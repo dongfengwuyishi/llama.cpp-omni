@@ -409,14 +409,18 @@ export class DuplexSession {
             }
         }
 
-        // Audio player management
+        // Audio player management — 与 end_of_turn 解耦：
+        // C++ 双工每个 SPEAK chunk 都带 end_of_turn=true（它其实是 "decode 结束" 信号），
+        // 若每次都 endTurn()，下一个 chunk 到达会触发 beginTurn()→_stopAllSources()
+        // 强行打断上一段还在排队播放的音频，导致 chunk 之间尾音被截断（尤其是
+        // LISTEN→SPEAK flush 出的 320ms 尾音 wav 紧跟 1000ms 主体时最明显）。
+        // 真正的 turn 结束信号只有 is_listen=true（__IS_LISTEN__）。
         if (!result.is_listen) {
             if (result.audio_data) {
                 if (!this.audioPlayer.turnActive) this.audioPlayer.beginTurn();
                 this.audioPlayer.playChunk(result.audio_data, recvTime);
             }
-            if (result.end_of_turn && this.audioPlayer.turnActive) this.audioPlayer.endTurn();
-        } else if (result.end_of_turn) {
+        } else {
             if (this.audioPlayer.turnActive) this.audioPlayer.endTurn();
         }
 
@@ -462,25 +466,29 @@ export class DuplexSession {
                 this._lastTTFS = 0;
             }
 
-            // Speak text accumulation
-            if (result.is_listen) {
-                if (this._speakHandle) { this._speakHandle = null; this.currentSpeakText = ''; }
-                this.onListenResult(result);
-            } else {
-                if (result.text) {
-                    this.currentSpeakText += result.text;
-                    if (!this._speakHandle) {
-                        this._speakHandle = this.onSpeakStart(this.currentSpeakText);
-                    } else {
-                        this.onSpeakUpdate(this._speakHandle, this.currentSpeakText);
-                    }
+            // Text accumulation — 与 is_listen / end_of_turn 解耦：
+            // C++ 双工每次 stream_decode 结束都会推 __END_OF_TURN__（除非 ended_with_listen），
+            // 这实际上是 "decode 结束" 信号而非真正的"轮次结束"；双工 0.5s 一次 decode，
+            // 所以不能用 end_of_turn 触发气泡 finalize——否则每次 decode 都分块显示。
+            // 真正的 turn 切换信号是 is_listen=true（__IS_LISTEN__）。
+            if (result.text) {
+                this.currentSpeakText += result.text;
+                if (!this._speakHandle) {
+                    this._speakHandle = this.onSpeakStart(this.currentSpeakText);
+                } else {
+                    this.onSpeakUpdate(this._speakHandle, this.currentSpeakText);
                 }
-                if (result.end_of_turn) {
+            }
+
+            if (result.is_listen) {
+                // 切到 listen：finalize 当前 speak bubble（如果有），再通知 listen
+                if (this._speakHandle) {
                     this.onSpeakEnd();
                     this._speakHandle = null;
                     this.currentSpeakText = '';
                     this.onSystemLog('— end of turn —');
                 }
+                this.onListenResult(result);
             }
 
             // Page-specific extensions

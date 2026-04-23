@@ -19,7 +19,7 @@
         "model_dir": "/path/to/MiniCPM-o-4_5-gguf",
         "llm_model": "",
         "cpp_server_port": null,
-        "ctx_size": 8192,
+        "ctx_size": 32768,
         "n_gpu_layers": 99,
         "vision_backend": "auto"
     }
