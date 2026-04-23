@@ -135,14 +135,18 @@ def detect_system():
 
 def find_llama_server() -> Optional[str]:
     """查找预编译的 llama-server 二进制"""
-    candidates = [
-        _REPO_ROOT / "build" / "bin" / "llama-server",
-        _REPO_ROOT / "build" / "bin" / "Release" / "llama-server",
-        _REPO_ROOT / "build" / "bin" / "Release" / "llama-server.exe",
-    ]
-    if platform.system() != "Windows":
-        candidates.append(
-            _REPO_ROOT / "build-x64-linux-cuda-release" / "bin" / "llama-server")
+    if platform.system() == "Windows":
+        candidates = [
+            _REPO_ROOT / "build" / "bin" / "Release" / "llama-server.exe",
+            _REPO_ROOT / "build" / "bin" / "llama-server.exe",
+            _REPO_ROOT / "bin" / "llama-server.exe",
+        ]
+    else:
+        candidates = [
+            _REPO_ROOT / "build" / "bin" / "llama-server",
+            _REPO_ROOT / "build" / "bin" / "Release" / "llama-server",
+            _REPO_ROOT / "build-x64-linux-cuda-release" / "bin" / "llama-server",
+        ]
 
     for c in candidates:
         if c.exists():
@@ -241,10 +245,13 @@ def start_worker(port: int = DEFAULT_WORKER_BASE_PORT, gpu_id: int = 0) -> subpr
     ]
 
     logger.info(f"Starting Worker on port {port}...")
-    proc = subprocess.Popen(
-        cmd, env=env, cwd=str(_SERVER_DIR),
+    popen_kwargs = dict(
+        env=env, cwd=str(_SERVER_DIR),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
+    if platform.system() == "Windows":
+        popen_kwargs["creationflags"] = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+    proc = subprocess.Popen(cmd, **popen_kwargs)
     _child_processes.append(proc)
     return proc
 
@@ -265,10 +272,13 @@ def start_gateway(port: int = 8006, worker_port: int = DEFAULT_WORKER_BASE_PORT,
         cmd.append("--http")
 
     logger.info(f"Starting Gateway on port {port}...")
-    proc = subprocess.Popen(
-        cmd, env=env, cwd=str(_SERVER_DIR),
+    popen_kwargs = dict(
+        env=env, cwd=str(_SERVER_DIR),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
+    if platform.system() == "Windows":
+        popen_kwargs["creationflags"] = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+    proc = subprocess.Popen(cmd, **popen_kwargs)
     _child_processes.append(proc)
     return proc
 
@@ -322,8 +332,15 @@ def main():
                         help="Use HTTP instead of HTTPS")
     args = parser.parse_args()
 
+    # Windows: default to HTTP (self-signed cert workflow is Unix-friendly only)
+    if platform.system() == "Windows" and not args.http:
+        args.http = True
+        logger.info("Windows detected — defaulting to HTTP mode.")
+
     signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
+    # SIGTERM does not exist on Windows
+    if hasattr(signal, "SIGTERM") and platform.system() != "Windows":
+        signal.signal(signal.SIGTERM, cleanup)
 
     print("=" * 56)
     print("  Comni Desktop App")

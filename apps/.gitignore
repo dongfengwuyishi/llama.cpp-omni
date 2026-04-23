@@ -17,6 +17,12 @@ desktop/packaging/.cache/
 desktop/dist/
 desktop/build/
 
+# Windows packaging — auto-generated icon + PyInstaller outputs
+desktop/packaging/windows/Comni.ico
+desktop/packaging/windows/build/
+desktop/packaging/windows/dist/
+desktop/packaging/windows/python-embed/
+
 # Logs
 *.log
 desktop/*.log

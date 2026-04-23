@@ -368,7 +368,10 @@ class WorkerPool:
             else:
                 worker.status = GatewayWorkerStatus.ERROR
         except Exception as e:
-            logger.warning(f"Health check failed for {worker.worker_id}: {e}")
+            logger.warning(
+                f"Health check failed for {worker.worker_id} "
+                f"({worker.url}/health): {type(e).__name__}: {e!r}"
+            )
             worker.status = GatewayWorkerStatus.OFFLINE
 
     # ========== 路由策略 ==========

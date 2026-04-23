@@ -326,13 +326,26 @@ class CppBackendWorker:
             pass
 
     def is_cpp_healthy(self) -> bool:
-        """Check if the underlying C++ llama-server is alive (process + HTTP)."""
+        """Fast liveness check (process-only, safe to call from async handlers).
+
+        Only checks whether the llama-server subprocess is still running.
+        Does NOT issue a network call: that would block the asyncio event
+        loop, which on Windows has been observed to starve /health
+        responses and eventually freeze the worker under concurrent load
+        (gateway's 15s heartbeat + worker's 3s requests.get).
+        """
         proc = self._cpp_process
         if proc is None or proc.poll() is not None:
             return False
+        return True
+
+    def is_cpp_responsive(self, timeout: float = 3.0) -> bool:
+        """Blocking HTTP liveness check — only call from a thread pool."""
+        if not self.is_cpp_healthy():
+            return False
         try:
             import requests as _req
-            r = _req.get(f"{self._cpp_server_url}/health", timeout=3)
+            r = _req.get(f"{self._cpp_server_url}/health", timeout=timeout)
             return r.status_code == 200
         except Exception:
             return False
@@ -822,6 +835,12 @@ class CppBackendWorker:
                 r = requests.get(f"{self._cpp_server_url}/health", timeout=2)
                 if r.status_code == 200:
                     logger.info(f"C++ server ready after {i+1}s")
+                    # /health returns 200 as soon as HTTP listen is up, but
+                    # the internal omni runtime still finishes warmup in the
+                    # background. Calling /v1/stream/omni_init immediately
+                    # races with that warmup and yields a 502. Give the C++
+                    # side a couple of seconds to settle before returning.
+                    time.sleep(2.0)
                     return
             except Exception:
                 pass
@@ -830,14 +849,35 @@ class CppBackendWorker:
         raise RuntimeError("C++ server startup timeout (300s)")
 
     def _find_server_binary(self) -> str:
-        candidates = [
-            os.path.join(self.llamacpp_root, "build/bin/llama-server"),
-            os.path.join(self.llamacpp_root, "build/bin/Release/llama-server"),
-        ]
-        if platform.system() != "Windows":
-            candidates.append(os.path.join(self.llamacpp_root, "build-x64-linux-cuda-release/bin/llama-server"))
+        # __file__ sits at <root>/apps/server/core/processors/cpp_backend.py
+        # Walk up 4 parents → <root>; this is the real install/repo root
+        # regardless of what config.json says about llamacpp_root (which can
+        # be stale if a config.json was baked-in on the build machine).
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _own_root = os.path.abspath(os.path.join(_here, "..", "..", "..", ".."))
+        roots = [self.llamacpp_root, _own_root]
+        # Deduplicate while preserving order
+        seen = set()
+        roots = [r for r in roots if not (r in seen or seen.add(r))]
+
+        if platform.system() == "Windows":
+            rel_paths = [
+                "build/bin/Release/llama-server.exe",
+                "build/bin/llama-server.exe",
+                "bin/llama-server.exe",
+            ]
+        else:
+            rel_paths = [
+                "build/bin/llama-server",
+                "build/bin/Release/llama-server",
+                "build-x64-linux-cuda-release/bin/llama-server",
+            ]
+
+        candidates = [os.path.join(r, p) for r in roots for p in rel_paths]
         for c in candidates:
             if os.path.exists(c):
+                if os.path.dirname(c) != os.path.join(self.llamacpp_root, os.path.dirname(rel_paths[0])):
+                    logger.info(f"_find_server_binary: resolved via fallback: {c}")
                 return c
         return candidates[0]
 
@@ -891,28 +931,49 @@ class CppBackendWorker:
             f"Calling omni_init: media_type={media_type}, duplex={duplex_mode}, "
             f"lang={effective_lang}"
         )
-        resp = self._http_client.post(
-            f"{self._cpp_server_url}/v1/stream/omni_init",
-            json=req_body,
-            timeout=120.0,
-        )
-        if resp.status_code != 200:
-            # Re-init can fail when switching media_type (C++ omni_free + omni_init
-            # doesn't always clean up properly). Restart the entire C++ server.
+        # IMPORTANT: the Windows build of llama-server's embedded HTTP server
+        # returns a bare 502 on the very first POST sent by httpx/h11 (some
+        # TCP-level / connection-reuse behaviour). The `requests` library
+        # doesn't trigger this, so we use it just for this one-shot call
+        # and keep httpx for the streaming paths that depend on httpx.stream().
+        import requests as _rq
+        url = f"{self._cpp_server_url}/v1/stream/omni_init"
+
+        resp = None
+        for attempt in range(3):
+            resp = _rq.post(url, json=req_body, timeout=120.0)
+            if resp.status_code == 200:
+                break
             logger.warning(
-                "omni_init failed (status=%d), restarting C++ server and retrying",
+                "omni_init returned %d (attempt %d/3); retrying in 2s…",
+                resp.status_code, attempt + 1,
+            )
+            time.sleep(2.0)
+
+        if resp.status_code != 200:
+            # Fall back to a full C++ server restart. This handles the case
+            # where omni_free + omni_init (e.g. on media_type switch) left
+            # the runtime in a bad state.
+            logger.warning(
+                "omni_init still failing (status=%d) — restarting C++ server",
                 resp.status_code,
             )
             self._stop_cpp_server()
             time.sleep(1)
             self._start_cpp_server()
-            resp2 = self._http_client.post(
-                f"{self._cpp_server_url}/v1/stream/omni_init",
-                json=req_body,
-                timeout=120.0,
-            )
+            resp2 = None
+            for attempt in range(3):
+                resp2 = _rq.post(url, json=req_body, timeout=120.0)
+                if resp2.status_code == 200:
+                    break
+                logger.warning(
+                    "omni_init (post-restart) returned %d (attempt %d/3)",
+                    resp2.status_code, attempt + 1,
+                )
+                time.sleep(2.0)
             if resp2.status_code != 200:
-                raise RuntimeError(f"omni_init failed after restart: {resp2.text}")
+                raise RuntimeError(
+                    f"omni_init failed after restart: {resp2.status_code} {resp2.text}")
             logger.info(f"omni_init success (after restart): {resp2.json()}")
             return
         logger.info(f"omni_init success: {resp.json()}")

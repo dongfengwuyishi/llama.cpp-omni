@@ -1,0 +1,25 @@
+# Runtime deps for the bundled embedded Python inside Comni.exe
+# (PySide6 / pyobjc / pytest are excluded — GUI is handled by Comni.exe itself,
+#  and test frameworks aren't needed at runtime)
+
+fastapi>=0.128.0
+uvicorn>=0.40.0
+httpx>=0.28.0
+websockets>=16.0
+python-multipart
+
+pydantic>=2.11.0
+numpy>=2.2.0
+
+soundfile>=0.12.0
+librosa>=0.10.0
+
+Pillow>=10.0.0
+
+onnxruntime>=1.17.0
+
+tqdm>=4.67.0
+pyyaml>=6.0
+
+huggingface_hub>=0.25.0
+requests>=2.31.0
