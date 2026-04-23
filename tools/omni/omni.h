@@ -251,7 +251,11 @@ struct omni_context {
     // 每次 update_session_config 时重置 force_listen_used=0。
     int force_listen_count = 3;
     int force_listen_used  = 0;
-    
+
+    // TTS 采样温度（与 Python TTSSamplingParams.temperature 对齐，默认 0.8）
+    // 通过 /v1/stream/update_session_config 的 "tts_temperature" 字段透传
+    float tts_temperature = 0.8f;
+
     // 是否启用双工模式
     // simplex: 单工模式，用户说完后模型回复，回复完用户再说
     // duplex: 双工模式，模型可以在任意时刻决定听/说切换

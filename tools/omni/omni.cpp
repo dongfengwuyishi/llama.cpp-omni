@@ -3697,7 +3697,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // 🔧 TTS流式采样参数 - 与 Python ras_sampling 对齐：
         // Python TTSSamplingParams 默认 temperature=0.8 (modeling_minicpmo.py line 75)
         common_params_sampling tts_sampling = params->sampling;
-        tts_sampling.temp = 0.8f;              // 🔧 [与 Python 对齐] TTSSamplingParams.temperature=0.8
+        tts_sampling.temp = ctx_omni->tts_temperature;  // [与 Python 对齐] TTSSamplingParams.temperature
         tts_sampling.top_p = 0.85f;  // 🔧 [与 Python 对齐] TTSSamplingParams.top_p=0.85             // 🔧 [与 Python streaming 对齐] top_p=0.8
         tts_sampling.top_k = 25;               // top_k = 25 (ras_sampling 参数)
         tts_sampling.penalty_repeat = 1.05f;   // repetition_penalty = 1.05
@@ -4751,7 +4751,7 @@ static bool generate_audio_tokens_local_simplex(
     // Create sampler - matching Python TTSStreamingGenerator
     // Python TTSSamplingParams 默认 temperature=0.8 (modeling_minicpmo.py line 75)
     common_params_sampling tts_sampling = params->sampling;
-    tts_sampling.temp = 0.8f;    // 🔧 [与 Python 对齐] TTSSamplingParams.temperature=0.8
+    tts_sampling.temp = ctx_omni->tts_temperature;  // [与 Python 对齐] TTSSamplingParams.temperature
     tts_sampling.top_p = 0.85f;  // 🔧 [与 Python 对齐] TTSSamplingParams.top_p=0.85   // 🔧 [与 Python streaming 对齐] top_p=0.8
     tts_sampling.top_k = 25;
     tts_sampling.penalty_repeat = 1.05f;
@@ -5185,7 +5185,7 @@ static bool generate_audio_tokens_local(
     // 🔧 TTS流式采样参数 - 与 Python TTSStreamingGenerator 对齐
     // Python TTSSamplingParams 默认 temperature=0.8 (modeling_minicpmo.py line 75)
     common_params_sampling tts_sampling = params->sampling;
-    tts_sampling.temp = 0.8f;              // 🔧 [与 Python 对齐] TTSSamplingParams.temperature=0.8
+    tts_sampling.temp = ctx_omni->tts_temperature;  // [与 Python 对齐] TTSSamplingParams.temperature
     tts_sampling.top_p = 0.85f;  // 🔧 [与 Python 对齐] TTSSamplingParams.top_p=0.85             // 🔧 [与 Python streaming 对齐] top_p=0.8
     tts_sampling.top_k = 25;               // top_k = 25
     tts_sampling.penalty_repeat = 1.05f;   // repetition_penalty = 1.05
