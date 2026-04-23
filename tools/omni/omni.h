@@ -41,6 +41,10 @@ struct omni_embeds{
     // vision_embed[1..n] = slice embeds (各 64 tokens * hidden_size)
     std::vector<std::vector<float>> vision_embed;
     std::vector<float> audio_embed;
+    // 用户文本片段（与 audio/image 同为一种 modality 的载体）。
+    // 非空时，LLM 线程会用 eval_string 将其作为 user-turn 的一部分投入 KV cache，
+    // 不会自动包裹任何 role/special token。
+    std::string user_text;
     int index = 0;
     int end_flag = false;
 };
@@ -435,7 +439,10 @@ bool stream_prefill(struct omni_context * ctx_omni,
                             std::string aud_fname,
                             std::string img_fname = "",
                             int index = 0,
-                            int max_slice_nums = -1);  // -1 表示使用全局设置，>=1 表示本次 prefill 的 slice 数量
+                            int max_slice_nums = -1,  // -1 表示使用全局设置，>=1 表示本次 prefill 的 slice 数量
+                            std::string text = "");   // 用户文本片段：与 audio/image 同为一种 modality，
+                                                     // 在 index>=1 的用户输入阶段插入到当前 user turn 中。
+                                                     // 不会自动包裹任何 role/special token —— 调用方完全控制其字面值。
 
 bool stream_decode(struct omni_context * ctx_omni,
                         std::string debug_dir,

@@ -4445,7 +4445,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                     }
                 }
                 // ========== 子分支2：处理只有音频嵌入的数据（纯音频模式） ==========
-                else {
+                else if (!embeds->audio_embed.empty()) {
                     int n_audio_tokens = embeds->audio_embed.size() / hidden_size;
                     print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
                     
@@ -4467,10 +4467,22 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                         eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false);
                     }
                 }
+                // ========== 子分支3：纯文本输入（turn-based chat 文本对话） ==========
+                // 单工：assistant_prompt 末尾已带 <|im_start|>user\n，文本本身不需要
+                //       任何 <|audio_start|>/<|audio_end|> 之类的 modality 包裹。
+                // 双工：与音频对齐，先 <unit> 再写入文本。
+                else if (!embeds->user_text.empty()) {
+                    if (ctx_omni->duplex_mode) {
+                        eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->n_past, false);
+                    }
+                    eval_string(ctx_omni, params, embeds->user_text.c_str(), params->n_batch, &ctx_omni->n_past, false);
+                }
                 
                 // 🔧 [#39 滑动窗口] 注册 unit 结束
                 if (ctx_omni->sliding_window_config.mode != "off") {
-                    std::string input_type = embeds->vision_embed.size() > 0 ? "omni" : "audio";
+                    std::string input_type = embeds->vision_embed.size() > 0 ? "omni"
+                                           : !embeds->audio_embed.empty()    ? "audio"
+                                           :                                   "text";
                     sliding_window_register_unit_end(ctx_omni, input_type, {}, false);
                 }
                 
@@ -8745,7 +8757,7 @@ void t2w_thread_func(struct omni_context * ctx_omni, common_params *params) {
     }
 }
 
-bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums) {
+bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums, std::string text) {
     
     // 只有在新一轮开始时 (index == 0) 才需要等待上一轮 TTS 完成
     // 同一轮内的后续 prefill (index >= 1) 不需要等待
@@ -9049,6 +9061,10 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                 } else {
                     LOG_WRN("%s: audio encoding failed, skipping audio for this frame: %s\n", __func__, aud_fname.c_str());
                 }
+            }
+            // text 仅作为字面量带过去，由 LLM 线程在锁保护下做 eval_string。
+            if (!text.empty()) {
+                omni_embeds->user_text = text;
             }
             omni_embeds->index = index;
             // 🔧 [整合] <|im_start|>user\n 已在 sys prompt 末尾添加，后续轮次在 stream_decode 结束时添加
