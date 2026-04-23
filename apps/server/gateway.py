@@ -305,7 +305,9 @@ async def chat(request: Request):
     task_start = datetime.now()
 
     try:
-        async with httpx.AsyncClient(timeout=worker_pool.request_timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=worker_pool.request_timeout, trust_env=False
+        ) as client:
             resp = await client.post(
                 f"{worker.url}/chat",
                 json=request_body,

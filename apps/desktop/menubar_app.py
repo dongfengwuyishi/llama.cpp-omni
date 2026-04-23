@@ -1230,6 +1230,15 @@ class AppDelegate(NSObject):
             self._log_file = open(_LOG_PATH, "a", encoding="utf-8")
             env = os.environ.copy()
             env["PYTHONPATH"] = str(_SERVER_DIR)
+            # Prevent system HTTP proxy (e.g. Clash/V2Ray on 127.0.0.1:7890) from
+            # intercepting loopback IPC between gateway / worker / llama-server.
+            # macOS ExceptionsList doesn't reliably bypass 'localhost' host name
+            # in Python urllib/httpx; force all children to disable proxies entirely.
+            for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                       "http_proxy", "https_proxy", "all_proxy"):
+                env.pop(_k, None)
+            env["NO_PROXY"] = "*"
+            env["no_proxy"] = "*"
 
             self._set_progress_text("Loading models…")
             self._start_log_tail()
@@ -1240,7 +1249,7 @@ class AppDelegate(NSObject):
                 env=env, cwd=str(_SERVER_DIR),
                 stdout=self._log_file, stderr=subprocess.STDOUT)
 
-            if not self._wait_health(f"http://localhost:{self._worker_port}", 300):
+            if not self._wait_health(f"http://127.0.0.1:{self._worker_port}", 300):
                 if self._worker_proc and self._worker_proc.poll() is not None:
                     self._append_log(f"\nWorker exited with code {self._worker_proc.returncode}\n")
                 else:
@@ -1254,7 +1263,7 @@ class AppDelegate(NSObject):
             self._gateway_proc = subprocess.Popen(
                 [sys.executable, str(_SERVER_DIR / "gateway.py"),
                  "--port", str(self._port),
-                 "--workers", f"localhost:{self._worker_port}", "--http"],
+                 "--workers", f"127.0.0.1:{self._worker_port}", "--http"],
                 env=env, cwd=str(_SERVER_DIR),
                 stdout=self._log_file, stderr=subprocess.STDOUT)
 
@@ -1280,9 +1289,12 @@ class AppDelegate(NSObject):
 
     def _wait_health(self, url, timeout=300):
         import urllib.request
+        # Build an opener that ignores system HTTP proxy, so loopback probes
+        # aren't intercepted by local HTTP proxies (Clash/V2Ray etc.).
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for _ in range(timeout // 2):
             try:
-                resp = urllib.request.urlopen(f"{url}/health", timeout=3)
+                resp = opener.open(f"{url}/health", timeout=3)
                 if resp.status == 200:
                     data = json.loads(resp.read())
                     if data.get("model_loaded", True):

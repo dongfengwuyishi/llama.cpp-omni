@@ -241,7 +241,10 @@ class CppBackendWorker:
         logger.info(f"[GPU {self.gpu_id}] Starting C++ llama-server...")
 
         import httpx
-        self._http_client = httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0))
+        self._http_client = httpx.Client(
+            timeout=httpx.Timeout(600.0, connect=30.0),
+            trust_env=False,
+        )
 
         self._start_cpp_server()
         self._call_omni_init(media_type=2, duplex_mode=True)
