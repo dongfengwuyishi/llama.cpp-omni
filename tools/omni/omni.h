@@ -41,6 +41,10 @@ struct omni_embeds{
     // vision_embed[1..n] = slice embeds (各 64 tokens * hidden_size)
     std::vector<std::vector<float>> vision_embed;
     std::vector<float> audio_embed;
+    // 用户文本片段（与 audio/image 同为一种 modality 的载体）。
+    // 非空时，LLM 线程会用 eval_string 将其作为 user-turn 的一部分投入 KV cache，
+    // 不会自动包裹任何 role/special token。
+    std::string user_text;
     int index = 0;
     int end_flag = false;
 };
@@ -222,6 +226,11 @@ struct omni_context {
     // 如果是，则不清理 KV cache，让下一个音频片段可以累积上下文
     std::atomic<bool> ended_with_listen{false};
     
+    // [滑窗专用] 记录最近一次 decode 结果是 LISTEN 还是 SPEAK
+    // 与 ended_with_listen 不同：不在 stream_decode 开头重置，
+    // 只由 decode 的实际输出驱动（LISTEN→true, SPEAK→false）
+    std::atomic<bool> slide_last_was_listen{true};
+    
     // 🔧 [与 Python 对齐] LLM 生成结束标志
     // 当 LLM 检测到 end token 时设置为 true
     // TTS 线程检查此标志来决定是否添加 text_eos_embed
@@ -235,7 +244,18 @@ struct omni_context {
     // listen_prob_scale: 调整 <|listen|> token 的采样概率
     // 1.0: Python 默认
     float listen_prob_scale = 1.0f;
-    
+
+    // 会话开局强制 LISTEN 的 chunk 数（与 Python duplex_config.force_listen_count 对齐）
+    // 防止 browser 打开 MediaStreamTrack 时的瞬态噪声 + 强 system prompt 组合
+    // 导致模型在第一 chunk 就 SPEAK 产生"抢答"。
+    // 每次 update_session_config 时重置 force_listen_used=0。
+    int force_listen_count = 3;
+    int force_listen_used  = 0;
+
+    // TTS 采样温度（与 Python TTSSamplingParams.temperature 对齐，默认 0.8）
+    // 通过 /v1/stream/update_session_config 的 "tts_temperature" 字段透传
+    float tts_temperature = 0.8f;
+
     // 是否启用双工模式
     // simplex: 单工模式，用户说完后模型回复，回复完用户再说
     // duplex: 双工模式，模型可以在任意时刻决定听/说切换
@@ -423,7 +443,10 @@ bool stream_prefill(struct omni_context * ctx_omni,
                             std::string aud_fname,
                             std::string img_fname = "",
                             int index = 0,
-                            int max_slice_nums = -1);  // -1 表示使用全局设置，>=1 表示本次 prefill 的 slice 数量
+                            int max_slice_nums = -1,  // -1 表示使用全局设置，>=1 表示本次 prefill 的 slice 数量
+                            std::string text = "");   // 用户文本片段：与 audio/image 同为一种 modality，
+                                                     // 在 index>=1 的用户输入阶段插入到当前 user turn 中。
+                                                     // 不会自动包裹任何 role/special token —— 调用方完全控制其字面值。
 
 bool stream_decode(struct omni_context * ctx_omni,
                         std::string debug_dir,

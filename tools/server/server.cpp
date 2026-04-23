@@ -5554,15 +5554,32 @@ int main(int argc, char ** argv) {
     //  Internal implementation is intentionally left blank per request; handlers validate inputs shape only.
     //  Replace placeholders with actual invocation to streaming backend when ready.
 
+    // 在持有 octx_mutex 的前提下读取 octx->n_past。
+    // 注意：本 helper 内部自己会加 octx_mutex。调用方在调用前必须已经释放该锁，
+    // 否则同一线程会对非递归的 std::mutex 二次加锁，造成自死锁。
+    const auto read_stream_kv_cache_length = [&ctx_server]() -> int {
+        std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
+        if (ctx_server.octx == nullptr) {
+            return 0;
+        }
+        return ctx_server.octx->n_past;
+    };
+
     // impl: prefill
-    const auto handle_stream_prefill_impl = [&ctx_server, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
+    const auto handle_stream_prefill_impl = [&ctx_server, &read_stream_kv_cache_length, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
         // Expected body fields (aligned with test_case in minicpmo-cli.cpp):
-        //  audio_path_prefix: string (required)
-        //  img_path_prefix: string (optional, default "")
-        //  img_posfix: string (optional, default "")
-        //  cnt: integer (required)
-        if (!data.contains("audio_path_prefix") || !data.at("audio_path_prefix").is_string()) {
-            res_error(res, format_error_response("\"audio_path_prefix\" must be provided as string", ERROR_TYPE_INVALID_REQUEST));
+        //  audio_path_prefix: string (optional, default "")
+        //  img_path_prefix:   string (optional, default "")
+        //  img_posfix:        string (optional, default "")
+        //  text:              string (optional, default "")  ← 文本输入（turn-based 文字对话）
+        //  cnt:               integer (required)
+        // 至少需要 audio/img/text 之一非空，否则视为非法请求。
+        if (data.contains("audio_path_prefix") && !data.at("audio_path_prefix").is_string()) {
+            res_error(res, format_error_response("\"audio_path_prefix\" must be a string when present", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (data.contains("text") && !data.at("text").is_string()) {
+            res_error(res, format_error_response("\"text\" must be a string when present", ERROR_TYPE_INVALID_REQUEST));
             return;
         }
         if (!data.contains("cnt") || !data.at("cnt").is_number_integer()) {
@@ -5578,13 +5595,21 @@ int main(int argc, char ** argv) {
             }
         }
 
-        const std::string audio_path_prefix = data.at("audio_path_prefix");
+        const std::string audio_path_prefix = data.value("audio_path_prefix", std::string(""));
         const std::string img_path_prefix   = data.value("img_path_prefix", "");
         const std::string img_posfix        = data.value("img_posfix", "");
+        const std::string text              = data.value("text", std::string(""));
         const int cnt                        = data.at("cnt");
         // 🔧 [高清+高刷] 可选参数：控制本次 prefill 的图片切片数量
         // -1 (默认) = 使用全局设置, 1 = 不切片, 2 = 高清模式切片
         const int max_slice_nums             = data.value("max_slice_nums", -1);
+
+        if (audio_path_prefix.empty() && img_path_prefix.empty() && text.empty()) {
+            res_error(res, format_error_response(
+                "at least one of \"audio_path_prefix\", \"img_path_prefix\", \"text\" must be non-empty",
+                ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
 
         bool ok = true;
 
@@ -5596,10 +5621,16 @@ int main(int argc, char ** argv) {
         //     img_fname = img_path_prefix + std::to_string(0) + img_posfix;
         // }
         std::string img_fname = img_path_prefix;
-        std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
-        if (!stream_prefill(ctx_server.octx, aud_fname, img_fname, cnt, max_slice_nums)) {
-            ok = false;
-            // break;
+        // 注意：这里多包一层 { } 是必须的——为了在执行下面 ack 中的
+        // read_stream_kv_cache_length() 之前先释放 octx_mutex。
+        // octx_mutex 是非递归的 std::mutex，如果继续持有它去调用那个 helper，
+        // 同一线程会二次加锁，造成自死锁。
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
+            if (!stream_prefill(ctx_server.octx, aud_fname, img_fname, cnt, max_slice_nums, text)) {
+                ok = false;
+                // break;
+            }
         }
         // }
 
@@ -5610,10 +5641,11 @@ int main(int argc, char ** argv) {
 
         json ack = {
             {"success", true},
-            {"audio_path_prefix", data.at("audio_path_prefix")},
-            {"img_path_prefix", data.contains("img_path_prefix") ? data.at("img_path_prefix") : json("")},
-            {"img_posfix", data.contains("img_posfix") ? data.at("img_posfix") : json("")},
-            {"cnt", data.at("cnt")}
+            {"audio_path_prefix", audio_path_prefix},
+            {"img_path_prefix", img_path_prefix},
+            {"img_posfix", img_posfix},
+            {"cnt", data.at("cnt")},
+            {"kv_cache_length", read_stream_kv_cache_length()},
         };
         res_ok(res, ack);
     };
@@ -5626,7 +5658,7 @@ int main(int argc, char ** argv) {
     };
 
     // impl: decode
-    const auto handle_stream_decode_impl = [&ctx_server, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
+    const auto handle_stream_decode_impl = [&ctx_server, &read_stream_kv_cache_length, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
         // Expected body fields:
         // optional: debug_dir: string (default "./")
         // optional: stream: bool (default true)
@@ -5643,6 +5675,19 @@ int main(int argc, char ** argv) {
         bool stream = json_value(data, "stream", true);
         int round_idx = json_value(data, "round_idx", -1);  // 🔧 [轮次同步] 从请求中获取 round_idx
 
+        // 🔧 [Length Penalty] 从请求体读取 length_penalty 覆盖 omni context 中的值
+        // length_penalty > 1.0 降低 EOS 概率（生成更长），< 1.0 提高 EOS 概率（更早结束），= 1.0 禁用
+        if (data.contains("length_penalty") && data.at("length_penalty").is_number()) {
+            float lp = data.at("length_penalty").get<float>();
+            {
+                std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
+                if (ctx_server.octx != nullptr) {
+                    ctx_server.octx->length_penalty = lp;
+                }
+            }
+            SRV_INF("%s: length_penalty set to %.3f\n", __func__, lp);
+        }
+
         if (!stream) {
             bool ok = false;
             {
@@ -5657,14 +5702,15 @@ int main(int argc, char ** argv) {
 
             json ack = {
                 {"success", true},
-                {"debug_dir", debug_dir}
+                {"debug_dir", debug_dir},
+                {"kv_cache_length", read_stream_kv_cache_length()},
             };
             res_ok(res, ack);
             return;
         }
 
         // SSE streaming mode: start decode, then read text_queue and stream to client
-        const auto chunked_content_provider = [&ctx_server, debug_dir, round_idx](size_t, httplib::DataSink & sink) {
+        const auto chunked_content_provider = [&ctx_server, debug_dir, round_idx, &read_stream_kv_cache_length](size_t, httplib::DataSink & sink) {
             // 🔧 [修复多轮对话] 在启动worker之前先重置状态，避免竞态条件
             {
                 std::lock_guard<std::mutex> lock(ctx_server.octx->text_mtx);
@@ -5728,6 +5774,11 @@ int main(int argc, char ** argv) {
                 }
             }
             if (worker.joinable()) worker.join();
+            if (!server_sent_event(sink, json {
+                {"kv_cache_length", read_stream_kv_cache_length()},
+            })) {
+                return false;
+            }
             // send done
             static const std::string ev_done = "data: [DONE]\n\n";
             sink.write(ev_done.data(), ev_done.size());
@@ -5746,7 +5797,7 @@ int main(int argc, char ** argv) {
     };
 
     // impl: omni_init
-    const auto handle_stream_omni_init_impl = [&ctx_server, &res_ok, &res_error, &params](const json & data, httplib::Response & res) -> void {
+    const auto handle_stream_omni_init_impl = [&ctx_server, &read_stream_kv_cache_length, &res_ok, &res_error, &params](const json & data, httplib::Response & res) -> void {
         // Expected body fields (aligned with omni_init):
         // 支持 msg_type 或 media_type 参数（前端用 msg_type，保持向后兼容）
         int media_type = -1;
@@ -5846,6 +5897,20 @@ int main(int argc, char ** argv) {
             ctx_server.octx->async = true;
             ctx_server.octx->duplex_mode = duplex_mode;  // 确保设置
 
+            // 外部传入 system prompt（优先于 C++ 内置默认值）
+            if (data.contains("voice_clone_prompt") && data.at("voice_clone_prompt").is_string()) {
+                const std::string vcp = data.at("voice_clone_prompt").get<std::string>();
+                ctx_server.octx->audio_voice_clone_prompt = vcp;
+                ctx_server.octx->omni_voice_clone_prompt = vcp;
+                SRV_INF("%s: voice_clone_prompt overridden from request\n", __func__);
+            }
+            if (data.contains("assistant_prompt") && data.at("assistant_prompt").is_string()) {
+                const std::string ap = data.at("assistant_prompt").get<std::string>();
+                ctx_server.octx->audio_assistant_prompt = ap;
+                ctx_server.octx->omni_assistant_prompt = ap;
+                SRV_INF("%s: assistant_prompt overridden from request\n", __func__);
+            }
+
             // optional: voice cloning audio during init, index=0
             if (data.contains("voice_audio") && data.at("voice_audio").is_string()) {
                 const std::string voice_audio = data.at("voice_audio");
@@ -5865,7 +5930,8 @@ int main(int argc, char ** argv) {
             {"success", true},
             {"media_type", media_type},
             {"use_tts", use_tts},
-            {"voice_audio_used", data.contains("voice_audio") && data.at("voice_audio").is_string() && !data.at("voice_audio").get<std::string>().empty()}
+            {"voice_audio_used", data.contains("voice_audio") && data.at("voice_audio").is_string() && !data.at("voice_audio").get<std::string>().empty()},
+            {"kv_cache_length", read_stream_kv_cache_length()},
         };
         res_ok(res, ack);
     };
@@ -5937,7 +6003,7 @@ int main(int argc, char ** argv) {
 
     // ==================== 重置 API ====================
     // impl: reset - 清空 KV cache，用于新会话开始
-    const auto handle_stream_reset_impl = [&ctx_server, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
+    const auto handle_stream_reset_impl = [&ctx_server, &read_stream_kv_cache_length, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
         // Expected body fields:
         //   - duplex_mode: (optional) bool - 更新双工/单工模式
         // 
@@ -6005,7 +6071,8 @@ int main(int argc, char ** argv) {
         
         json ack = {
             {"success", true},
-            {"message", "KV caches cleared, ready for new session"}
+            {"message", "KV caches cleared, ready for new session"},
+            {"kv_cache_length", read_stream_kv_cache_length()},
         };
         res_ok(res, ack);
     };
@@ -6018,7 +6085,7 @@ int main(int argc, char ** argv) {
 
     // ==================== 更新会话配置 API ====================
     // impl: update_session_config - 更新会话配置（media_type、duplex_mode 等），不重新加载模型
-    const auto handle_stream_update_session_config_impl = [&ctx_server, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
+    const auto handle_stream_update_session_config_impl = [&ctx_server, &read_stream_kv_cache_length, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
         // Expected body fields:
         //   - media_type: (optional) int - 1=audio, 2=omni
         //   - duplex_mode: (optional) bool - 双工/单工模式
@@ -6112,7 +6179,30 @@ int main(int argc, char ** argv) {
                     ctx_server.octx->high_refresh = new_high_refresh;
                 }
             }
-            
+
+            // [Python 透传] session-level sampling 旋钮，对齐 DuplexConfig
+            // 仅当请求显式提供时覆盖；省略时保留 omni_init 阶段的默认值。
+            if (data.contains("listen_prob_scale") && data.at("listen_prob_scale").is_number()) {
+                ctx_server.octx->listen_prob_scale = data.at("listen_prob_scale").get<float>();
+                SRV_INF("%s: listen_prob_scale set to %.4f\n", __func__,
+                        ctx_server.octx->listen_prob_scale);
+            }
+            if (data.contains("force_listen_count") && data.at("force_listen_count").is_number_integer()) {
+                ctx_server.octx->force_listen_count = data.at("force_listen_count").get<int>();
+                SRV_INF("%s: force_listen_count set to %d\n", __func__,
+                        ctx_server.octx->force_listen_count);
+            }
+            if (data.contains("max_new_speak_tokens_per_chunk") && data.at("max_new_speak_tokens_per_chunk").is_number_integer()) {
+                ctx_server.octx->max_new_speak_tokens_per_chunk = data.at("max_new_speak_tokens_per_chunk").get<int>();
+                SRV_INF("%s: max_new_speak_tokens_per_chunk set to %d\n", __func__,
+                        ctx_server.octx->max_new_speak_tokens_per_chunk);
+            }
+            if (data.contains("tts_temperature") && data.at("tts_temperature").is_number()) {
+                ctx_server.octx->tts_temperature = data.at("tts_temperature").get<float>();
+                SRV_INF("%s: tts_temperature set to %.4f\n", __func__,
+                        ctx_server.octx->tts_temperature);
+            }
+
             // 3. 清空 KV cache
             if (ctx_server.octx->ctx_llama) {
                 llama_memory_t mem = llama_get_memory(ctx_server.octx->ctx_llama);
@@ -6144,7 +6234,9 @@ int main(int argc, char ** argv) {
             ctx_server.octx->simplex_round_idx = 0;
             ctx_server.octx->wav_turn_base = 0;
             ctx_server.octx->round_start_positions.clear();
-            SRV_INF("%s: simplex_round_idx and wav_turn_base reset to 0\n", __func__);
+            // [Case 2 抢答] 新 session 时重置 force_listen 计数器，重新进入开局强制 LISTEN 期
+            ctx_server.octx->force_listen_used = 0;
+            SRV_INF("%s: simplex_round_idx, wav_turn_base, force_listen_used reset to 0\n", __func__);
             
             // 🔧 [修复卡住问题] 重置 speek_done 为 true
             // 原因：stream_prefill(index=0) 在 warmup_done=true 时会等待 speek_done=true
@@ -6152,7 +6244,21 @@ int main(int argc, char ** argv) {
             ctx_server.octx->speek_done = true;
             SRV_INF("%s: speek_done set to true for session config update\n", __func__);
             
-            // 🔧 [关键] 重置 system_prompt_initialized，让 stream_prefill 重新评估 system prompt
+            // 外部传入 system prompt（优先于 C++ 内置默认值）
+            if (data.contains("voice_clone_prompt") && data.at("voice_clone_prompt").is_string()) {
+                const std::string vcp = data.at("voice_clone_prompt").get<std::string>();
+                ctx_server.octx->audio_voice_clone_prompt = vcp;
+                ctx_server.octx->omni_voice_clone_prompt = vcp;
+                SRV_INF("%s: voice_clone_prompt overridden from request\n", __func__);
+            }
+            if (data.contains("assistant_prompt") && data.at("assistant_prompt").is_string()) {
+                const std::string ap = data.at("assistant_prompt").get<std::string>();
+                ctx_server.octx->audio_assistant_prompt = ap;
+                ctx_server.octx->omni_assistant_prompt = ap;
+                SRV_INF("%s: assistant_prompt overridden from request\n", __func__);
+            }
+
+            // 重置 system_prompt_initialized，让 stream_prefill 重新评估 system prompt
             ctx_server.octx->system_prompt_initialized = false;
             
             // 5. 重新 prefill system prompt（如果提供 voice_audio）
@@ -6192,7 +6298,14 @@ int main(int argc, char ** argv) {
                 {"mode", ctx_server.octx->sliding_window_config.mode},
                 {"high_water_tokens", ctx_server.octx->sliding_window_config.high_water_tokens},
                 {"low_water_tokens", ctx_server.octx->sliding_window_config.low_water_tokens}
-            }}
+            }},
+            {"sampling", {
+                {"listen_prob_scale", ctx_server.octx->listen_prob_scale},
+                {"force_listen_count", ctx_server.octx->force_listen_count},
+                {"max_new_speak_tokens_per_chunk", ctx_server.octx->max_new_speak_tokens_per_chunk},
+                {"tts_temperature", ctx_server.octx->tts_temperature},
+            }},
+            {"kv_cache_length", read_stream_kv_cache_length()},
         };
         res_ok(res, ack);
     };
