@@ -111,6 +111,7 @@ const settingsPersistence = new SettingsPersistence('audio_duplex_settings', [
     // Session
     { id: 'playbackDelay', type: 'number' },
     { id: 'maxKvTokens', type: 'number' },
+    { id: 'stopOnKvShrink', type: 'checkbox' },
     { id: 'duplexLengthPenalty', type: 'number' },
     // System prompt
     { id: 'systemPrompt', type: 'textarea' },
@@ -838,6 +839,7 @@ async function startSession() {
     session = new DuplexSession('adx', {
         getMaxKvTokens: () => parseInt(document.getElementById('maxKvTokens').value, 10) || 8192,
         getPlaybackDelayMs: () => parseInt(document.getElementById('playbackDelay').value, 10) || 200,
+        getStopOnSlidingWindow: () => !!document.getElementById('stopOnKvShrink')?.checked,
         outputSampleRate: SAMPLE_RATE_OUT,
     });
 

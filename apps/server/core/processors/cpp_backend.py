@@ -71,6 +71,48 @@ def _get_system_prompts(duplex: bool, lang: str = "zh") -> Dict[str, str]:
     return _SYSTEM_PROMPTS.get((duplex, lang), _SYSTEM_PROMPTS[(duplex, "zh")])
 
 
+# C++ /v1/stream/update_session_config 当前能识别的 sampling 字段。
+# 与 omni_context 中的字段一一对应；新增需同步 server.cpp + omni.h。
+_CPP_SAMPLING_KEYS = (
+    "listen_prob_scale",
+    "force_listen_count",
+    "max_new_speak_tokens_per_chunk",
+    "tts_temperature",
+)
+
+
+def _sampling_from_duplex_config(cfg: Any) -> Dict[str, Any]:
+    """从 DuplexConfig（pydantic 模型 / dict / None）抽出 C++ 能用的 sampling 字段。"""
+    if cfg is None:
+        return {}
+    out: Dict[str, Any] = {}
+    for key in _CPP_SAMPLING_KEYS:
+        val = None
+        if hasattr(cfg, key):
+            val = getattr(cfg, key, None)
+        elif isinstance(cfg, dict):
+            val = cfg.get(key)
+        if val is not None:
+            out[key] = val
+    return out
+
+
+def _sampling_from_generation(gen: Any) -> Dict[str, Any]:
+    """从 GenerationConfig（chat / half-duplex 用）抽出 C++ 能用的字段。
+
+    当前只透传 tts_temperature（如上层提供）。chat/half-duplex 的 max_new_tokens 语义
+    是"单轮上限"，与 duplex 的 max_new_speak_tokens_per_chunk "每 chunk 上限" 不同，
+    故不映射以免改变现有行为。
+    """
+    if gen is None:
+        return {}
+    out: Dict[str, Any] = {}
+    tts_t = getattr(gen, "tts_temperature", None) if not isinstance(gen, dict) else gen.get("tts_temperature")
+    if tts_t is not None:
+        out["tts_temperature"] = tts_t
+    return out
+
+
 def _build_prompts_from_content(
     system_content: Any,
     duplex: bool,
@@ -183,6 +225,10 @@ class CppBackendWorker:
         self._current_session_id: Optional[str] = None
         self._round_number: int = 0
         self._sent_wav_files: set = set()
+        self._last_kv_cache_length: int = 0
+        # duplex 的 length_penalty 只能在 decode 阶段提供；duplex_prepare 时保存，
+        # duplex_generate 的每次 decode 请求下发给 C++
+        self._duplex_length_penalty: float = 1.1
 
     # ================================================================
     # Model loading (maps to omni_init)
@@ -206,7 +252,16 @@ class CppBackendWorker:
 
     @property
     def kv_cache_length(self) -> int:
-        return 0
+        """C++ 在 omni_init / update_session_config / prefill / decode 的 ack/SSE 里
+        会把当前 n_past 作为 kv_cache_length 回传，这里缓存最近一次读到的值。"""
+        return int(self._last_kv_cache_length)
+
+    def _maybe_update_kv_cache_length(self, payload: Any) -> None:
+        if isinstance(payload, dict) and "kv_cache_length" in payload:
+            try:
+                self._last_kv_cache_length = int(payload.get("kv_cache_length", 0) or 0)
+            except (TypeError, ValueError):
+                logger.debug("invalid kv_cache_length payload: %r", payload.get("kv_cache_length"))
 
     # ================================================================
     # Duplex
@@ -220,12 +275,21 @@ class CppBackendWorker:
         media_type: int = 2,
         lang: Optional[str] = None,
         system_content: Any = None,
+        sampling: Optional[Dict[str, Any]] = None,
+        length_penalty: float = 1.1,
     ) -> str:
-        """Duplex 准备 → update_session_config"""
+        """Duplex 准备 → update_session_config。sampling 可由 worker 从 DuplexConfig
+        透传，当前能识别：listen_prob_scale / force_listen_count /
+        max_new_speak_tokens_per_chunk / tts_temperature。
+
+        length_penalty 在 C++ 侧只能在 /v1/stream/decode 时指定，duplex 每个 chunk
+        一次 decode；这里保存到实例，由 duplex_generate 透传。
+        """
         self._reset_output_dir()
         self._duplex_chunk_counter = 0
         self._round_number = 0
         self._sent_wav_files = set()
+        self._duplex_length_penalty = float(length_penalty)
         voice_audio = ref_audio_path or self.ref_audio_path or ""
         effective_system_content = system_content if system_content else system_prompt_text
         self._call_update_session_config(
@@ -234,6 +298,7 @@ class CppBackendWorker:
             voice_audio=voice_audio,
             lang=lang,
             system_content=effective_system_content,
+            sampling=sampling,
         )
         os.makedirs(os.path.join(self._output_dir, "tts_wav"), exist_ok=True)
         os.makedirs(os.path.join(self._output_dir, "tts_txt"), exist_ok=True)
@@ -300,7 +365,10 @@ class CppBackendWorker:
 
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/decode",
-            json={"stream": True},
+            json={
+                "stream": True,
+                "length_penalty": float(self._duplex_length_penalty),
+            },
             timeout=600.0,
         )
 
@@ -329,6 +397,8 @@ class CppBackendWorker:
                     texts.append(event["text"])
                 if event.get("content"):
                     texts.append(event["content"])
+                # C++ 只在最后一个 SSE 事件里携带 kv_cache_length
+                self._maybe_update_kv_cache_length(event)
                 # if event.get("stop"):
                 #     end_of_turn = True
 
@@ -621,6 +691,7 @@ class CppBackendWorker:
                                 duration_ms=round((time.perf_counter() - t0) * 1000, 1),
                             )
                             chunk_idx += 1
+                        self._maybe_update_kv_cache_length(event)
                         if event.get("stop"):
                             break
 
@@ -694,6 +765,7 @@ class CppBackendWorker:
         lang: Optional[str] = None,
         ref_audio_path: Optional[str] = None,
         system_content: Any = None,
+        sampling: Optional[Dict[str, Any]] = None,
     ) -> None:
         """重置 Half-Duplex 会话"""
         voice_audio = ref_audio_path or self.ref_audio_path or ""
@@ -703,6 +775,7 @@ class CppBackendWorker:
             voice_audio=voice_audio,
             lang=lang,
             system_content=system_content,
+            sampling=sampling,
         )
         self._duplex_chunk_counter = 0
         self._round_number = 0
@@ -759,10 +832,12 @@ class CppBackendWorker:
                      use_tts_template=False, enable_thinking=False, lang: Optional[str] = None,
                      ref_audio_path: Optional[str] = None,
                      reset_context: bool = True,
-                     system_content: Any = None) -> str:
+                     system_content: Any = None,
+                     sampling: Optional[Dict[str, Any]] = None) -> str:
         """Chat prefill — reset_context=True 时重置会话上下文
 
         system_content: 如未提供，自动从 msgs 中的 system role 抽取 content
+        sampling: 可选，C++ 端识别的 sampling 字段（如 tts_temperature 等）
         """
         media_type = 2 if omni_mode else 1
         effective_system_content = system_content
@@ -782,6 +857,7 @@ class CppBackendWorker:
                 voice_audio=ref_audio_path or self.ref_audio_path or "",
                 lang=lang,
                 system_content=effective_system_content,
+                sampling=sampling,
             )
         logger.info(
             f"[ChatPrefill] session={session_id} omni_mode={omni_mode} media_type={media_type} "
@@ -816,14 +892,26 @@ class CppBackendWorker:
                     self._call_prefill("", temp_img, cnt, max_slice_nums or -1)
                     self._cleanup_temp_files("", temp_img)
                     cnt += 1
+                elif isinstance(item, str):
+                    if not item:
+                        continue
+                    # turnbased 纯文本输入：C++ /v1/stream/prefill 支持 text 字段，
+                    # 不传可能导致 LLM 状态未 push 用户消息，产生乱码/空响应。
+                    self._call_prefill("", "", cnt, text=item)
+                    cnt += 1
         return "prefilled"
 
     def chat_non_streaming_generate(self, session_id, **kwargs):
         """Chat 非流式生成"""
         cur_round = self._round_number
+        length_penalty = float(kwargs.get("length_penalty", 1.1) or 1.1)
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/decode",
-            json={"stream": True, "round_idx": cur_round},
+            json={
+                "stream": True,
+                "round_idx": cur_round,
+                "length_penalty": length_penalty,
+            },
             timeout=600.0,
         )
         self._round_number += 1
@@ -1010,9 +1098,13 @@ class CppBackendWorker:
             )
             if resp2.status_code != 200:
                 raise RuntimeError(f"omni_init failed after restart: {resp2.text}")
-            logger.info(f"omni_init success (after restart): {resp2.json()}")
+            payload2 = resp2.json()
+            self._maybe_update_kv_cache_length(payload2)
+            logger.info(f"omni_init success (after restart): {payload2}")
             return
-        logger.info(f"omni_init success: {resp.json()}")
+        payload = resp.json()
+        self._maybe_update_kv_cache_length(payload)
+        logger.info(f"omni_init success: {payload}")
 
     def _call_update_session_config(
         self,
@@ -1021,7 +1113,15 @@ class CppBackendWorker:
         voice_audio: str = "",
         lang: Optional[str] = None,
         system_content: Any = None,
+        sampling: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """sampling: 可选 dict，会原样下推到 /v1/stream/update_session_config，
+        当前 C++ 侧识别的字段：
+          - listen_prob_scale (float)
+          - force_listen_count (int)
+          - max_new_speak_tokens_per_chunk (int)
+          - tts_temperature (float)
+        其它字段会被 C++ 端忽略，便于将来增量扩展。"""
         mode_changed = (
             self._last_duplex_mode is not None and
             self._last_duplex_mode != duplex_mode
@@ -1046,8 +1146,8 @@ class CppBackendWorker:
             )
             self._last_duplex_mode = duplex_mode
             self._last_media_type = media_type
-            # omni_init already prefills voice_audio if set in ref_audio_path
-            # return
+            # 即使刚 omni_init 完，后面仍需要下发 update_session_config，
+            # 以便 C++ 端应用新的 sampling 参数（C++ 在 init 时只使用默认值）。
 
         self._last_duplex_mode = duplex_mode
         self._last_media_type = media_type
@@ -1083,6 +1183,15 @@ class CppBackendWorker:
         if lang:
             self._last_lang = lang
 
+        if sampling:
+            for key in _CPP_SAMPLING_KEYS:
+                if key in sampling and sampling[key] is not None:
+                    req_body[key] = sampling[key]
+            logger.info(
+                "update_session_config sampling: %s",
+                {k: req_body[k] for k in _CPP_SAMPLING_KEYS if k in req_body},
+            )
+
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/update_session_config",
             json=req_body,
@@ -1090,9 +1199,19 @@ class CppBackendWorker:
         )
         if resp.status_code != 200:
             raise RuntimeError(f"update_session_config failed: {resp.text}")
+        try:
+            self._maybe_update_kv_cache_length(resp.json())
+        except Exception:
+            pass
 
     def _call_prefill(self, audio_path: str, img_path: str, cnt: int,
-                      max_slice_nums: int = -1) -> None:
+                      max_slice_nums: int = -1, text: str = "") -> None:
+        """C++ /v1/stream/prefill 支持三选一或组合：
+          - audio_path_prefix + cnt
+          - img_path_prefix + cnt
+          - text (纯文本，turnbased 文本对话用)
+        至少要有其中一个非空，否则 C++ 会 400。
+        """
         req_body: Dict[str, Any] = {
             "audio_path_prefix": audio_path,
             "img_path_prefix": img_path,
@@ -1100,6 +1219,8 @@ class CppBackendWorker:
         }
         if max_slice_nums > 0:
             req_body["max_slice_nums"] = max_slice_nums
+        if text:
+            req_body["text"] = text
 
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/prefill",
@@ -1108,6 +1229,11 @@ class CppBackendWorker:
         )
         if resp.status_code != 200:
             logger.error(f"prefill failed (cnt={cnt}): {resp.text}")
+            return
+        try:
+            self._maybe_update_kv_cache_length(resp.json())
+        except Exception:
+            pass
 
     # ================================================================
     # Internal: data conversion helpers

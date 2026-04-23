@@ -340,8 +340,15 @@ class MiniCPMOWorker:
         lang: Optional[str] = None,
         reset_context: bool = True,
         ref_audio_path: Optional[str] = None,
+        system_content: Any = None,
+        sampling: Optional[Dict[str, Any]] = None,  # noqa: ARG002 — pytorch view 不消费
     ) -> str:
-        """Chat prefill：一次性 prefill 所有消息到 KV cache"""
+        """Chat prefill：一次性 prefill 所有消息到 KV cache
+
+        system_content: 前端原始 system 段，C++ backend 用它构造自定义 prompt；
+            pytorch backend 不识别时走 TypeError fallback。
+        sampling: 预留给 cpp backend；pytorch 路径不消费。
+        """
         chat_view = self.processor.set_chat_mode()
         try:
             prompt = chat_view.prefill(
@@ -354,16 +361,30 @@ class MiniCPMOWorker:
                 lang=lang,
                 reset_context=reset_context,
                 ref_audio_path=ref_audio_path,
+                system_content=system_content,
             )
         except TypeError:
-            prompt = chat_view.prefill(
-                session_id=session_id,
-                msgs=msgs,
-                omni_mode=omni_mode,
-                max_slice_nums=max_slice_nums,
-                use_tts_template=use_tts_template,
-                enable_thinking=enable_thinking,
-            )
+            try:
+                prompt = chat_view.prefill(
+                    session_id=session_id,
+                    msgs=msgs,
+                    omni_mode=omni_mode,
+                    max_slice_nums=max_slice_nums,
+                    use_tts_template=use_tts_template,
+                    enable_thinking=enable_thinking,
+                    lang=lang,
+                    reset_context=reset_context,
+                    ref_audio_path=ref_audio_path,
+                )
+            except TypeError:
+                prompt = chat_view.prefill(
+                    session_id=session_id,
+                    msgs=msgs,
+                    omni_mode=omni_mode,
+                    max_slice_nums=max_slice_nums,
+                    use_tts_template=use_tts_template,
+                    enable_thinking=enable_thinking,
+                )
         return prompt
 
     def chat_non_streaming_generate(
@@ -508,6 +529,8 @@ class MiniCPMOWorker:
         media_type: int = 2,
         lang: Optional[str] = None,
         system_content: Any = None,
+        sampling: Optional[Dict[str, Any]] = None,
+        length_penalty: float = 1.1,
     ) -> str:
         """Duplex 准备
 
@@ -519,24 +542,52 @@ class MiniCPMOWorker:
                 若不提供则 fallback 到 ref_audio_path。
         """
         duplex_view = self.processor.set_duplex_mode()
+        # pytorch backend 的 length_penalty 通过 duplex_view.config 生效；
+        # cpp backend 的 duplex_view（其实就是 worker 本身）忽略 config，直接走
+        # `length_penalty=` kwarg 路径（保存到 _duplex_length_penalty）。
+        if getattr(duplex_view, "config", None) is not None:
+            try:
+                duplex_view.config.length_penalty = float(length_penalty)
+            except Exception:
+                pass
         kwargs = {
             "system_prompt_text": system_prompt_text,
             "ref_audio_path": ref_audio_path or self.ref_audio_path,
             "prompt_wav_path": prompt_wav_path,
         }
-        # C++ backend 支持 media_type/lang/system_content，pytorch backend 不一定支持，逐级 fallback
+        # C++ backend 支持 media_type/lang/system_content/sampling/length_penalty，
+        # pytorch backend 不一定支持，逐级 fallback。
         try:
             return duplex_view.prepare(
-                media_type=media_type, lang=lang, system_content=system_content, **kwargs
+                media_type=media_type,
+                lang=lang,
+                system_content=system_content,
+                sampling=sampling,
+                length_penalty=length_penalty,
+                **kwargs,
             )
         except TypeError:
             try:
-                return duplex_view.prepare(media_type=media_type, lang=lang, **kwargs)
+                return duplex_view.prepare(
+                    media_type=media_type,
+                    lang=lang,
+                    system_content=system_content,
+                    sampling=sampling,
+                    **kwargs,
+                )
             except TypeError:
                 try:
-                    return duplex_view.prepare(media_type=media_type, **kwargs)
+                    return duplex_view.prepare(
+                        media_type=media_type, lang=lang, system_content=system_content, **kwargs
+                    )
                 except TypeError:
-                    return duplex_view.prepare(**kwargs)
+                    try:
+                        return duplex_view.prepare(media_type=media_type, lang=lang, **kwargs)
+                    except TypeError:
+                        try:
+                            return duplex_view.prepare(media_type=media_type, **kwargs)
+                        except TypeError:
+                            return duplex_view.prepare(**kwargs)
 
     def duplex_prefill(
         self,
@@ -1086,7 +1137,12 @@ async def chat_ws(ws: WebSocket):
                 )
 
             await asyncio.to_thread(_do_prefill)
-            pre_kv = worker.processor.kv_cache_length if worker.processor else 0
+            # PyTorch backend 从 processor.kv_cache_length 读；C++ backend 由 CppBackendWorker
+            # 从 /v1/stream/prefill 响应里同步到自身 kv_cache_length 属性。
+            if worker.processor is not None:
+                pre_kv = worker.processor.kv_cache_length
+            else:
+                pre_kv = int(getattr(worker, "kv_cache_length", 0) or 0)
             await ws.send_json({"type": "prefill_done", "input_tokens": pre_kv})
 
             # 3. TTS init (PyTorch only; C++ handles TTS internally via omni_init)
@@ -2026,6 +2082,29 @@ async def duplex_ws(ws: WebSocket):
 
                     # 双工目前前端只传 system_prompt 字符串，直接作为 system_content 下发
                     duplex_system_content = msg.get("system_content") or system_prompt
+
+                    # 从 config 抽 C++ 认识的 sampling 字段，供 CppBackendWorker 透传
+                    # 到 /v1/stream/update_session_config
+                    duplex_sampling: Dict[str, Any] = {}
+                    if config_dict:
+                        for _sk in (
+                            "listen_prob_scale",
+                            "force_listen_count",
+                            "max_new_speak_tokens_per_chunk",
+                            "tts_temperature",
+                        ):
+                            if config_dict.get(_sk) is not None:
+                                duplex_sampling[_sk] = config_dict[_sk]
+
+                    # length_penalty 在 C++ 只能按 decode 下发，duplex 每 chunk 一次 decode；
+                    # 前端通过 config.length_penalty 传入（omni/audio_duplex 各自的 UI 字段）。
+                    duplex_length_penalty = 1.1
+                    if config_dict and config_dict.get("length_penalty") is not None:
+                        try:
+                            duplex_length_penalty = float(config_dict["length_penalty"])
+                        except (TypeError, ValueError):
+                            pass
+
                     prompt = await asyncio.to_thread(
                         worker.duplex_prepare,
                         system_prompt_text=system_prompt,
@@ -2034,6 +2113,8 @@ async def duplex_ws(ws: WebSocket):
                         media_type=duplex_media_type,
                         lang=_infer_lang_from_texts([system_prompt]),
                         system_content=duplex_system_content,
+                        sampling=duplex_sampling or None,
+                        length_penalty=duplex_length_penalty,
                     )
                     logger.info(f"Duplex prepared ({duplex_type}, media_type={duplex_media_type}, deferred_finalize={use_deferred_finalize})")
                     from config import get_config
