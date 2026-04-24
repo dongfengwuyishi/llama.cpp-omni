@@ -101,6 +101,42 @@ pwsh apps/desktop/packaging/windows/build.ps1 -Python 'C:\...\python.exe'
 | `version_info.txt` | 写入 `Comni.exe` 的 Windows 版本信息 |
 | `Comni.ico` | 运行 `make_icon.py` 后生成，**不提交到 git** |
 
+## 版本号管理（跨 mac/win 统一）
+
+版本状态文件：`apps/desktop/packaging/VERSION_LOG.json`
+
+```
+apps/desktop/packaging/
+├── bump_version.py     # 共享 helper（Python，mac/win 均可调用）
+├── VERSION_LOG.json    # { current: {macos, windows}, history: [...] }
+├── build_dmg.sh        # mac 打包，自动 peek → build → record
+└── windows/
+    └── make_installer.ps1   # -Version 由人传入，推荐先跑 peek
+```
+
+打包 Windows 前，先从 log 里拿下一个版本号：
+
+```powershell
+# 1) 预览下一版（只读，不写）
+$ver = python apps\desktop\packaging\bump_version.py peek windows
+Write-Host "Next version: $ver"
+
+# 2) 正常走 PyInstaller + Inno Setup 打包
+pwsh apps\desktop\packaging\windows\build.ps1
+pwsh apps\desktop\packaging\windows\make_installer.ps1 -Version $ver
+
+# 3) 构建都成功后，再把这一版写回 log（否则浪费号）
+python apps\desktop\packaging\bump_version.py record windows `
+    --version $ver `
+    --commit (git rev-parse --short=7 HEAD) `
+    --arch x64 `
+    --note "installer=Comni-Setup-$ver-win64.exe"
+```
+
+默认 patch +1（`1.0.1 → 1.0.2`），需要时 `--bump minor|major` 或 `--set 1.2.3`
+显式覆盖。`VERSION_LOG.json` 需要提交到 git，mac 侧 `build_dmg.sh`
+也读写同一个文件。
+
 ## Symlink 说明
 
 `~/.comni/models/` 下的模型通过符号链接/目录 Junction 指向真实模型目录，节省磁盘。
