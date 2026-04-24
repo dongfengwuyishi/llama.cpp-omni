@@ -33,7 +33,69 @@ HF_DEFAULT_MIRROR = "https://hf-mirror.com"
 MANIFEST_CACHE_HOURS = 24
 HEAD_TIMEOUT_SEC = 5
 
+# User agent used for all HF / mirror requests. Avoid the generic "Comni/1.0"
+# because some mirrors throttle unknown UAs; give them a descriptive name so
+# they can whitelist / identify us.
+_DEFAULT_UA = "comni-model-hub/1.0"
+
 ProgressCallback = Callable[[str, int, int], None]  # (filename, downloaded, total)
+
+
+# ── Networking config helpers ────────────────────────────
+#
+# Why these exist: on Chinese user machines Clash / V2Ray commonly hijack
+# *all* outbound HTTP(S) traffic via HTTPS_PROXY, including requests to
+# huggingface.co and hf-mirror.com. The proxy then either returns 502 (HF
+# not in the proxy's ruleset) or performs a TLS MITM that breaks the
+# handshake (seen in logs: "_ssl.c:993: The handshake operation timed out").
+# By default we *drop* the proxy for all HF/mirror download traffic. Users
+# who genuinely need a proxy (e.g. overseas users tunnelling back home) can
+# re-enable it with   "respect_proxy": true   in ~/.comni/config.json.
+
+
+def _should_respect_proxy() -> bool:
+    """Default False — strip HTTP(S)_PROXY for HF/mirror traffic."""
+    try:
+        return bool(load_comni_config().get("respect_proxy", False))
+    except Exception:
+        return False
+
+
+def _requests_proxies() -> Optional[dict]:
+    """Return the value to pass as ``proxies=`` to requests.
+
+    None => let requests read the env (respect_proxy=True).
+    ``{"http": None, "https": None}`` => explicitly disable proxies.
+    """
+    return None if _should_respect_proxy() else {"http": None, "https": None}
+
+
+def _urllib_opener():
+    """urllib opener with proxies disabled by default."""
+    import urllib.request
+    if _should_respect_proxy():
+        return urllib.request.build_opener()
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _should_telemetry_head() -> bool:
+    """HEAD count pings HF main site to bump the per-file download counter.
+    Pure telemetry — no benefit to the user, and each ping can block up to
+    10s on networks where HF is unreachable. Default OFF."""
+    try:
+        return bool(load_comni_config().get("telemetry_head_count", False))
+    except Exception:
+        return False
+
+
+def _should_verify_sha256() -> bool:
+    """Post-download SHA256 verification. Default OFF because hashing 4+GB
+    takes 30-60s and most users don't want the extra wait. Users on bit-rot
+    prone storage or paranoid users can flip ``"verify_sha256": true``."""
+    try:
+        return bool(load_comni_config().get("verify_sha256", False))
+    except Exception:
+        return False
 
 
 # ── Registry ─────────────────────────────────────────────
@@ -356,9 +418,18 @@ SPEED_TEST_TIMEOUT = 10           # seconds to download test bytes (HF only)
 MIN_SPEED_BPS = 200 * 1024        # 200 KB/s — below this, switch to mirror
 CONNECT_TIMEOUT = 8               # short: fail fast to trigger mirror fallback
 READ_TIMEOUT = 60
-MAX_PARALLEL = 4                  # concurrent download threads
+MAX_PARALLEL = 4                  # concurrent download threads (file level)
 MAX_RETRIES = 3                   # retry on transient network errors
 RETRY_BACKOFF = (2, 5, 10)       # seconds to wait between retries
+
+# ── Multipart (Range) download for large files ─────────────────────────
+# Single-connection HF / hf-mirror downloads usually cap at ~1-5 MB/s per
+# connection. With 8 parallel Range requests we routinely see 20-40 MB/s
+# — close to the user's line rate. Only triggered for files at least this
+# large (small files see no benefit and extra connections waste handshakes).
+MULTIPART_MIN_SIZE = 50 * 1024 * 1024   # 50 MB
+MULTIPART_PARTS = 8                     # per-file connections
+MULTIPART_PROBE_TIMEOUT = 6             # seconds for the Range-support probe
 
 
 @dataclass
@@ -406,6 +477,26 @@ class ModelDownloader:
 
     def cancel(self):
         self._cancel.set()
+
+    # -- _use_mirror access (must be lock-protected because multiple worker
+    # threads read/write it concurrently in _download_one / _stream_download) --
+
+    def _get_use_mirror(self) -> Optional[bool]:
+        with self._lock:
+            return self._use_mirror
+
+    def _set_use_mirror(self, val: bool, reason: str = "") -> None:
+        """Flip to True/False. Once a side is decided we lock it in — we do
+        NOT allow True→False (avoids per-file thrash where one thread sees
+        HF briefly succeed while others are already on mirror)."""
+        with self._lock:
+            if self._use_mirror is val:
+                return
+            if self._use_mirror is True and val is False:
+                return
+            self._use_mirror = val
+            endpoint = self.mirror_url if val else HF_MAIN_ENDPOINT
+            logger.info("Endpoint locked: %s (%s)", endpoint, reason or "decision")
 
     def _files_to_download(self) -> List[dict]:
         """Build ordered list of files: chosen LLM variant + required + optional.
@@ -468,7 +559,7 @@ class ModelDownloader:
         # Decide listing endpoint: if we've already fallen back to mirror
         # elsewhere, don't bother poking HF again.
         endpoints: List[str] = []
-        if self._use_mirror and self.mirror_url:
+        if self._get_use_mirror() and self.mirror_url:
             endpoints.append(self.mirror_url)
         else:
             endpoints.append(HF_MAIN_ENDPOINT)
@@ -482,8 +573,7 @@ class ModelDownloader:
                 tree = list(api.list_repo_tree(
                     self.hf_repo, path_in_repo=rel_dir, recursive=True))
                 if ep != HF_MAIN_ENDPOINT:
-                    # We successfully used mirror for listing — lock it in.
-                    self._use_mirror = True
+                    self._set_use_mirror(True, "list_repo_tree via mirror")
                 break
             except Exception as e:
                 logger.warning("list_repo_tree failed on %s: %s", ep, e)
@@ -515,14 +605,21 @@ class ModelDownloader:
             logger.warning("Failed to download directory %s: %s", rel_dir, e)
 
     def _send_head_for_count(self, rel_path: str):
-        """Send HEAD to HF main site in a background thread (non-blocking)."""
+        """Optional HEAD ping to HF main to bump the download counter.
+
+        Default OFF — can be enabled with ``"telemetry_head_count": true``.
+        Runs in a daemon thread so it never blocks the actual download. Uses
+        a proxy-free opener so Clash/V2Ray can't hijack the request."""
+        if not _should_telemetry_head():
+            return
+
         def _head():
             try:
                 import urllib.request
                 url = _resolve_download_url(self.hf_repo, rel_path, HF_MAIN_ENDPOINT)
                 req = urllib.request.Request(url, method="HEAD")
-                req.add_header("User-Agent", "Comni/1.0")
-                urllib.request.urlopen(req, timeout=10)
+                req.add_header("User-Agent", _DEFAULT_UA)
+                _urllib_opener().open(req, timeout=5)
                 logger.debug("HEAD count OK: %s", rel_path)
             except Exception as e:
                 logger.debug("HEAD count failed: %s (%s, non-fatal)", rel_path, e)
@@ -546,6 +643,140 @@ class ModelDownloader:
             self.progress.file_index = self._completed_count
         self._notify()
 
+    def _multipart_download(self, url: str, dest: Path, rel_path: str,
+                            expected_size: int) -> bool:
+        """Download ``url`` using ``MULTIPART_PARTS`` parallel Range requests.
+
+        Returns True on success. Returns False if the server doesn't support
+        Range (HTTP 200 instead of 206) so the caller can fall back to a
+        single-connection download. Raises on any network failure mid-way.
+
+        Assumptions (enforced by caller):
+          * expected_size >= MULTIPART_MIN_SIZE (partitioning makes sense)
+          * resume_from == 0 (we always start from scratch and pre-allocate)
+          * endpoint has already been decided (no speed probe here)
+        """
+        import requests
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # 1) Range-capability probe. We ask for byte 0-0 and check for 206.
+        try:
+            probe = requests.get(
+                url,
+                headers={"User-Agent": _DEFAULT_UA, "Range": "bytes=0-0"},
+                timeout=(CONNECT_TIMEOUT, MULTIPART_PROBE_TIMEOUT),
+                stream=True,
+                allow_redirects=True,
+                proxies=_requests_proxies(),
+            )
+            status = probe.status_code
+            probe.close()
+        except Exception as e:
+            logger.debug("Range probe raised (%s) — falling back", e)
+            return False
+
+        if status != 206:
+            logger.info(
+                "Server returned %d for Range probe on %s — falling back "
+                "to single connection", status, rel_path,
+            )
+            return False
+
+        # 2) Pre-allocate the target file. Using truncate() creates a sparse
+        # file on APFS / ext4 / NTFS so this is instant.
+        try:
+            with open(dest, "wb") as f:
+                f.truncate(expected_size)
+        except OSError as e:
+            logger.warning("Pre-allocation failed for %s: %s — falling back",
+                           rel_path, e)
+            return False
+
+        # 3) Slice into MULTIPART_PARTS byte ranges. Last part absorbs the
+        # remainder so rounding doesn't drop the final bytes.
+        part_size = expected_size // MULTIPART_PARTS
+        ranges: List[tuple] = []
+        for i in range(MULTIPART_PARTS):
+            start = i * part_size
+            end = (i + 1) * part_size - 1 if i < MULTIPART_PARTS - 1 \
+                else expected_size - 1
+            ranges.append((i, start, end))
+
+        parts_done = [0] * MULTIPART_PARTS  # bytes written per part
+        failure = threading.Event()          # any worker flips this on failure
+
+        def _fetch_range(idx: int, start: int, end: int) -> None:
+            local_done = 0
+            last_report = time.time()
+            try:
+                with requests.get(
+                    url,
+                    headers={
+                        "User-Agent": _DEFAULT_UA,
+                        "Range": f"bytes={start}-{end}",
+                    },
+                    stream=True,
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                    allow_redirects=True,
+                    proxies=_requests_proxies(),
+                ) as resp:
+                    resp.raise_for_status()
+                    # NB: each thread opens its own FD to avoid seek/write
+                    # races. Writes go to disjoint byte ranges so there is
+                    # no overlap.
+                    with open(dest, "r+b") as f:
+                        f.seek(start)
+                        for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                            if failure.is_set() or self._cancel.is_set():
+                                raise Exception("Cancelled by user")
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            local_done += len(chunk)
+                            parts_done[idx] = local_done
+
+                            now = time.time()
+                            if now - last_report >= 0.3:
+                                total_done = sum(parts_done)
+                                self._update_aggregate_progress(
+                                    rel_path, len(chunk), total_done)
+                                last_report = now
+            except Exception:
+                failure.set()
+                raise
+
+        # 4) Launch all workers; bail the moment any one fails.
+        try:
+            with ThreadPoolExecutor(max_workers=MULTIPART_PARTS,
+                                    thread_name_prefix="mpart") as pool:
+                futures = [pool.submit(_fetch_range, i, s, e)
+                           for (i, s, e) in ranges]
+                for fut in as_completed(futures):
+                    exc = fut.exception()
+                    if exc is not None:
+                        failure.set()
+                        # Wait for remaining workers to exit cleanly — their
+                        # writes to the file are already abandoned; the
+                        # caller will re-download the whole file.
+                        raise exc
+        except Exception:
+            # Leave the (possibly partial) file on disk so the caller's
+            # retry can decide whether to resume or discard. The
+            # _sanitize_resume() helper will keep actual<=expected bytes,
+            # but since we pre-allocated to expected_size the size check
+            # can't distinguish partial from complete. So discard on
+            # failure to avoid a false "complete" verdict.
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            raise
+
+        # 5) Final progress flush.
+        total_done = sum(parts_done)
+        self._update_aggregate_progress(rel_path, 0, total_done)
+        return True
+
     def _stream_download(self, url: str, dest: Path, rel_path: str,
                          expected_size: int, resume_from: int = 0) -> bool:
         """Stream-download a file with real progress reporting.
@@ -561,15 +792,16 @@ class ModelDownloader:
         import requests
 
         is_hf = url.startswith(HF_MAIN_ENDPOINT)
-        probing = is_hf and self._use_mirror is None and bool(self.mirror_url)
+        probing = is_hf and self._get_use_mirror() is None and bool(self.mirror_url)
 
-        headers = {"User-Agent": "Comni/1.0"}
+        headers = {"User-Agent": _DEFAULT_UA}
         if resume_from > 0:
             headers["Range"] = f"bytes={resume_from}-"
 
         resp = requests.get(url, headers=headers, stream=True,
                             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-                            allow_redirects=True)
+                            allow_redirects=True,
+                            proxies=_requests_proxies())
         resp.raise_for_status()
 
         done = resume_from
@@ -602,7 +834,7 @@ class ModelDownloader:
                             return False
                         logger.info("HF OK (%.0f KB/s) — staying on main",
                                     speed / 1024)
-                        self._use_mirror = False
+                        self._set_use_mirror(False, "HF fast enough")
                         probing = False
                     elif now - t0 > SPEED_TEST_TIMEOUT:
                         resp.close()
@@ -616,6 +848,71 @@ class ModelDownloader:
 
         self._update_aggregate_progress(rel_path, 0, done)
         return True
+
+    def _sanitize_resume(self, dest_file: Path, rel_path: str,
+                         expected_size: int) -> int:
+        """Decide how many bytes we can safely resume from.
+
+        Returns the resume offset (0 = start over). If the existing file is
+        bigger than expected (e.g. a previous run wrote a proxy error page
+        into it, or an Apple AV scanner appended quarantine metadata), we
+        delete it — continuing would produce a size mismatch only at the
+        very end, after wasting the user's time re-downloading everything."""
+        if not dest_file.exists():
+            return 0
+        actual = dest_file.stat().st_size
+        if expected_size > 0 and actual > expected_size:
+            logger.warning(
+                "Local %s is larger than expected (%d > %d) — discarding",
+                rel_path, actual, expected_size,
+            )
+            try:
+                dest_file.unlink()
+            except OSError as e:
+                logger.warning("Failed to remove oversized local file: %s", e)
+            return 0
+        # actual <= expected: safe to resume. A zero-byte leftover is fine
+        # (resume=0 is effectively a fresh download).
+        return actual
+
+    def _download_file_from(self, url: str, dest_file: Path, rel_path: str,
+                            expected_size: int, resume_from: int) -> bool:
+        """Unified download wrapper: tries multipart first when eligible,
+        else falls back to single-connection ``_stream_download``.
+
+        Returns True on normal completion, False only for the HF-slow signal
+        (bubbled up from _stream_download). Raises on genuine failures.
+        """
+        eligible = (
+            expected_size >= MULTIPART_MIN_SIZE
+            and resume_from == 0
+            and self._get_use_mirror() is not None  # endpoint decided
+        )
+        if eligible:
+            try:
+                logger.info(
+                    "Multipart download %s (%s, %d parts)",
+                    rel_path, _fmt_size(expected_size), MULTIPART_PARTS,
+                )
+                if self._multipart_download(url, dest_file, rel_path,
+                                            expected_size):
+                    return True
+                # False = Range not supported; fall through to single conn.
+                logger.info("Multipart not supported for %s — single conn",
+                            rel_path)
+            except Exception as e:
+                # Partial file already discarded by _multipart_download.
+                # Bubble up so caller can retry (possibly via mirror).
+                if "Cancelled" in str(e):
+                    raise
+                logger.warning(
+                    "Multipart failed for %s (%s) — will fall back to "
+                    "single connection on next attempt", rel_path, e,
+                )
+                raise
+
+        return self._stream_download(url, dest_file, rel_path,
+                                     expected_size, resume_from)
 
     def _download_one(self, finfo: dict):
         """Download a single file with retry (called from thread pool).
@@ -655,15 +952,16 @@ class ModelDownloader:
                 time.sleep(wait)
 
             # --- Try HF first (unless we've already locked in a mirror) ---
-            if not self._use_mirror:
-                resume_from = dest_file.stat().st_size if dest_file.exists() else 0
+            if not self._get_use_mirror():
+                resume_from = self._sanitize_resume(
+                    dest_file, rel_path, expected_size)
                 url = _resolve_download_url(self.hf_repo, rel_path, HF_MAIN_ENDPOINT)
                 try:
                     if attempt == 0:
                         logger.info("Downloading %s from HF (resume=%d)",
                                     rel_path, resume_from)
-                    ok = self._stream_download(url, dest_file, rel_path,
-                                               expected_size, resume_from)
+                    ok = self._download_file_from(url, dest_file, rel_path,
+                                                  expected_size, resume_from)
                     if ok:
                         if self._verify_size(dest_file, rel_path, expected_size):
                             self._mark_file_done(rel_path)
@@ -675,32 +973,31 @@ class ModelDownloader:
                         # No mirror configured — keep retrying HF
                         last_err = Exception("HF too slow and no mirror configured")
                         continue
-                    logger.info("HF slow for %s — switching to mirror", rel_path)
-                    self._use_mirror = True
+                    self._set_use_mirror(True, f"HF slow for {rel_path}")
                 except Exception as e:
                     err_msg = str(e)
                     if "Cancelled" in err_msg:
                         raise
                     last_err = e
                     logger.warning("HF failed for %s: %s", rel_path, err_msg)
-                    if self.mirror_url and self._use_mirror is None:
+                    if self.mirror_url and self._get_use_mirror() is None:
                         # First HF failure → promote to mirror immediately.
                         # This does NOT consume a retry attempt for mirror.
-                        logger.info("Switching to mirror after HF error")
-                        self._use_mirror = True
+                        self._set_use_mirror(True, "HF error")
                     elif not self.mirror_url:
                         # No mirror available — fall through to next attempt
                         continue
 
             # --- Mirror path (either decided earlier or just-promoted) ---
-            if self._use_mirror and self.mirror_url:
-                resume_from = dest_file.stat().st_size if dest_file.exists() else 0
+            if self._get_use_mirror() and self.mirror_url:
+                resume_from = self._sanitize_resume(
+                    dest_file, rel_path, expected_size)
                 url = _resolve_download_url(self.hf_repo, rel_path, self.mirror_url)
                 try:
                     logger.info("Downloading %s from mirror %s (resume=%d)",
                                 rel_path, self.mirror_url, resume_from)
-                    self._stream_download(url, dest_file, rel_path,
-                                          expected_size, resume_from)
+                    self._download_file_from(url, dest_file, rel_path,
+                                             expected_size, resume_from)
                     if self._verify_size(dest_file, rel_path, expected_size):
                         self._mark_file_done(rel_path)
                         return
@@ -747,7 +1044,7 @@ class ModelDownloader:
         """
         if not self.mirror_url:
             # No mirror at all → just use HF and hope for the best.
-            self._use_mirror = False
+            self._set_use_mirror(False, "no mirror available")
             return files
 
         probe = min(files, key=lambda f: f.get("size", 0))
@@ -757,12 +1054,10 @@ class ModelDownloader:
                      _fmt_size(probe.get("size", 0)))
         self._download_one(probe)  # raises only if both HF and mirror fail
 
-        if self._use_mirror is None:
+        if self._get_use_mirror() is None:
             # Probe finished on HF without triggering the slow-speed signal
             # (e.g. file smaller than SPEED_TEST_BYTES). Stay on HF.
-            self._use_mirror = False
-        logger.info("Endpoint decided: %s",
-                     self.mirror_url if self._use_mirror else HF_MAIN_ENDPOINT)
+            self._set_use_mirror(False, "probe finished on HF")
         return rest
 
     def _run(self):

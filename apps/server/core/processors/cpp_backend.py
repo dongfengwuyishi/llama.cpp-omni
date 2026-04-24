@@ -1564,10 +1564,12 @@ class CppBackendWorker:
             )
             self._last_duplex_mode = duplex_mode
             self._last_media_type = media_type
-            # omni_init 已经按 ref_audio_path 预填了 voice_audio,
-            # 但仍然 fall through 到下方 update_session_config, 让 C++ 端
-            # 应用调用方新传入的 sampling 参数 (C++ 在 init 时只使用默认值)
-            # 以及任何其他未覆盖的字段。
+            # 即使刚 omni_init 完，后面仍需要下发 update_session_config：
+            #   1) omni_init 只在 ref_audio_path 被设置时 prefill voice_audio，
+            #      其它 field（sampling 等）仍需 update_session_config 同步；
+            #   2) C++ 在 init 时只使用默认的 sampling 参数，新值必须通过
+            #      update_session_config 才能下发。
+            # 所以这里 fall through 到下面的 lightweight 分支。
 
         self._last_duplex_mode = duplex_mode
         self._last_media_type = media_type

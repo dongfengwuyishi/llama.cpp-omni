@@ -230,7 +230,6 @@ def ensure_config(model_dir: str, port: int = 8006, worker_base_port: int = DEFA
 
 def _make_no_proxy_env(base_env: dict | None = None) -> dict:
     """Return a child-process env with all HTTP proxy settings disabled.
-
     Required to prevent loopback traffic (gateway<->worker<->llama-server) from
     being hijacked by host-level HTTP proxies (Clash/V2Ray on 127.0.0.1:7890)."""
     env = os.environ.copy() if base_env is None else dict(base_env)
@@ -304,6 +303,7 @@ def wait_for_health(url: str, timeout: int = 300, interval: float = 2.0) -> bool
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    # Bypass any host-level HTTP proxy: loopback probes must not be intercepted.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     # Bypass any host-level HTTP proxy: loopback probes must not be intercepted.
