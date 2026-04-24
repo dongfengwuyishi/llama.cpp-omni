@@ -785,6 +785,15 @@ class ServiceController(QThread):
         env["PYTHONPATH"] = str(_SERVER_DIR)
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        # Prevent host-level HTTP proxy (Clash / V2Ray / corporate proxy) from
+        # hijacking loopback IPC between gateway / worker / llama-server.
+        # Python's proxy_bypass doesn't always treat 'localhost' as an
+        # exception on non-English Windows / macOS locales.
+        for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                   "http_proxy", "https_proxy", "all_proxy"):
+            env.pop(_k, None)
+        env["NO_PROXY"] = "*"
+        env["no_proxy"] = "*"
         backend = detect_gpu_backend()
         self.log_line.emit(f"GPU backend: {backend}\n")
 
@@ -815,7 +824,7 @@ class ServiceController(QThread):
             self.state_changed.emit(ServiceState.ERROR)
             return
 
-        if not self._wait_health(f"http://localhost:{self._wk_port}", timeout=300):
+        if not self._wait_health(f"http://127.0.0.1:{self._wk_port}", timeout=300):
             if self._worker_proc and self._worker_proc.poll() is not None:
                 self.log_line.emit(
                     f"\nWorker exited with code {self._worker_proc.returncode}\n")
@@ -830,7 +839,7 @@ class ServiceController(QThread):
         gateway_cmd = [
             python_exe, str(_SERVER_DIR / "gateway.py"),
             "--port", str(self._gw_port),
-            "--workers", f"localhost:{self._wk_port}",
+            "--workers", f"127.0.0.1:{self._wk_port}",
             "--http",
         ]
         self._gateway_proc = self._popen(gateway_cmd, env)
@@ -880,9 +889,12 @@ class ServiceController(QThread):
 
     def _wait_health(self, url: str, timeout: int = 300) -> bool:
         import urllib.request
+        # Bypass any host-level HTTP proxy: loopback probes must not be
+        # intercepted by local HTTP proxies (Clash/V2Ray etc.).
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for _ in range(timeout // 2):
             try:
-                resp = urllib.request.urlopen(f"{url}/health", timeout=3)
+                resp = opener.open(f"{url}/health", timeout=3)
                 if resp.status == 200:
                     data = json.loads(resp.read())
                     if data.get("model_loaded", True):

@@ -42,7 +42,7 @@ from io import BytesIO
 import httpx
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Body
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, Response, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -394,9 +394,10 @@ async def chat_ws_proxy(ws: WebSocket):
         task_start = datetime.now()
 
         # 连接 Worker WebSocket（proxy=None 避免 macOS 系统代理干扰 localhost）
+        # max_size=128MB：允许前端附带短视频/高分辨率图片作为 user-turn 附件
         import websockets
         ws_url = f"ws://{assigned_worker.host}:{assigned_worker.port}/ws/chat"
-        worker_ws = await websockets.connect(ws_url, proxy=None)
+        worker_ws = await websockets.connect(ws_url, proxy=None, max_size=128 * 1024 * 1024)
 
         # 转发请求
         await worker_ws.send(raw)
@@ -514,7 +515,10 @@ async def half_duplex_ws(ws: WebSocket, session_id: str):
         max_retries = 5
         for attempt in range(max_retries):
             try:
-                worker_ws = await websockets.connect(ws_url, open_timeout=5, proxy=None)
+                worker_ws = await websockets.connect(
+                    ws_url, open_timeout=5, proxy=None,
+                    max_size=128 * 1024 * 1024,
+                )
                 break
             except Exception as conn_err:
                 if attempt < max_retries - 1:
@@ -579,6 +583,11 @@ async def _write_diagnostic(path: str, msg: dict) -> None:
 
 
 def _sync_append(path: str, line: str) -> None:
+    # 诊断文件所在目录可能不存在（打包后 cwd 为 apps/server，不含 tmp/），
+    # 自动创建。失败时冒泡给上层统一吞掉并打 warning。
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(line)
 
@@ -677,7 +686,10 @@ async def duplex_ws(ws: WebSocket, session_id: str):
         max_retries = 5
         for attempt in range(max_retries):
             try:
-                worker_ws = await websockets.connect(ws_url, open_timeout=5, proxy=None)
+                worker_ws = await websockets.connect(
+                    ws_url, open_timeout=5, proxy=None,
+                    max_size=128 * 1024 * 1024,
+                )
                 break
             except Exception as conn_err:
                 if attempt < max_retries - 1:
@@ -1253,6 +1265,61 @@ async def upload_session_recording(session_id: str, file: UploadFile = File(...)
     return {"status": "ok", "path": f"frontend_replay{ext}", "size_bytes": total}
 
 
+# ============ Session Comment (mobile + desktop 共用) ============
+
+_COMMENT_MAX_CHARS = 2000
+
+
+@app.post("/api/sessions/{session_id}/comment")
+async def save_session_comment(session_id: str, payload: Dict[str, Any] = Body(...)):
+    """保存用户对该 session 的评语，写入 data/sessions/{session_id}/comment.txt"""
+    sdir = _session_dir(session_id)
+    if not os.path.isdir(sdir):
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+    raw = payload.get("comment")
+    if raw is None:
+        raw = ""
+    if not isinstance(raw, str):
+        raise HTTPException(status_code=400, detail="comment must be a string")
+    comment = raw.strip()
+    if len(comment) > _COMMENT_MAX_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Comment too long (max {_COMMENT_MAX_CHARS} chars)",
+        )
+
+    dest = os.path.join(sdir, "comment.txt")
+    if comment:
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(comment)
+    else:
+        # Empty comment ⇒ remove any prior comment file so it doesn't linger.
+        try:
+            os.remove(dest)
+        except FileNotFoundError:
+            pass
+
+    logger.info(f"[Session] comment saved: {session_id} ({len(comment)} chars)")
+    return {"status": "ok", "len": len(comment)}
+
+
+@app.get("/api/sessions/{session_id}/comment")
+async def get_session_comment(session_id: str):
+    """读取 session 的评语；不存在则返回空字符串（向前兼容旧会话）。"""
+    sdir = _session_dir(session_id)
+    if not os.path.isdir(sdir):
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+    dest = os.path.join(sdir, "comment.txt")
+    if not os.path.exists(dest):
+        return {"comment": ""}
+    try:
+        with open(dest, "r", encoding="utf-8") as f:
+            return {"comment": f.read()}
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/s/{session_id}", response_class=HTMLResponse)
 async def session_viewer(session_id: str):
     """Session 回看页面"""
@@ -1355,6 +1422,60 @@ async def audio_duplex():
     return HTMLResponse("<h1>Audio Duplex</h1><p>Page not found</p>")
 
 
+# ============ 移动端 ============
+
+@app.get("/mobile-omni", include_in_schema=False)
+async def mobile_omni_redirect():
+    """移动版 Omni 入口重定向到带尾斜杠版本"""
+    return RedirectResponse(url="/mobile-omni/", status_code=302)
+
+
+@app.get("/mobile-omni/", response_class=HTMLResponse)
+async def mobile_omni():
+    """移动版全双工页：复用桌面 omni-app.js，外壳为 apps/frontend/mobile-omni/"""
+    if not app_registry.is_enabled("omni"):
+        return RedirectResponse(url="/", status_code=302)
+    page_path = os.path.join(static_dir, "mobile-omni", "index.html")
+    if os.path.exists(page_path):
+        return FileResponse(page_path)
+    return HTMLResponse("<h1>Mobile Omni</h1><p>Page not found</p>", status_code=404)
+
+
+@app.get("/mobile", include_in_schema=False)
+async def mobile_redirect():
+    """移动端入口重定向到带尾斜杠版本，确保相对资源路径正确解析"""
+    return RedirectResponse(url="/mobile/", status_code=302)
+
+
+@app.get("/mobile/", response_class=HTMLResponse)
+async def mobile():
+    """移动端 React 预览页面（由 frontend-mobile 项目 build 到 frontend/mobile/）"""
+    page_path = os.path.join(static_dir, "mobile", "index.html")
+    if os.path.exists(page_path):
+        return FileResponse(page_path)
+    return HTMLResponse(
+        "<h1>Mobile Preview</h1>"
+        "<p>Build output not found. Run "
+        "<code>cd apps/frontend-mobile && bun run --bun build:static</code> "
+        "(or <code>npm run build:static</code>) to produce the assets.</p>",
+        status_code=404,
+    )
+
+
+@app.api_route("/mobile/{asset_path:path}", methods=["GET", "HEAD"])
+async def mobile_asset(asset_path: str):
+    """移动端构建产物静态资源"""
+    mobile_root = os.path.realpath(os.path.join(static_dir, "mobile"))
+    full_path = os.path.realpath(os.path.join(mobile_root, asset_path))
+
+    if not full_path.startswith(mobile_root + os.sep):
+        raise HTTPException(status_code=400, detail="Path traversal detected")
+    if not os.path.exists(full_path) or os.path.isdir(full_path):
+        raise HTTPException(status_code=404, detail=f"Mobile asset not found: {asset_path}")
+
+    return FileResponse(full_path)
+
+
 @app.get("/admin", response_class=HTMLResponse)
 async def admin():
     """Admin Dashboard"""
@@ -1435,7 +1556,9 @@ def main():
     else:
         logger.warning("Running in HTTP mode (no TLS). Browser microphone/camera APIs may not work.")
 
-    uvicorn.run(app, host=args.host, port=port, **ssl_kwargs)
+    # ws_max_size=128MB 以便前端可以附带短视频 / 高分辨率图片
+    uvicorn.run(app, host=args.host, port=port,
+                ws_max_size=128 * 1024 * 1024, **ssl_kwargs)
 
 
 if __name__ == "__main__":

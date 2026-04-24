@@ -693,20 +693,41 @@ class AppDelegate(NSObject):
 
         y = mc_y - 12
 
-        # ── Service Card ──
-        svc_h = 50
+        # ── Service Card (两行：桌面 URL + 移动 URL) ──
+        svc_h = 82
         svc_y = y - svc_h
         cv.addSubview_(self._make_card(x=_PAD, y=svc_y, w=_CARD_W, h=svc_h))
 
-        svc_mid = svc_y + (svc_h - 20) // 2
-        cv.addSubview_(self._make_label("URL", x=_INNER_L, y=svc_mid, w=32, h=20,
-                                         size=12, bold=True))
-        self._url_label = self._make_label(f"http://localhost:{self._port}",
-                                            x=_INNER_L + 38, y=svc_mid, w=_INNER_W - 120, h=20,
-                                            size=12, color=NSColor.secondaryLabelColor())
+        # 第一行（靠上）：桌面 URL + Copy
+        row1_y = svc_y + svc_h - _CARD_INSET - 22
+        cv.addSubview_(self._make_label("Desktop",
+                                         x=_INNER_L, y=row1_y, w=60, h=20,
+                                         size=11, bold=True))
+        self._url_label = self._make_label(
+            f"https://localhost:{self._port}",
+            x=_INNER_L + 64, y=row1_y, w=_INNER_W - 64 - 80, h=20,
+            size=12, color=NSColor.secondaryLabelColor())
         cv.addSubview_(self._url_label)
-        cv.addSubview_(self._make_button("Copy", x=_PAD + _CARD_W - _CARD_INSET - 72,
-                                          y=svc_mid - 2, w=72, h=24, action="onCopyURL:"))
+        cv.addSubview_(self._make_button(
+            "Copy", x=_PAD + _CARD_W - _CARD_INSET - 72,
+            y=row1_y - 2, w=72, h=24, action="onCopyURL:"))
+
+        # 第二行（靠下）：Mobile URL（局域网 IP） + QR 按钮
+        row2_y = svc_y + _CARD_INSET
+        cv.addSubview_(self._make_label("Mobile",
+                                         x=_INNER_L, y=row2_y, w=60, h=20,
+                                         size=11, bold=True))
+        lan_ip = self._get_lan_ip()
+        mobile_url = (f"https://{lan_ip}:{self._port}/mobile/"
+                      if lan_ip else "(no LAN IP detected)")
+        self._mobile_url_label = self._make_label(
+            mobile_url,
+            x=_INNER_L + 64, y=row2_y, w=_INNER_W - 64 - 80, h=20,
+            size=12, color=NSColor.secondaryLabelColor())
+        cv.addSubview_(self._mobile_url_label)
+        cv.addSubview_(self._make_button(
+            "QR", x=_PAD + _CARD_W - _CARD_INSET - 72,
+            y=row2_y - 2, w=72, h=24, action="onShowMobileQR:"))
 
         y = svc_y - 8
 
@@ -1175,7 +1196,7 @@ class AppDelegate(NSObject):
             self._worker_port = wk
             self._gw_field.setStringValue_(str(gw))
             self._wk_field.setStringValue_(str(wk))
-            self._url_label.setStringValue_(f"http://localhost:{self._port}")
+            self._url_label.setStringValue_(f"https://localhost:{self._port}")
             save_config(model_dir, self._port, self._worker_port)
             for line in port_notes:
                 self._append_log(line)
@@ -1231,6 +1252,19 @@ class AppDelegate(NSObject):
             env = os.environ.copy()
             env["PYTHONPATH"] = str(_SERVER_DIR)
 
+            # ---------------------------------------------------------------
+            # 防止系统级 HTTP 代理劫持 loopback。
+            # 常见场景：用户开着 Clash/V2Ray，系统代理指向 127.0.0.1:7890。
+            # 子进程里 httpx / urllib 默认会读环境变量 HTTP_PROXY/HTTPS_PROXY，
+            # 于是把本该直连 worker 的 http://127.0.0.1:22700/ 发到 Clash
+            # 被回 502。显式清空所有 proxy 相关变量，并强制 NO_PROXY=*。
+            # ---------------------------------------------------------------
+            for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                       "http_proxy", "https_proxy", "all_proxy"):
+                env.pop(_k, None)
+            env["NO_PROXY"] = "*"
+            env["no_proxy"] = "*"
+
             self._set_progress_text("Loading models…")
             self._start_log_tail()
 
@@ -1240,7 +1274,7 @@ class AppDelegate(NSObject):
                 env=env, cwd=str(_SERVER_DIR),
                 stdout=self._log_file, stderr=subprocess.STDOUT)
 
-            if not self._wait_health(f"http://localhost:{self._worker_port}", 300):
+            if not self._wait_health(f"http://127.0.0.1:{self._worker_port}", 300):
                 if self._worker_proc and self._worker_proc.poll() is not None:
                     self._append_log(f"\nWorker exited with code {self._worker_proc.returncode}\n")
                 else:
@@ -1251,10 +1285,13 @@ class AppDelegate(NSObject):
             self._append_log("\nWorker ready!\n")
             self._set_progress_text("Starting gateway…")
 
+            # Gateway 默认用 HTTPS（自签名证书）。
+            # HTTP 模式下浏览器会禁掉麦克风/摄像头（非 secure context），
+            # 移动端通过局域网 IP 访问时录音/视频完全不可用，所以必须 HTTPS。
             self._gateway_proc = subprocess.Popen(
                 [sys.executable, str(_SERVER_DIR / "gateway.py"),
                  "--port", str(self._port),
-                 "--workers", f"localhost:{self._worker_port}", "--http"],
+                 "--workers", f"127.0.0.1:{self._worker_port}"],
                 env=env, cwd=str(_SERVER_DIR),
                 stdout=self._log_file, stderr=subprocess.STDOUT)
 
@@ -1265,11 +1302,16 @@ class AppDelegate(NSObject):
                 return
 
             self._set_state(ServiceState.RUNNING)
+            lan_ip = self._get_lan_ip()
+            lan_line = (f"  On your phone (same Wi-Fi): https://{lan_ip}:{self._port}\n"
+                        if lan_ip else "")
             self._append_log(
                 f"\n{'=' * 50}\n"
-                f"Server running at http://localhost:{self._port}\n"
+                f"Server running at https://localhost:{self._port}\n"
+                f"{lan_line}"
                 f"{'=' * 50}\n\n"
-                "Modes: Turn-based · Omni Duplex · Audio Duplex · Half-Duplex\n"
+                "Modes: Turn-based · Omni Duplex · Audio Duplex · Half-Duplex · Mobile\n"
+                "Note: 自签名证书，浏览器首次打开会提示不安全，点『高级 → 继续访问』即可。\n"
                 "Click 'Open Web UI' or visit the URL above.\n")
         except Exception as e:
             logger.exception("_do_start failed")
@@ -1279,10 +1321,15 @@ class AppDelegate(NSObject):
             self._append_log(traceback.format_exc())
 
     def _wait_health(self, url, timeout=300):
+        # 注意：不能直接用 urllib.request.urlopen()。macOS 上即便
+        # ExceptionsList 含 localhost / 127.0.0.1，Python 的 urllib 仍然会
+        # 读 $HTTP_PROXY 把请求走代理。这里用 ProxyHandler({}) 强制不走
+        # 任何代理，和 curl 行为对齐。
         import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for _ in range(timeout // 2):
             try:
-                resp = urllib.request.urlopen(f"{url}/health", timeout=3)
+                resp = opener.open(f"{url}/health", timeout=3)
                 if resp.status == 200:
                     data = json.loads(resp.read())
                     if data.get("model_loaded", True):
@@ -1293,6 +1340,106 @@ class AppDelegate(NSObject):
                 return False
             time.sleep(2)
         return False
+
+    @objc.python_method
+    def _is_private_ipv4(self, ip: str) -> bool:
+        """只接受常见家庭/办公局域网段，排除 VPN 假 IP (如 198.18.x Clash FakeIP)
+        和 CGNAT / link-local / loopback。"""
+        try:
+            p = [int(x) for x in ip.split(".")]
+            if len(p) != 4 or any(x < 0 or x > 255 for x in p):
+                return False
+            a, b = p[0], p[1]
+            if a == 10:
+                return True
+            if a == 172 and 16 <= b <= 31:
+                return True
+            if a == 192 and b == 168:
+                return True
+            return False
+        except Exception:
+            return False
+
+    @objc.python_method
+    def _get_lan_ip(self):
+        """尽量拿一个手机能连到的局域网 IP。探测顺序：
+        1. networksetup 找出 Wi-Fi / Ethernet 的 BSD 接口（如 en0），取其 IPv4
+        2. 兜底：ifconfig 扫所有非 VPN/虚拟接口
+        3. 最差：UDP connect 8.8.8.8 拿默认出网 IP
+
+        开 VPN（Clash / V2Ray / ExpressVPN 等）时，connect(8.8.8.8) 会被 VPN
+        劫持路由，拿到 utun* 上的假 IP（如 Clash FakeIP 段 198.18.0.0/15），
+        手机在同一 Wi-Fi 下根本连不到，所以不能用作首选方案。
+        """
+        import subprocess, re, socket
+
+        # --- 1) networksetup 枚举硬件端口，取 Wi-Fi / Ethernet ---
+        preferred_ifs = []
+        try:
+            out = subprocess.check_output(
+                ["networksetup", "-listallhardwareports"],
+                text=True, stderr=subprocess.DEVNULL, timeout=2)
+            port = dev = None
+            for ln in out.splitlines() + [""]:
+                if ln.startswith("Hardware Port:"):
+                    port = ln.split(":", 1)[1].strip()
+                elif ln.startswith("Device:"):
+                    dev = ln.split(":", 1)[1].strip()
+                elif not ln.strip():
+                    # 块结束，提交
+                    if port and dev and any(k in port for k in
+                            ("Wi-Fi", "AirPort", "Ethernet", "Thunderbolt")):
+                        preferred_ifs.append(dev)
+                    port = dev = None
+        except Exception:
+            pass
+
+        for ifn in preferred_ifs:
+            try:
+                ip = subprocess.check_output(
+                    ["ipconfig", "getifaddr", ifn],
+                    text=True, stderr=subprocess.DEVNULL, timeout=1).strip()
+                if ip and self._is_private_ipv4(ip):
+                    return ip
+            except Exception:
+                continue
+
+        # --- 2) ifconfig 兜底，排除虚拟 / VPN 接口 ---
+        BAD_PREFIX = (
+            "utun", "ipsec", "ppp", "tap", "tun",
+            "bridge", "awdl", "llw", "lo", "gif", "stf", "anpi", "ap",
+        )
+        try:
+            out = subprocess.check_output(
+                ["ifconfig"], text=True, stderr=subprocess.DEVNULL, timeout=2)
+            current_if = None
+            for ln in out.splitlines():
+                if re.match(r"^[a-zA-Z]", ln):
+                    current_if = ln.split(":", 1)[0]
+                    continue
+                m = re.search(r"\binet (\d+\.\d+\.\d+\.\d+)\b", ln)
+                if not m or not current_if:
+                    continue
+                if current_if.startswith(BAD_PREFIX):
+                    continue
+                ip = m.group(1)
+                if self._is_private_ipv4(ip):
+                    return ip
+        except Exception:
+            pass
+
+        # --- 3) 最差兜底：UDP connect ---
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.3)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and self._is_private_ipv4(ip):
+                return ip
+        except Exception:
+            pass
+        return None
 
     @objc.typedSelector(b'v@:@')
     def onStop_(self, sender):
@@ -1327,7 +1474,7 @@ class AppDelegate(NSObject):
     def onOpenBrowser_(self, sender):
         try:
             logger.info("onOpenBrowser_")
-            webbrowser.open(f"http://localhost:{self._port}")
+            webbrowser.open(f"https://localhost:{self._port}")
         except Exception:
             logger.exception("onOpenBrowser_ failed")
 
@@ -1347,11 +1494,157 @@ class AppDelegate(NSObject):
     @objc.typedSelector(b'v@:@')
     def onCopyURL_(self, sender):
         try:
-            url = f"http://localhost:{self._port}"
+            url = f"https://localhost:{self._port}"
             subprocess.run(["pbcopy"], input=url.encode(), check=True)
             self._append_log(f"URL copied: {url}\n")
         except Exception:
             logger.exception("onCopyURL_ failed")
+
+    @objc.python_method
+    def _mobile_url(self):
+        """移动端 URL。IP 会动态重新探测，保证切换 Wi-Fi 后也正确。"""
+        lan_ip = self._get_lan_ip()
+        if not lan_ip:
+            return None
+        return f"https://{lan_ip}:{self._port}/mobile/"
+
+    @objc.typedSelector(b'v@:@')
+    def onShowMobileQR_(self, sender):
+        """弹出二维码窗口，手机扫码即可打开移动端。"""
+        try:
+            logger.info("onShowMobileQR_")
+            url = self._mobile_url()
+            if not url:
+                self._alert("No LAN IP detected",
+                            "未探测到可用的局域网 IP，请确认 Mac 已连接 Wi-Fi。")
+                return
+            # 刷新一下 UI 上的 Mobile URL，防止 IP 漂移后对不上
+            try:
+                if hasattr(self, "_mobile_url_label") and self._mobile_url_label is not None:
+                    self._mobile_url_label.setStringValue_(url)
+            except Exception:
+                pass
+            self._present_qr_window(url)
+            self._append_log(f"Mobile QR shown for: {url}\n")
+        except Exception:
+            logger.exception("onShowMobileQR_ failed")
+
+    @objc.python_method
+    def _alert(self, title: str, info: str):
+        try:
+            a = NSAlert.alloc().init()
+            a.setAlertStyle_(NSAlertStyleInformational)
+            a.setMessageText_(title)
+            a.setInformativeText_(info)
+            a.addButtonWithTitle_("OK")
+            a.runModal()
+        except Exception:
+            logger.exception("_alert failed")
+
+    @objc.python_method
+    def _make_qr_image(self, text: str, px: int = 320):
+        """用系统自带 CIQRCodeGenerator 生成 NSImage（无外部依赖）。"""
+        from Foundation import NSData
+        from Quartz import (
+            CIImage, CIFilter, CIContext, CIVector,
+        )
+        data = NSData.dataWithBytes_length_(text.encode("utf-8"), len(text.encode("utf-8")))
+        f = CIFilter.filterWithName_("CIQRCodeGenerator")
+        f.setValue_forKey_(data, "inputMessage")
+        # 高纠错 H：被 Safari/微信扫描时更宽容
+        f.setValue_forKey_("H", "inputCorrectionLevel")
+        ci = f.outputImage()
+        if ci is None:
+            return None
+        ext = ci.extent()
+        # 放大到 px × px（最近邻采样，保持方块边缘锐利）
+        scale = float(px) / max(ext.size.width, 1.0)
+        from Quartz import CGAffineTransformMakeScale
+        ci = ci.imageByApplyingTransform_(CGAffineTransformMakeScale(scale, scale))
+        ctx = CIContext.contextWithOptions_(None)
+        cg = ctx.createCGImage_fromRect_(ci, ci.extent())
+        if cg is None:
+            return None
+        from AppKit import NSBitmapImageRep
+        from Foundation import NSMakeSize
+        rep = NSBitmapImageRep.alloc().initWithCGImage_(cg)
+        img = NSImage.alloc().initWithSize_(NSMakeSize(px, px))
+        img.addRepresentation_(rep)
+        return img
+
+    @objc.python_method
+    def _present_qr_window(self, url: str):
+        """独立窗口展示二维码 + URL + Copy 按钮。再次调用会复用现有窗口。"""
+        from AppKit import NSImageView, NSImageScaleProportionallyUpOrDown
+        qr_w, qr_h = 340, 440
+        if getattr(self, "_qr_window", None) is None:
+            rect = NSMakeRect(0, 0, qr_w, qr_h)
+            mask = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                rect, mask, NSBackingStoreBuffered, False)
+            win.setTitle_("Mobile — Scan to Open")
+            win.setReleasedWhenClosed_(False)
+            cv = win.contentView()
+
+            # QR 图片区域
+            iv = NSImageView.alloc().initWithFrame_(NSMakeRect(10, 110, 320, 320))
+            try:
+                iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+            except Exception:
+                pass
+            cv.addSubview_(iv)
+            self._qr_image_view = iv
+
+            # URL 文本
+            lbl = self._make_label("", x=10, y=70, w=320, h=32,
+                                    size=11, color=NSColor.secondaryLabelColor())
+            try:
+                lbl.cell().setWraps_(True)
+                lbl.cell().setScrollable_(False)
+                lbl.setAlignment_(NSTextAlignmentCenter)
+            except Exception:
+                pass
+            cv.addSubview_(lbl)
+            self._qr_url_label = lbl
+
+            tip = self._make_label(
+                "Scan with your phone (same Wi-Fi). 首次会提示证书不安全，点『继续』即可。",
+                x=10, y=38, w=320, h=30, size=10,
+                color=NSColor.tertiaryLabelColor())
+            try:
+                tip.cell().setWraps_(True)
+                tip.setAlignment_(NSTextAlignmentCenter)
+            except Exception:
+                pass
+            cv.addSubview_(tip)
+
+            cv.addSubview_(self._make_button(
+                "Copy URL", x=120, y=8, w=100, h=24, action="onCopyMobileURL:"))
+
+            win.center()
+            self._qr_window = win
+
+        img = self._make_qr_image(url, px=320)
+        if img is not None:
+            self._qr_image_view.setImage_(img)
+        self._qr_url_label.setStringValue_(url)
+        self._qr_current_url = url
+        self._qr_window.makeKeyAndOrderFront_(None)
+        # 把窗口带到前台
+        try:
+            NSApp.activateIgnoringOtherApps_(True)
+        except Exception:
+            pass
+
+    @objc.typedSelector(b'v@:@')
+    def onCopyMobileURL_(self, sender):
+        try:
+            url = getattr(self, "_qr_current_url", None) or self._mobile_url() or ""
+            if url:
+                subprocess.run(["pbcopy"], input=url.encode(), check=True)
+                self._append_log(f"Mobile URL copied: {url}\n")
+        except Exception:
+            logger.exception("onCopyMobileURL_ failed")
 
     @objc.typedSelector(b'v@:@')
     def onOpenLog_(self, sender):

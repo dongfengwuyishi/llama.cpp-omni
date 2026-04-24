@@ -201,16 +201,29 @@ def _kill_processes_on_port_windows(port: int) -> None:
     """netstat 找 LISTENING 在 *port* 上的 PID, 逐个 taskkill /F /T."""
     if not _IS_WIN:
         return
+    # NOTE: on non-English Windows (zh-CN, ja-JP, ...) netstat's table header
+    # is emitted in the local ANSI codepage (GBK/CP932/...). Using text=True
+    # here would let subprocess decode with Python's default encoding (often
+    # UTF-8) and crash inside the background _readerthread with
+    # UnicodeDecodeError, which leaves stdout as None and breaks the outer
+    # try/except. Decode manually with errors="replace" instead.
     try:
-        out = subprocess.check_output(
+        raw = subprocess.check_output(
             ["netstat", "-ano", "-p", "TCP"],
-            text=True, stderr=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             creationflags=_CREATE_NO_WINDOW,
             timeout=5,
         )
     except Exception as e:
         logger.debug(f"netstat failed: {e}")
         return
+
+    if not raw:
+        return
+    try:
+        out = raw.decode("mbcs", errors="replace")
+    except Exception:
+        out = raw.decode("utf-8", errors="replace")
 
     port_suffix = f":{port}"
     pids: set = set()
@@ -580,21 +593,36 @@ class CppBackendWorker:
 
     @staticmethod
     def _kill_stale_server_on_port(port: int) -> None:
-        """Kill any leftover llama-server process listening on *port*.
+        """Kill any leftover llama-server process LISTENING on *port*.
 
-        Windows: netstat -ano + taskkill /F /T
-        POSIX  : lsof -ti + SIGKILL
+        Windows: netstat -ano + taskkill /F /T (already filters by LISTENING)
+        POSIX  : lsof -sTCP:LISTEN -ti + SIGKILL
+
+        注意：lsof 默认返回所有与该端口相关的 socket，包括**作为客户端连接到
+        该端口**的进程。worker.py 通过 httpx 长连接到 llama-server 的 19060，
+        不加 -sTCP:LISTEN 会把 worker 自己的 PID 也返回，然后被 SIGKILL，
+        导致 omni duplex 会话结束后 worker 自杀、gateway 与 worker 失联。
         """
         if _IS_WIN:
             _kill_processes_on_port_windows(port)
             return
         try:
             out = subprocess.check_output(
-                ["lsof", "-ti", f"tcp:{port}"], text=True, stderr=subprocess.DEVNULL
+                ["lsof", "-sTCP:LISTEN", "-ti", f"tcp:{port}"],
+                text=True, stderr=subprocess.DEVNULL
             ).strip()
             if out:
+                own_pid = os.getpid()
                 for pid_str in out.splitlines():
-                    pid = int(pid_str.strip())
+                    try:
+                        pid = int(pid_str.strip())
+                    except ValueError:
+                        continue
+                    # 双保险：即便 lsof 有边界行为，也绝不 kill 本进程
+                    if pid == own_pid:
+                        logger.warning(
+                            f"Refusing to kill self (pid={pid}) on port {port}")
+                        continue
                     logger.warning(f"Killing stale process on port {port}: pid={pid}")
                     try:
                         os.kill(pid, signal.SIGKILL)

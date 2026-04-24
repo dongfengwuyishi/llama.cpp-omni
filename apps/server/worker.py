@@ -2330,7 +2330,8 @@ def main():
         })
         logger.info(f"Starting Worker (PyTorch backend) on port {port}, GPU {gpu_id}")
 
-    uvicorn.run(app, host=args.host, port=port)
+    # ws_max_size=128MB 以便前端可以附带短视频 / 高分辨率图片（和 gateway 对齐）
+    uvicorn.run(app, host=args.host, port=port, ws_max_size=128 * 1024 * 1024)
 
 
 if __name__ == "__main__":

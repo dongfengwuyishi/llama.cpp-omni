@@ -228,10 +228,21 @@ def ensure_config(model_dir: str, port: int = 8006, worker_base_port: int = DEFA
     logger.info(f"Config written to {_CONFIG_PATH}")
 
 
+def _strip_proxy_env(env: dict) -> dict:
+    """移除系统代理环境变量，避免本地 loopback 被 Clash/V2Ray 拦截。"""
+    for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+               "http_proxy", "https_proxy", "all_proxy"):
+        env.pop(_k, None)
+    env["NO_PROXY"] = "*"
+    env["no_proxy"] = "*"
+    return env
+
+
 def start_worker(port: int = DEFAULT_WORKER_BASE_PORT, gpu_id: int = 0) -> subprocess.Popen:
     """启动 Worker 进程"""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(_SERVER_DIR)
+    _strip_proxy_env(env)
 
     if platform.system() != "Darwin":
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -261,12 +272,13 @@ def start_gateway(port: int = 8006, worker_port: int = DEFAULT_WORKER_BASE_PORT,
     """启动 Gateway 进程"""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(_SERVER_DIR)
+    _strip_proxy_env(env)
 
     cmd = [
         sys.executable,
         str(_SERVER_DIR / "gateway.py"),
         "--port", str(port),
-        "--workers", f"localhost:{worker_port}",
+        "--workers", f"127.0.0.1:{worker_port}",
     ]
     if not use_https:
         cmd.append("--http")
@@ -284,17 +296,17 @@ def start_gateway(port: int = 8006, worker_port: int = DEFAULT_WORKER_BASE_PORT,
 
 
 def wait_for_health(url: str, timeout: int = 300, interval: float = 2.0) -> bool:
-    """等待服务就绪"""
+    """等待服务就绪。强制绕过系统代理（Clash/V2Ray 常见）。"""
     import urllib.request
     import ssl
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     for i in range(int(timeout / interval)):
         try:
-            req = urllib.request.Request(f"{url}/health")
-            resp = urllib.request.urlopen(req, timeout=3, context=ctx)
+            resp = opener.open(f"{url}/health", timeout=3, context=ctx)
             if resp.status == 200:
                 data = json.loads(resp.read())
                 if data.get("model_loaded", True):
@@ -416,7 +428,7 @@ def main():
     print(f"  Loading models... (this may take 30-90 seconds)")
     print()
 
-    if not wait_for_health(f"http://localhost:{args.worker_port}", timeout=300):
+    if not wait_for_health(f"http://127.0.0.1:{args.worker_port}", timeout=300):
         print("  [ERROR] Worker failed to start. Check logs.")
         cleanup()
 

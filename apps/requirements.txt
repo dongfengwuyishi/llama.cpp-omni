@@ -32,6 +32,7 @@ requests>=2.31.0
 
 # macOS Desktop App (PyObjC native)
 pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"  # CIQRCodeGenerator for mobile QR
 
 # Windows Desktop App (PySide6 native)
 PySide6>=6.6.0; sys_platform == "win32"
