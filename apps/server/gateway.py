@@ -320,8 +320,9 @@ async def chat(request: Request):
 
     try:
         # trust_env=False: worker.url 永远是 loopback，不走系统代理
-        async with httpx.AsyncClient(timeout=worker_pool.request_timeout,
-                                     trust_env=False) as client:
+        async with httpx.AsyncClient(
+            timeout=worker_pool.request_timeout, trust_env=False
+        ) as client:
             resp = await client.post(
                 f"{worker.url}/chat",
                 json=request_body,

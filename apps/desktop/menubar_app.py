@@ -1251,6 +1251,15 @@ class AppDelegate(NSObject):
             self._log_file = open(_LOG_PATH, "a", encoding="utf-8")
             env = os.environ.copy()
             env["PYTHONPATH"] = str(_SERVER_DIR)
+            # Prevent system HTTP proxy (e.g. Clash/V2Ray on 127.0.0.1:7890) from
+            # intercepting loopback IPC between gateway / worker / llama-server.
+            # macOS ExceptionsList doesn't reliably bypass 'localhost' host name
+            # in Python urllib/httpx; force all children to disable proxies entirely.
+            for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                       "http_proxy", "https_proxy", "all_proxy"):
+                env.pop(_k, None)
+            env["NO_PROXY"] = "*"
+            env["no_proxy"] = "*"
 
             # ---------------------------------------------------------------
             # 防止系统级 HTTP 代理劫持 loopback。
@@ -1291,6 +1300,10 @@ class AppDelegate(NSObject):
             self._gateway_proc = subprocess.Popen(
                 [sys.executable, str(_SERVER_DIR / "gateway.py"),
                  "--port", str(self._port),
+                 # 保持 HTTPS: 菜单栏 app 场景需要手机浏览器走 secure context,
+                 # 否则麦克风/摄像头被浏览器禁用. (注: upstream 曾一度改为 --http,
+                 # 但与下面 "https://{host}:{port}" 的启动日志和 mobile 使用场景
+                 # 不兼容, 这里恢复 HTTPS.)
                  "--workers", f"127.0.0.1:{self._worker_port}"],
                 env=env, cwd=str(_SERVER_DIR),
                 stdout=self._log_file, stderr=subprocess.STDOUT)
@@ -1326,6 +1339,8 @@ class AppDelegate(NSObject):
         # 读 $HTTP_PROXY 把请求走代理。这里用 ProxyHandler({}) 强制不走
         # 任何代理，和 curl 行为对齐。
         import urllib.request
+        # Build an opener that ignores system HTTP proxy, so loopback probes
+        # aren't intercepted by local HTTP proxies (Clash/V2Ray etc.).
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for _ in range(timeout // 2):
             try:

@@ -228,8 +228,12 @@ def ensure_config(model_dir: str, port: int = 8006, worker_base_port: int = DEFA
     logger.info(f"Config written to {_CONFIG_PATH}")
 
 
-def _strip_proxy_env(env: dict) -> dict:
-    """移除系统代理环境变量，避免本地 loopback 被 Clash/V2Ray 拦截。"""
+def _make_no_proxy_env(base_env: dict | None = None) -> dict:
+    """Return a child-process env with all HTTP proxy settings disabled.
+
+    Required to prevent loopback traffic (gateway<->worker<->llama-server) from
+    being hijacked by host-level HTTP proxies (Clash/V2Ray on 127.0.0.1:7890)."""
+    env = os.environ.copy() if base_env is None else dict(base_env)
     for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                "http_proxy", "https_proxy", "all_proxy"):
         env.pop(_k, None)
@@ -240,9 +244,8 @@ def _strip_proxy_env(env: dict) -> dict:
 
 def start_worker(port: int = DEFAULT_WORKER_BASE_PORT, gpu_id: int = 0) -> subprocess.Popen:
     """启动 Worker 进程"""
-    env = os.environ.copy()
+    env = _make_no_proxy_env()
     env["PYTHONPATH"] = str(_SERVER_DIR)
-    _strip_proxy_env(env)
 
     if platform.system() != "Darwin":
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -270,9 +273,8 @@ def start_worker(port: int = DEFAULT_WORKER_BASE_PORT, gpu_id: int = 0) -> subpr
 def start_gateway(port: int = 8006, worker_port: int = DEFAULT_WORKER_BASE_PORT,
                   use_https: bool = True) -> subprocess.Popen:
     """启动 Gateway 进程"""
-    env = os.environ.copy()
+    env = _make_no_proxy_env()
     env["PYTHONPATH"] = str(_SERVER_DIR)
-    _strip_proxy_env(env)
 
     cmd = [
         sys.executable,
@@ -304,9 +306,13 @@ def wait_for_health(url: str, timeout: int = 300, interval: float = 2.0) -> bool
     ctx.verify_mode = ssl.CERT_NONE
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+    # Bypass any host-level HTTP proxy: loopback probes must not be intercepted.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
     for i in range(int(timeout / interval)):
         try:
-            resp = opener.open(f"{url}/health", timeout=3, context=ctx)
+            req = urllib.request.Request(f"{url}/health")
+            resp = opener.open(req, timeout=3, context=ctx)
             if resp.status == 200:
                 data = json.loads(resp.read())
                 if data.get("model_loaded", True):

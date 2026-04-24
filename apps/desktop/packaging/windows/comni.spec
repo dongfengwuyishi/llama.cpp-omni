@@ -22,6 +22,7 @@ import os
 import sys
 import shutil
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 # The spec file is executed from the repo root when PyInstaller runs
 # `pyinstaller apps/desktop/packaging/windows/comni.spec`.
@@ -50,19 +51,30 @@ hiddenimports = [
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
+    "PIL.Image",
 ]
+
+# ------------------------------------------------------------
+# qrcode is imported lazily inside windows_app._make_qr_pixmap(),
+# and its subpackages (qrcode.image.pil / qrcode.compat.etree) use
+# conditional imports that PyInstaller's static analysis misses.
+# collect_all() walks the whole qrcode package and adds every
+# submodule + data file as a hiddenimport/datas/binary entry.
+# ------------------------------------------------------------
+_qr_datas, _qr_binaries, _qr_hidden = collect_all("qrcode")
+hiddenimports += _qr_hidden
 
 # ------------------------------------------------------------
 # Resources shipped alongside Comni.exe
 # The server / assets / frontend code is copied to `resources/apps/`
 # so windows_app.py's path-resolution logic finds it.
 # ------------------------------------------------------------
-datas = []
+datas = list(_qr_datas)
 
 # Ship the apps/ folder as resources/apps/ — needed at runtime
 def _collect_apps_folder():
     out = []
-    include_dirs = ["server", "assets", "frontend", "desktop", "vad"]
+    include_dirs = ["server", "assets", "frontend", "desktop", "vad", "certs"]
     for sub in include_dirs:
         src = APPS_ROOT / sub
         if not src.is_dir():
@@ -121,7 +133,7 @@ else:
           f"run worker.py / gateway.py on machines without Python.")
 
 # Optional: ship llama-server.exe if the user has already built it
-binaries = []
+binaries = list(_qr_binaries)
 llama_exe = REPO_ROOT / "build" / "bin" / "Release" / "llama-server.exe"
 if not llama_exe.is_file():
     llama_exe = REPO_ROOT / "build" / "bin" / "llama-server.exe"

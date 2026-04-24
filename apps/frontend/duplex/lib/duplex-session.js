@@ -17,6 +17,9 @@ export class DuplexSession {
      * @param {object} [config]
      * @param {number} [config.maxKvTokens=8192] - KV cache limit for auto-stop
      * @param {function} [config.getPlaybackDelayMs] - Returns playback delay in ms
+     * @param {function} [config.getStopOnSlidingWindow] - If returns true, auto-stop
+     *   when the server-side KV cache length shrinks (i.e. round-boundary pruning /
+     *   sliding window kicks in). Default: false.
      * @param {number} [config.outputSampleRate=24000] - Audio output sample rate
      */
     constructor(prefix, config = {}) {
@@ -24,6 +27,7 @@ export class DuplexSession {
         this.config = {
             getMaxKvTokens: config.getMaxKvTokens || (() => 8192),
             getPlaybackDelayMs: config.getPlaybackDelayMs || (() => 200),
+            getStopOnSlidingWindow: config.getStopOnSlidingWindow || (() => false),
             outputSampleRate: config.outputSampleRate || 24000,
             getWsUrl: config.getWsUrl || ((sessionId) => {
                 const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -56,6 +60,7 @@ export class DuplexSession {
         this._firstClientTs = 0;
         this._resultCount = 0;
         this._lastDriftMs = null;
+        this._lastKvCacheLength = 0;
 
         // Bridge AudioPlayer metrics to session onMetrics
         this.audioPlayer.onMetrics = (data) => {
@@ -335,6 +340,7 @@ export class DuplexSession {
         this._firstClientTs = 0;
         this._resultCount = 0;
         this._lastDriftMs = null;
+        this._lastKvCacheLength = 0;
         this.chunksSent = 0;
         this.currentSpeakText = '';
         this._speakHandle = null;
@@ -437,11 +443,26 @@ export class DuplexSession {
                 - (this._firstClientTs - this._firstServerTs)) * 1000;
         }
 
-        // KV cache auto-stop check
+        // KV cache auto-stop checks
         const maxKv = this.config.getMaxKvTokens();
-        if (result.kv_cache_length !== undefined && result.kv_cache_length > 0 && result.kv_cache_length >= maxKv) {
-            this.onSystemLog(`\u26a0 KV cache (${result.kv_cache_length.toLocaleString()}) reached limit. Auto-stopping.`);
-            setTimeout(() => this.stop(), 0);
+        const curKv = result.kv_cache_length;
+        if (curKv !== undefined && curKv > 0) {
+            // (1) 命中用户配置的上限
+            if (curKv >= maxKv) {
+                this.onSystemLog(`\u26a0 KV cache (${curKv.toLocaleString()}) reached limit. Auto-stopping.`);
+                setTimeout(() => this.stop(), 0);
+            }
+            // (2) 检测到滑窗裁剪：C++ 后端会在轮次边界做 KV pruning，两次上报之间
+            //     长度下降即可判定。上限(1)可能永远不触发，此处兜底。
+            else if (this._lastKvCacheLength > 0 && curKv < this._lastKvCacheLength) {
+                const prev = this._lastKvCacheLength;
+                this.onSystemLog(`\u2702 KV cache pruned (sliding window): ${prev.toLocaleString()} \u2192 ${curKv.toLocaleString()}.`);
+                if (this.config.getStopOnSlidingWindow()) {
+                    this.onSystemLog('\u26a0 Stop-on-sliding-window enabled. Auto-stopping.');
+                    setTimeout(() => this.stop(), 0);
+                }
+            }
+            this._lastKvCacheLength = curKv;
         }
 
         // Deferred UI + metrics update via rAF

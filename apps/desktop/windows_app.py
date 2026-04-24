@@ -280,6 +280,253 @@ def is_port_in_use(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+# ------------------------------------------------------------
+# LAN IP 探测:避免命中 Clash / V2Ray TUN 虚拟网卡的坑。
+#
+# 经验教训 (你的机器实测):
+#   - socket.connect(("8.8.8.8", 80)) 拿到的 source IP 会被 TUN 代理劫持,
+#     返回 198.18.0.1 (Clash Meta TUN 默认段,IANA 保留给 benchmark 的
+#     198.18.0.0/15),手机扫这个 URL 根本连不上。
+#   - 所以绝不能信"默认路由源 IP",必须自己枚举所有网卡,
+#     排掉虚拟/代理网卡,按私有段优先级挑真实家用网卡。
+# ------------------------------------------------------------
+
+# 必须排掉的 IP 段(虚拟 / 代理 / link-local / loopback / VirtualBox)
+def _is_bogus_ip(ip: str) -> bool:
+    if not ip:
+        return True
+    if ip.startswith(("127.", "0.")):                  # loopback / unspecified
+        return True
+    if ip.startswith("169.254."):                      # link-local (APIPA)
+        return True
+    if ip.startswith(("198.18.", "198.19.")):          # IANA benchmark / Clash Meta TUN
+        return True
+    if ip.startswith("192.168.56."):                   # VirtualBox host-only 默认段
+        return True
+    if ip.startswith("192.0.0.") or ip.startswith("192.0.2."):  # RFC 6890 TEST-NET
+        return True
+    return False
+
+
+# 网卡 friendly name 命中以下关键词时,直接当虚拟网卡排除
+_VIRTUAL_IFACE_HINTS = (
+    "clash", "mihomo", "tun", "tap", "wireguard", "openvpn",
+    "vpn", "vethernet", "virtualbox", "vmware", "hyper-v",
+    "loopback", "docker", "wsl", "shadowsocks", "v2ray", "sing-box",
+)
+
+
+def _is_virtual_iface_name(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    lo = name.lower()
+    return any(k in lo for k in _VIRTUAL_IFACE_HINTS)
+
+
+def _rank_private_ip(ip: str) -> int:
+    """数字越小优先级越高,代表越像家用局域网。"""
+    if ip.startswith("192.168."):
+        return 0                                         # 家用 Wi-Fi / LAN 最常见
+    if ip.startswith("10."):
+        return 1                                         # 企业 / 公寓 LAN
+    if ip.startswith("172."):
+        try:
+            second = int(ip.split(".", 2)[1])
+            if 16 <= second <= 31:
+                return 2                                 # RFC1918 / 但 Docker/WSL2 也常见
+        except ValueError:
+            pass
+    return 9                                             # 其他(公网 / 未归类)
+
+
+def _enum_adapters_win32() -> List[tuple]:
+    """调 Win32 GetAdaptersAddresses 枚举所有启用中的 IPv4 网卡。
+    返回 [(ip, friendly_name), ...]。失败返回 []。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        AF_INET = 2
+        AF_UNSPEC = 0
+        GAA_FLAG_SKIP_ANYCAST = 0x0002
+        GAA_FLAG_SKIP_MULTICAST = 0x0004
+        GAA_FLAG_SKIP_DNS_SERVER = 0x0008
+
+        ULONG = wintypes.ULONG
+        PVOID = ctypes.c_void_p
+
+        class SOCKADDR(ctypes.Structure):
+            _fields_ = [
+                ("sa_family", ctypes.c_ushort),
+                ("sa_data", ctypes.c_ubyte * 14),
+            ]
+
+        class SOCKET_ADDRESS(ctypes.Structure):
+            _fields_ = [
+                ("lpSockaddr", ctypes.POINTER(SOCKADDR)),
+                ("iSockaddrLength", ctypes.c_int),
+            ]
+
+        class IP_ADAPTER_UNICAST_ADDRESS(ctypes.Structure):
+            pass
+        IP_ADAPTER_UNICAST_ADDRESS._fields_ = [
+            ("Length", ULONG),
+            ("Flags", wintypes.DWORD),
+            ("Next", ctypes.POINTER(IP_ADAPTER_UNICAST_ADDRESS)),
+            ("Address", SOCKET_ADDRESS),
+            # 其余字段我们不用,塞一个 cushion 就好
+            ("_tail", ctypes.c_ubyte * 128),
+        ]
+
+        class IP_ADAPTER_ADDRESSES(ctypes.Structure):
+            pass
+        # 这个结构体在不同 Windows 版本字段会增减,
+        # 我们用 union 只读前面固定的几个字段,后面 padding。
+        IP_ADAPTER_ADDRESSES._fields_ = [
+            ("Length", ULONG),
+            ("IfIndex", wintypes.DWORD),
+            ("Next", ctypes.POINTER(IP_ADAPTER_ADDRESSES)),
+            ("AdapterName", ctypes.c_char_p),
+            ("FirstUnicastAddress", ctypes.POINTER(IP_ADAPTER_UNICAST_ADDRESS)),
+            ("FirstAnycastAddress", PVOID),
+            ("FirstMulticastAddress", PVOID),
+            ("FirstDnsServerAddress", PVOID),
+            ("DnsSuffix", ctypes.c_wchar_p),
+            ("Description", ctypes.c_wchar_p),
+            ("FriendlyName", ctypes.c_wchar_p),
+            ("_tail", ctypes.c_ubyte * 512),
+        ]
+
+        iphlpapi = ctypes.WinDLL("iphlpapi")
+        GetAdaptersAddresses = iphlpapi.GetAdaptersAddresses
+        GetAdaptersAddresses.argtypes = [
+            ULONG, ULONG, PVOID, PVOID, ctypes.POINTER(ULONG)]
+        GetAdaptersAddresses.restype = ULONG
+
+        buf_size = ULONG(15 * 1024)                     # 15KB 足够装几十张网卡
+        buf = ctypes.create_string_buffer(buf_size.value)
+        flags = (GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST
+                 | GAA_FLAG_SKIP_DNS_SERVER)
+        ret = GetAdaptersAddresses(AF_INET, flags, None,
+                                   ctypes.cast(buf, PVOID), ctypes.byref(buf_size))
+        if ret == 111:                                   # ERROR_BUFFER_OVERFLOW
+            buf = ctypes.create_string_buffer(buf_size.value)
+            ret = GetAdaptersAddresses(AF_INET, flags, None,
+                                       ctypes.cast(buf, PVOID),
+                                       ctypes.byref(buf_size))
+        if ret != 0:
+            return []
+
+        results: List[tuple] = []
+        ptr = ctypes.cast(buf, ctypes.POINTER(IP_ADAPTER_ADDRESSES))
+        while ptr:
+            ad = ptr.contents
+            name = ad.FriendlyName or ad.Description or ""
+            ua = ad.FirstUnicastAddress
+            while ua:
+                sock = ua.contents.Address.lpSockaddr
+                if sock and sock.contents.sa_family == AF_INET:
+                    raw = bytes(sock.contents.sa_data[2:6])
+                    ip = ".".join(str(b) for b in raw)
+                    results.append((ip, name))
+                ua = ua.contents.Next if bool(ua.contents.Next) else None
+            ptr = ad.Next if bool(ad.Next) else None
+        return results
+    except Exception as e:
+        logger.debug("_enum_adapters_win32 failed: %s", e)
+        return []
+
+
+def _get_lan_ip() -> Optional[str]:
+    """返回一个手机能连到的家用/办公局域网 IPv4。
+
+    策略(按优先级):
+      1. Win32 GetAdaptersAddresses 枚举所有启用的物理网卡 IPv4,
+         排除虚拟网卡(TUN/VPN/Docker/vEthernet/VirtualBox),
+         按 192.168.* > 10.* > 172.16-31.* 排序。
+      2. socket.getaddrinfo(hostname) 兜底(无法拿到 friendly name,
+         只能靠 IP 段启发过滤)。
+      3. UDP connect 8.8.8.8 拿默认路由源 IP 兜底(会被 Clash TUN 劫持,
+         所以只在前两步都空的时候才用)。
+    """
+    candidates: List[tuple] = []                         # [(rank, ip), ...]
+
+    # --- 1) Win32 枚举(最准,有 interface friendly name 可排虚拟网卡) ---
+    for ip, name in _enum_adapters_win32():
+        if _is_bogus_ip(ip):
+            continue
+        if _is_virtual_iface_name(name):
+            logger.debug("skip virtual iface: %s -> %s", name, ip)
+            continue
+        candidates.append((_rank_private_ip(ip), ip))
+
+    # --- 2) hostname resolve 兜底(拿不到 iface name,仅靠 IP 段过滤) ---
+    if not candidates:
+        try:
+            hostname = socket.gethostname()
+            for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                ip = info[4][0]
+                if _is_bogus_ip(ip):
+                    continue
+                candidates.append((_rank_private_ip(ip), ip))
+        except Exception:
+            pass
+
+    # --- 3) 最后兜底:UDP connect(会被 TUN 劫持) ---
+    if not candidates:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.settimeout(0.3)
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
+            finally:
+                s.close()
+            if not _is_bogus_ip(ip):
+                candidates.append((_rank_private_ip(ip), ip))
+        except Exception:
+            pass
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def _make_qr_pixmap(text: str, size_px: int = 200):
+    """生成二维码 QPixmap,失败时返回 None(不抛出,让 UI 降级为纯文本)。"""
+    try:
+        import io
+        import qrcode           # PyInstaller 会把它自动 pick up
+        from PySide6.QtGui import QPixmap
+    except Exception as e:
+        logger.warning("qrcode / PIL / Qt import failed: %s", e)
+        return None
+    try:
+        # box_size/border 影响像素密度,ERROR_CORRECT_M 容错更好被扫描
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=8,
+            border=2,
+        )
+        qr.add_data(text)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        pix = QPixmap()
+        if not pix.loadFromData(buf.getvalue(), "PNG"):
+            return None
+        # 按目标尺寸缩放,保持方块锐利用 FastTransformation (不模糊)
+        from PySide6.QtCore import Qt
+        return pix.scaled(size_px, size_px,
+                          Qt.KeepAspectRatio, Qt.FastTransformation)
+    except Exception as e:
+        logger.warning("QR generation failed for %r: %s", text, e)
+        return None
+
+
 def next_free_port(start: int, max_tries: int = 128) -> tuple[int, str]:
     orig = int(start)
     for i in range(max_tries):
@@ -836,11 +1083,14 @@ class ServiceController(QThread):
         self.log_line.emit("\nWorker ready!\n")
         self.progress_text.emit("Starting gateway…")
 
+        # 默认走 HTTPS (自签证书在 apps/certs/),
+        # 手机浏览器要求 secure context 才能启用麦克风/摄像头/WebRTC,
+        # 本地访问也不成问题 — 首次进入浏览器会弹不安全警告,
+        # 点「高级 → 继续访问」即可。
         gateway_cmd = [
             python_exe, str(_SERVER_DIR / "gateway.py"),
             "--port", str(self._gw_port),
             "--workers", f"127.0.0.1:{self._wk_port}",
-            "--http",
         ]
         self._gateway_proc = self._popen(gateway_cmd, env)
         time.sleep(3)
@@ -850,11 +1100,16 @@ class ServiceController(QThread):
             return
 
         self.state_changed.emit(ServiceState.RUNNING)
+        lan_ip = _get_lan_ip()
+        lan_line = (f"  On your phone (same Wi-Fi): https://{lan_ip}:{self._gw_port}\n"
+                    if lan_ip else "")
         self.log_line.emit(
             f"\n{'=' * 50}\n"
-            f"Server running at http://localhost:{self._gw_port}\n"
+            f"Server running at https://localhost:{self._gw_port}\n"
+            f"{lan_line}"
             f"{'=' * 50}\n\n"
             "Modes: Turn-based · Omni Duplex · Audio Duplex · Half-Duplex\n"
+            "Note: 自签名证书,浏览器首次打开会提示不安全,点「高级 → 继续访问」即可。\n"
             "Click 'Open Web UI' or visit the URL above.\n")
 
     def _do_stop(self):
@@ -982,8 +1237,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._tray_available = tray_available
         self.setWindowTitle(self.APP_TITLE)
-        self.resize(580, 780)
-        self.setMinimumSize(QSize(480, 600))
+        self.resize(560, 720)
+        self.setMinimumSize(QSize(500, 620))
 
         self._state = ServiceState.STOPPED
         self._controller = ServiceController(self)
@@ -994,6 +1249,9 @@ class MainWindow(QMainWindow):
         gw, wk = self._load_ports_from_config()
         self._gw_port = gw
         self._wk_port = wk
+
+        self._lan_ip: Optional[str] = None  # populated when service runs
+        self._qr_dialog: Optional["QRDialog"] = None
 
         self._build_ui()
         if self._tray_available:
@@ -1052,7 +1310,7 @@ class MainWindow(QMainWindow):
 
         st_row = QHBoxLayout()
         self._status_label = QLabel("●  Stopped")
-        self._status_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        self._status_label.setStyleSheet("font-size: 20px; font-weight: 600;")
         st_row.addWidget(self._status_label)
         st_row.addStretch(1)
         self._open_btn = QPushButton("Open Web UI  →")
@@ -1085,13 +1343,16 @@ class MainWindow(QMainWindow):
         sc_l.addWidget(self._progress_bar)
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
         self._start_btn = QPushButton("▶  Start Server")
         self._start_btn.setDefault(True)
-        self._start_btn.setMinimumHeight(34)
+        self._start_btn.setMinimumHeight(36)
+        self._start_btn.setStyleSheet("QPushButton { font-size: 13px; }")
         self._start_btn.clicked.connect(self.on_start)
         btn_row.addWidget(self._start_btn, 2)
         self._stop_btn = QPushButton("■  Stop")
-        self._stop_btn.setMinimumHeight(34)
+        self._stop_btn.setMinimumHeight(36)
+        self._stop_btn.setStyleSheet("QPushButton { font-size: 13px; }")
         self._stop_btn.clicked.connect(self.on_stop)
         btn_row.addWidget(self._stop_btn, 1)
         sc_l.addLayout(btn_row)
@@ -1117,18 +1378,51 @@ class MainWindow(QMainWindow):
         mc_l.addWidget(self._comp_label)
         root.addWidget(mc)
 
-        # URL card
-        uc = self._card()
-        uc_l = QHBoxLayout(uc)
-        uc_l.setContentsMargins(16, 10, 16, 10)
-        uc_l.addWidget(QLabel("URL"))
-        self._url_label = QLabel(f"http://localhost:{self._gw_port}")
-        self._url_label.setStyleSheet("color: #555;")
-        uc_l.addWidget(self._url_label, 1)
+        # Service card (单卡两行,对齐 macOS 菜单栏版布局)
+        #   Row1: [Desktop]   https://localhost:{port}          [Copy]
+        #   Row2: [Mobile ]   https://{lan_ip}:{port} or hint   [ QR ]
+        svc = self._card()
+        svc_l = QVBoxLayout(svc)
+        svc_l.setContentsMargins(16, 12, 16, 12)
+        svc_l.setSpacing(10)
+
+        # ─ Desktop row ─
+        d_row = QHBoxLayout()
+        d_row.setSpacing(8)
+        d_lbl = QLabel("Desktop")
+        d_lbl.setFixedWidth(58)
+        d_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #333;")
+        d_row.addWidget(d_lbl)
+        self._url_label = QLabel(f"https://localhost:{self._gw_port}")
+        self._url_label.setStyleSheet("color: #666; font-size: 12px;")
+        self._url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        d_row.addWidget(self._url_label, 1)
         copy_btn = QPushButton("Copy")
+        copy_btn.setFixedWidth(72)
         copy_btn.clicked.connect(self.on_copy_url)
-        uc_l.addWidget(copy_btn)
-        root.addWidget(uc)
+        d_row.addWidget(copy_btn)
+        svc_l.addLayout(d_row)
+
+        # ─ Mobile row ─
+        m_row = QHBoxLayout()
+        m_row.setSpacing(8)
+        m_lbl = QLabel("Mobile")
+        m_lbl.setFixedWidth(58)
+        m_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #333;")
+        m_row.addWidget(m_lbl)
+        self._mobile_url_label = QLabel("(service not running)")
+        self._mobile_url_label.setStyleSheet("color: #aaa; font-size: 12px;")
+        self._mobile_url_label.setTextInteractionFlags(
+            Qt.TextSelectableByMouse)
+        m_row.addWidget(self._mobile_url_label, 1)
+        self._mobile_qr_btn = QPushButton("QR")
+        self._mobile_qr_btn.setFixedWidth(72)
+        self._mobile_qr_btn.setEnabled(False)
+        self._mobile_qr_btn.clicked.connect(self.on_show_mobile_qr)
+        m_row.addWidget(self._mobile_qr_btn)
+        svc_l.addLayout(m_row)
+
+        root.addWidget(svc)
 
         # Ports
         prow = QHBoxLayout()
@@ -1267,7 +1561,7 @@ class MainWindow(QMainWindow):
             self._gw_port, self._wk_port = gw, wk
             self._gw_edit.setText(str(gw))
             self._wk_edit.setText(str(wk))
-            self._url_label.setText(f"http://localhost:{gw}")
+            self._url_label.setText(f"https://localhost:{gw}")
             save_config(model_dir, gw, wk)
             for n in notes:
                 self._append_log(n)
@@ -1295,13 +1589,61 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def on_open_browser(self):
-        webbrowser.open(f"http://localhost:{self._gw_port}")
+        webbrowser.open(f"https://localhost:{self._gw_port}")
 
     @Slot()
     def on_copy_url(self):
-        url = f"http://localhost:{self._gw_port}"
+        url = f"https://localhost:{self._gw_port}"
         QApplication.clipboard().setText(url)
         self._append_log(f"URL copied: {url}\n")
+
+    @Slot()
+    def on_show_mobile_qr(self):
+        """弹出二维码窗口(对齐 macOS 菜单栏版的 QR panel 行为)。"""
+        if not self._lan_ip:
+            return
+        url = f"https://{self._lan_ip}:{self._gw_port}"
+        if getattr(self, "_qr_dialog", None) is None:
+            self._qr_dialog = QRDialog(self)
+        self._qr_dialog.set_url(url)
+        self._qr_dialog.show()
+        self._qr_dialog.raise_()
+        self._qr_dialog.activateWindow()
+
+    def _refresh_mobile_card(self, running: bool) -> None:
+        """服务变为 RUNNING 时探测 LAN IP 并更新 Mobile 行;
+        STOPPED 时恢复灰色占位。"""
+        if not running:
+            self._lan_ip = None
+            self._mobile_url_label.setText("(service not running)")
+            self._mobile_url_label.setStyleSheet(
+                "color: #aaa; font-size: 12px;")
+            self._mobile_qr_btn.setEnabled(False)
+            if getattr(self, "_qr_dialog", None) is not None:
+                try:
+                    self._qr_dialog.close()
+                except Exception:
+                    pass
+            return
+
+        lan_ip = _get_lan_ip()
+        self._lan_ip = lan_ip
+        if not lan_ip:
+            self._mobile_url_label.setText("(no LAN IP detected)")
+            self._mobile_url_label.setStyleSheet(
+                "color: #c0392b; font-size: 12px;")
+            self._mobile_qr_btn.setEnabled(False)
+            return
+
+        url = f"https://{lan_ip}:{self._gw_port}"
+        self._mobile_url_label.setText(url)
+        self._mobile_url_label.setStyleSheet(
+            "color: #666; font-size: 12px;")
+        self._mobile_qr_btn.setEnabled(True)
+        # 如果 QR 弹窗已打开,同步刷新其 URL (切 Wi-Fi 后场景)
+        if getattr(self, "_qr_dialog", None) is not None \
+                and self._qr_dialog.isVisible():
+            self._qr_dialog.set_url(url)
 
     @Slot()
     def on_open_log(self):
@@ -1341,7 +1683,13 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_state_changed(self, state: str):
+        prev = self._state
         self._state = state
+        # 进入/离开 RUNNING 时更新移动端 URL + 二维码
+        if state == ServiceState.RUNNING and prev != ServiceState.RUNNING:
+            self._refresh_mobile_card(running=True)
+        elif state != ServiceState.RUNNING and prev == ServiceState.RUNNING:
+            self._refresh_mobile_card(running=False)
         self._update_ui()
 
     def _update_ui(self):
@@ -1397,6 +1745,98 @@ class MainWindow(QMainWindow):
         # No tray — accept the close; QApplication.quitOnLastWindowClosed
         # (set to True at startup in this case) will terminate the app.
         event.accept()
+
+
+# ============================================================
+# Mobile QR popup dialog
+#
+# 对齐 macOS 菜单栏版的 `_present_qr_window` 体验:
+# 点「QR」按钮后弹出一个独立小窗口,展示 320x320 二维码 +
+# URL 文本 + Copy 按钮。多次点击复用同一个窗口。
+# ============================================================
+
+class QRDialog(QDialog):
+
+    _QR_PX = 320
+    _WIN_W = 360
+    _WIN_H = 460
+
+    def __init__(self, parent: "MainWindow"):
+        super().__init__(parent)
+        self._parent_window = parent
+        self._url: str = ""
+        self.setWindowTitle("Mobile — Scan to Open")
+        self.setModal(False)
+        self.setFixedSize(self._WIN_W, self._WIN_H)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(10)
+
+        self._qr_label = QLabel()
+        self._qr_label.setFixedSize(self._QR_PX, self._QR_PX)
+        self._qr_label.setAlignment(Qt.AlignCenter)
+        self._qr_label.setStyleSheet(
+            "QLabel { background:#fafafa; border:1px solid #e0e0e0;"
+            " border-radius:6px; color:#aaa; font-size:11px; }")
+        self._qr_label.setText("(generating…)")
+        qr_wrap = QHBoxLayout()
+        qr_wrap.addStretch(1)
+        qr_wrap.addWidget(self._qr_label)
+        qr_wrap.addStretch(1)
+        root.addLayout(qr_wrap)
+
+        self._url_display = QLabel("")
+        self._url_display.setAlignment(Qt.AlignCenter)
+        self._url_display.setStyleSheet("color: #555; font-size: 12px;")
+        self._url_display.setWordWrap(True)
+        self._url_display.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        root.addWidget(self._url_display)
+
+        tip = QLabel(
+            "Scan with your phone (same Wi-Fi).\n"
+            "First visit: browser shows a self-signed cert warning\u2014\n"
+            "tap \u300cAdvanced \u2192 Proceed\u300d to continue.")
+        tip.setAlignment(Qt.AlignCenter)
+        tip.setStyleSheet("color: #999; font-size: 10px;")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        root.addStretch(1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        copy_btn = QPushButton("Copy URL")
+        copy_btn.setFixedWidth(110)
+        copy_btn.clicked.connect(self._on_copy)
+        btn_row.addWidget(copy_btn)
+        close_btn = QPushButton("Close")
+        close_btn.setFixedWidth(80)
+        close_btn.clicked.connect(self.hide)
+        btn_row.addWidget(close_btn)
+        btn_row.addStretch(1)
+        root.addLayout(btn_row)
+
+    def set_url(self, url: str) -> None:
+        self._url = url
+        self._url_display.setText(url)
+        pix = _make_qr_pixmap(url, size_px=self._QR_PX)
+        if pix is not None:
+            self._qr_label.setPixmap(pix)
+            self._qr_label.setText("")
+        else:
+            self._qr_label.clear()
+            self._qr_label.setText("QR unavailable")
+
+    @Slot()
+    def _on_copy(self) -> None:
+        if not self._url:
+            return
+        QApplication.clipboard().setText(self._url)
+        try:
+            self._parent_window._append_log(f"Mobile URL copied: {self._url}\n")
+        except Exception:
+            pass
 
 
 # ============================================================
