@@ -278,7 +278,9 @@ class WorkerPool:
 
     async def start(self) -> None:
         """启动连接池"""
-        self._client = httpx.AsyncClient(timeout=self.request_timeout)
+        # trust_env=False: workers 都是 loopback (localhost:xxxx)，
+        # 绝不应该走任何系统代理 (否则 Clash 等会返回 502)。
+        self._client = httpx.AsyncClient(timeout=self.request_timeout, trust_env=False)
         await self._refresh_all_status()
         self._health_check_task = asyncio.create_task(self._health_check_loop())
 

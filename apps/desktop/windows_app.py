@@ -586,6 +586,100 @@ def save_config(model_dir: str, gateway_port: int = DEFAULT_GATEWAY_PORT,
 
 
 # ============================================================
+# Windows Job Object helpers (kill-on-close) — 彻底解决孤儿子进程残留
+# ============================================================
+# 即使 Comni.exe 被强杀 / 崩溃 / 正常关闭, OS 都会关闭本进程持有的所有
+# HANDLE; 对 kill-on-close Job 而言, HANDLE 被关意味着 Job 里所有进程会
+# 被 OS 强制 TerminateProcess 掉, 无一漏网. 配合 cpp_backend 里 worker →
+# llama-server 的那层 Job, 形成两级闭环.
+# ------------------------------------------------------------
+
+def _create_kill_on_close_job_win():
+    """Return a Job Object HANDLE with KILL_ON_JOB_CLOSE, or None if not Win."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        JobObjectExtendedLimitInformation = 9
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+        class _IO_COUNTERS(ctypes.Structure):
+            _fields_ = [("a", ctypes.c_ulonglong), ("b", ctypes.c_ulonglong),
+                        ("c", ctypes.c_ulonglong), ("d", ctypes.c_ulonglong),
+                        ("e", ctypes.c_ulonglong), ("f", ctypes.c_ulonglong)]
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit",     ctypes.c_int64),
+                ("LimitFlags",              wintypes.DWORD),
+                ("MinimumWorkingSetSize",   ctypes.c_size_t),
+                ("MaximumWorkingSetSize",   ctypes.c_size_t),
+                ("ActiveProcessLimit",      wintypes.DWORD),
+                ("Affinity",                ctypes.c_size_t),
+                ("PriorityClass",           wintypes.DWORD),
+                ("SchedulingClass",         wintypes.DWORD),
+            ]
+
+        class _EXT(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BASIC),
+                ("IoInfo",                _IO_COUNTERS),
+                ("ProcessMemoryLimit",    ctypes.c_size_t),
+                ("JobMemoryLimit",        ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed",     ctypes.c_size_t),
+            ]
+
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ]
+
+        hJob = kernel32.CreateJobObjectW(None, None)
+        if not hJob:
+            return None
+        info = _EXT()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            hJob, JobObjectExtendedLimitInformation,
+            ctypes.byref(info), ctypes.sizeof(info),
+        ):
+            kernel32.CloseHandle(hJob)
+            return None
+        return hJob
+    except Exception:
+        return None
+
+
+def _assign_process_to_job_win(hJob, pid: int) -> bool:
+    if hJob is None or not sys.platform.startswith("win"):
+        return False
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_TERMINATE = 0x0001
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        hProc = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if not hProc:
+            return False
+        try:
+            return bool(kernel32.AssignProcessToJobObject(hJob, hProc))
+        finally:
+            kernel32.CloseHandle(hProc)
+    except Exception:
+        return False
+
+
+# ============================================================
 # Service states
 # ============================================================
 
@@ -626,6 +720,14 @@ class ServiceController(QThread):
         self._wk_port = DEFAULT_WORKER_BASE_PORT
         self._log_tail_thread: Optional[threading.Thread] = None
         self._log_tail_running = False
+        # Windows Job Object (kill-on-close).
+        # 所有通过 _popen 启动的子进程 (worker / gateway) 都会 assign 到这里,
+        # 这样即使 Comni.exe 崩溃 / 被 taskkill, OS 也会自动把 Job 里所有
+        # 进程 (以及它们的子孙) 一并杀掉. 再配合 cpp_backend 里 worker →
+        # llama-server 那一层 Job, 形成闭环:
+        #   Comni.exe 退出 任何方式  → OS 杀 worker+gateway
+        #   worker 退出                → OS 杀 llama-server
+        self._proc_job = _create_kill_on_close_job_win()
 
     # public API
     def start_service(self, gw_port: int, wk_port: int):
@@ -656,11 +758,19 @@ class ServiceController(QThread):
     def _popen(self, cmd: list[str], env: dict) -> subprocess.Popen:
         CREATE_NO_WINDOW = 0x08000000
         CREATE_NEW_PROCESS_GROUP = 0x00000200
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             cmd, env=env, cwd=str(_SERVER_DIR),
             stdout=self._log_file, stderr=subprocess.STDOUT,
             creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
         )
+        # 把子进程 assign 到 kill-on-close Job. 保证 Comni.exe 无论如何退出,
+        # worker / gateway 及其所有子孙进程都会被 OS 自动杀掉.
+        if self._proc_job is not None:
+            try:
+                _assign_process_to_job_win(self._proc_job, proc.pid)
+            except Exception as e:
+                logger.warning(f"assign_process_to_job pid={proc.pid}: {e}")
+        return proc
 
     def _do_start(self):
         logger.info("start worker=%s gateway=%s", self._wk_port, self._gw_port)

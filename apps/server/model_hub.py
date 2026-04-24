@@ -26,6 +26,10 @@ _CACHE_DIR = _COMNI_HOME / "cache"
 _COMNI_CONFIG_PATH = _COMNI_HOME / "config.json"
 
 HF_MAIN_ENDPOINT = "https://huggingface.co"
+# Built-in fallback mirror used when HuggingFace is unreachable and the user
+# hasn't configured their own mirror. Can be overridden via comni config
+# ("hf_mirror") or the ModelDownloader(mirror_url=...) ctor argument.
+HF_DEFAULT_MIRROR = "https://hf-mirror.com"
 MANIFEST_CACHE_HOURS = 24
 HEAD_TIMEOUT_SEC = 5
 
@@ -84,7 +88,21 @@ def save_comni_config(cfg: dict):
 
 
 def get_hf_mirror() -> str:
-    return load_comni_config().get("hf_mirror", "")
+    """Return the configured HF mirror, or the built-in default.
+
+    Priority:
+      1. User-configured "hf_mirror" in ~/.comni/config.json
+      2. HF_DEFAULT_MIRROR (https://hf-mirror.com)
+    An empty / explicitly-disabled value can be set with "hf_mirror": "disabled".
+    """
+    cfg_val = load_comni_config().get("hf_mirror", None)
+    if cfg_val is None:
+        return HF_DEFAULT_MIRROR
+    if isinstance(cfg_val, str):
+        if cfg_val.strip().lower() in ("", "disabled", "none", "off"):
+            return ""
+        return cfg_val.strip()
+    return HF_DEFAULT_MIRROR
 
 
 # ── Verification ─────────────────────────────────────────
@@ -287,22 +305,37 @@ def fetch_remote_manifest(hf_repo: str, force: bool = False) -> Dict[str, dict]:
         except Exception:
             pass
 
-    logger.info("Fetching manifest from HF: %s", hf_repo)
-    manifest = {}
-    try:
+    manifest: Dict[str, dict] = {}
+
+    def _pull(endpoint: str) -> Dict[str, dict]:
         from huggingface_hub import HfApi
-        api = HfApi(endpoint=HF_MAIN_ENDPOINT)
+        api = HfApi(endpoint=endpoint)
         info = api.model_info(hf_repo, files_metadata=True)
+        out: Dict[str, dict] = {}
         for sib in info.siblings or []:
             if not sib.rfilename.endswith(".gguf"):
                 continue
             entry = {"size": sib.size or 0}
             if sib.lfs:
                 entry["sha256"] = sib.lfs.get("sha256", "") if isinstance(sib.lfs, dict) else getattr(sib.lfs, "sha256", "")
-            manifest[sib.rfilename] = entry
+            out[sib.rfilename] = entry
+        return out
+
+    logger.info("Fetching manifest from HF: %s", hf_repo)
+    try:
+        manifest = _pull(HF_MAIN_ENDPOINT)
     except Exception as e:
-        logger.warning("Failed to fetch manifest: %s", e)
-        return manifest
+        logger.warning("Failed to fetch manifest from HF main: %s", e)
+        mirror = get_hf_mirror()
+        if mirror:
+            logger.info("Retrying manifest via mirror: %s", mirror)
+            try:
+                manifest = _pull(mirror)
+            except Exception as e2:
+                logger.warning("Manifest fallback mirror also failed: %s", e2)
+                return manifest
+        else:
+            return manifest
 
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     to_save = dict(manifest)
@@ -319,9 +352,9 @@ def fetch_remote_manifest(hf_repo: str, force: bool = False) -> Dict[str, dict]:
 
 CHUNK_SIZE = 1024 * 1024          # 1 MB per read
 SPEED_TEST_BYTES = 2 * 1024 * 1024  # test with first 2 MB
-SPEED_TEST_TIMEOUT = 15           # seconds to download test bytes
+SPEED_TEST_TIMEOUT = 10           # seconds to download test bytes (HF only)
 MIN_SPEED_BPS = 200 * 1024        # 200 KB/s — below this, switch to mirror
-CONNECT_TIMEOUT = 15
+CONNECT_TIMEOUT = 8               # short: fail fast to trigger mirror fallback
 READ_TIMEOUT = 60
 MAX_PARALLEL = 4                  # concurrent download threads
 MAX_RETRIES = 3                   # retry on transient network errors
@@ -413,7 +446,11 @@ class ModelDownloader:
         return dirs
 
     def _download_directory(self, dir_entry: dict):
-        """Download a directory tree (e.g. .mlmodelc) from HF repo."""
+        """Download a directory tree (e.g. .mlmodelc) from HF repo.
+
+        Tries HF main first, then falls back to mirror for the tree listing.
+        Per-file downloads delegate to _download_one which has its own fallback.
+        """
         rel_dir = dir_entry["path"]
         dest_dir = self.dest_dir / rel_dir
 
@@ -423,30 +460,57 @@ class ModelDownloader:
 
         logger.info("Downloading directory: %s", rel_dir)
         try:
-            from huggingface_hub import HfApi
-            endpoint = self.mirror_url if self._use_mirror else HF_MAIN_ENDPOINT
-            api = HfApi(endpoint=endpoint)
-            from huggingface_hub import RepoFile
-            tree = api.list_repo_tree(self.hf_repo, path_in_repo=rel_dir, recursive=True)
-            file_list = []
-            for item in tree:
-                if isinstance(item, RepoFile):
-                    file_list.append({
-                        "path": item.rfilename,
-                        "size": getattr(item, "size", 0) or 0,
-                    })
-            if not file_list:
-                logger.warning("No files found in HF directory: %s", rel_dir)
-                return
+            from huggingface_hub import HfApi, RepoFile
+        except ImportError:
+            logger.warning("huggingface_hub not available, cannot download directory: %s", rel_dir)
+            return
 
+        # Decide listing endpoint: if we've already fallen back to mirror
+        # elsewhere, don't bother poking HF again.
+        endpoints: List[str] = []
+        if self._use_mirror and self.mirror_url:
+            endpoints.append(self.mirror_url)
+        else:
+            endpoints.append(HF_MAIN_ENDPOINT)
+            if self.mirror_url:
+                endpoints.append(self.mirror_url)
+
+        tree = None
+        for ep in endpoints:
+            try:
+                api = HfApi(endpoint=ep)
+                tree = list(api.list_repo_tree(
+                    self.hf_repo, path_in_repo=rel_dir, recursive=True))
+                if ep != HF_MAIN_ENDPOINT:
+                    # We successfully used mirror for listing — lock it in.
+                    self._use_mirror = True
+                break
+            except Exception as e:
+                logger.warning("list_repo_tree failed on %s: %s", ep, e)
+                tree = None
+
+        if tree is None:
+            logger.warning("Unable to list directory %s from any endpoint", rel_dir)
+            return
+
+        file_list = []
+        for item in tree:
+            if isinstance(item, RepoFile):
+                file_list.append({
+                    "path": item.rfilename,
+                    "size": getattr(item, "size", 0) or 0,
+                })
+        if not file_list:
+            logger.warning("No files found in HF directory: %s", rel_dir)
+            return
+
+        try:
             for finfo in file_list:
                 if self._cancel.is_set():
                     raise Exception("Cancelled by user")
                 self._download_one(finfo)
-
-            logger.info("Directory download complete: %s (%d files)", rel_dir, len(file_list))
-        except ImportError:
-            logger.warning("huggingface_hub not available, cannot download directory: %s", rel_dir)
+            logger.info("Directory download complete: %s (%d files)",
+                        rel_dir, len(file_list))
         except Exception as e:
             logger.warning("Failed to download directory %s: %s", rel_dir, e)
 
@@ -486,10 +550,18 @@ class ModelDownloader:
                          expected_size: int, resume_from: int = 0) -> bool:
         """Stream-download a file with real progress reporting.
 
-        Returns True if successful, False if speed too slow (caller should retry
-        with mirror). Progress is aggregated across parallel workers.
+        Returns:
+            True  — download finished (caller must still size-verify).
+            False — speed too slow / timeout (HF-only signal; caller should
+                    fall back to mirror). Only applies when a mirror is
+                    available AND we're still on the HF endpoint.
+
+        Raises any network/HTTP exception so callers can fall back quickly.
         """
         import requests
+
+        is_hf = url.startswith(HF_MAIN_ENDPOINT)
+        probing = is_hf and self._use_mirror is None and bool(self.mirror_url)
 
         headers = {"User-Agent": "Comni/1.0"}
         if resume_from > 0:
@@ -518,20 +590,23 @@ class ModelDownloader:
 
                 now = time.time()
 
-                # Speed test (only once, for the probe file)
-                if self._use_mirror is None and self.mirror_url:
+                # HF speed probe — only runs for the first HF download
+                # while we're still deciding between HF and mirror.
+                if probing:
                     if local_bytes >= SPEED_TEST_BYTES:
                         speed = local_bytes / max(now - t0, 0.01)
                         if speed < MIN_SPEED_BPS:
                             resp.close()
-                            logger.info("HF too slow (%.0f KB/s), switching to mirror",
+                            logger.info("HF too slow (%.0f KB/s) — switching to mirror",
                                         speed / 1024)
                             return False
-                        logger.info("HF OK (%.0f KB/s), using direct", speed / 1024)
+                        logger.info("HF OK (%.0f KB/s) — staying on main",
+                                    speed / 1024)
                         self._use_mirror = False
+                        probing = False
                     elif now - t0 > SPEED_TEST_TIMEOUT:
                         resp.close()
-                        logger.info("HF timeout (%ds, %d KB), switching to mirror",
+                        logger.info("HF probe timeout (%ds, %d KB) — switching to mirror",
                                     SPEED_TEST_TIMEOUT, local_bytes // 1024)
                         return False
 
@@ -543,7 +618,14 @@ class ModelDownloader:
         return True
 
     def _download_one(self, finfo: dict):
-        """Download a single file with retry (called from thread pool)."""
+        """Download a single file with retry (called from thread pool).
+
+        Fallback strategy:
+          * First try HF main endpoint (unless mirror already locked in).
+          * On ANY HF failure (timeout / connection error / HTTP error / slow
+            speed) — switch to mirror immediately, without consuming a retry.
+          * Only after mirror has also failed do we burn retry attempts.
+        """
         rel_path = finfo["path"]
         expected_size = finfo.get("size", 0)
         dest_file = self.dest_dir / rel_path
@@ -561,68 +643,110 @@ class ModelDownloader:
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         self._send_head_for_count(rel_path)
 
-        last_err = None
+        last_err: Optional[BaseException] = None
         for attempt in range(MAX_RETRIES):
             if self._cancel.is_set():
                 raise Exception("Cancelled by user")
 
-            resume_from = dest_file.stat().st_size if dest_file.exists() else 0
-            endpoint = self.mirror_url if self._use_mirror else HF_MAIN_ENDPOINT
-            url = _resolve_download_url(self.hf_repo, rel_path, endpoint)
-
-            if attempt == 0:
-                logger.info("Downloading %s from %s (resume=%d)",
-                            rel_path, endpoint, resume_from)
-            else:
+            if attempt > 0:
                 wait = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
-                logger.warning("Retry %d/%d for %s (wait %ds, resume=%d)",
-                               attempt + 1, MAX_RETRIES, rel_path, wait, resume_from)
+                logger.warning("Retry %d/%d for %s (wait %ds)",
+                               attempt + 1, MAX_RETRIES, rel_path, wait)
                 time.sleep(wait)
 
-            try:
-                ok = self._stream_download(url, dest_file, rel_path,
-                                           expected_size, resume_from)
-                if not ok and self.mirror_url:
+            # --- Try HF first (unless we've already locked in a mirror) ---
+            if not self._use_mirror:
+                resume_from = dest_file.stat().st_size if dest_file.exists() else 0
+                url = _resolve_download_url(self.hf_repo, rel_path, HF_MAIN_ENDPOINT)
+                try:
+                    if attempt == 0:
+                        logger.info("Downloading %s from HF (resume=%d)",
+                                    rel_path, resume_from)
+                    ok = self._stream_download(url, dest_file, rel_path,
+                                               expected_size, resume_from)
+                    if ok:
+                        if self._verify_size(dest_file, rel_path, expected_size):
+                            self._mark_file_done(rel_path)
+                            return
+                        # size mismatch — treat as failure, fall through
+                        raise IOError(f"Size mismatch after HF download: {rel_path}")
+                    # ok == False → speed probe said HF is too slow
+                    if not self.mirror_url:
+                        # No mirror configured — keep retrying HF
+                        last_err = Exception("HF too slow and no mirror configured")
+                        continue
+                    logger.info("HF slow for %s — switching to mirror", rel_path)
                     self._use_mirror = True
-                    mirror_url = _resolve_download_url(
-                        self.hf_repo, rel_path, self.mirror_url)
-                    resume_from = dest_file.stat().st_size if dest_file.exists() else 0
-                    logger.info("Retrying %s from mirror (resume=%d)",
-                                rel_path, resume_from)
-                    self._stream_download(mirror_url, dest_file, rel_path,
+                except Exception as e:
+                    err_msg = str(e)
+                    if "Cancelled" in err_msg:
+                        raise
+                    last_err = e
+                    logger.warning("HF failed for %s: %s", rel_path, err_msg)
+                    if self.mirror_url and self._use_mirror is None:
+                        # First HF failure → promote to mirror immediately.
+                        # This does NOT consume a retry attempt for mirror.
+                        logger.info("Switching to mirror after HF error")
+                        self._use_mirror = True
+                    elif not self.mirror_url:
+                        # No mirror available — fall through to next attempt
+                        continue
+
+            # --- Mirror path (either decided earlier or just-promoted) ---
+            if self._use_mirror and self.mirror_url:
+                resume_from = dest_file.stat().st_size if dest_file.exists() else 0
+                url = _resolve_download_url(self.hf_repo, rel_path, self.mirror_url)
+                try:
+                    logger.info("Downloading %s from mirror %s (resume=%d)",
+                                rel_path, self.mirror_url, resume_from)
+                    self._stream_download(url, dest_file, rel_path,
                                           expected_size, resume_from)
-
-                # Verify size
-                if expected_size > 0 and dest_file.exists():
-                    actual = dest_file.stat().st_size
-                    if actual != expected_size:
-                        raise IOError(
-                            f"Size mismatch: {rel_path} "
-                            f"(expected {expected_size}, got {actual})")
-
-                with self._lock:
-                    self._completed_count += 1
-                    self.progress.file_index = self._completed_count
-                logger.info("Done: %s (%s)", rel_path,
-                            _fmt_size(dest_file.stat().st_size))
-                return  # success
-
-            except Exception as e:
-                last_err = e
-                err_msg = str(e)
-                if "Cancelled" in err_msg:
-                    raise
-                logger.warning("Attempt %d failed for %s: %s",
-                               attempt + 1, rel_path, err_msg)
+                    if self._verify_size(dest_file, rel_path, expected_size):
+                        self._mark_file_done(rel_path)
+                        return
+                    raise IOError(f"Size mismatch after mirror download: {rel_path}")
+                except Exception as e:
+                    err_msg = str(e)
+                    if "Cancelled" in err_msg:
+                        raise
+                    last_err = e
+                    logger.warning("Mirror failed for %s: %s", rel_path, err_msg)
 
         raise Exception(f"Failed after {MAX_RETRIES} retries: {rel_path}: {last_err}")
+
+    def _verify_size(self, dest_file: Path, rel_path: str,
+                     expected_size: int) -> bool:
+        if expected_size <= 0 or not dest_file.exists():
+            return True
+        actual = dest_file.stat().st_size
+        if actual != expected_size:
+            logger.warning("Size mismatch: %s (expected %d, got %d)",
+                           rel_path, expected_size, actual)
+            return False
+        return True
+
+    def _mark_file_done(self, rel_path: str):
+        with self._lock:
+            self._completed_count += 1
+            self.progress.file_index = self._completed_count
+        dest_file = self.dest_dir / rel_path
+        if dest_file.exists():
+            logger.info("Done: %s (%s)", rel_path,
+                        _fmt_size(dest_file.stat().st_size))
+        else:
+            logger.info("Done: %s", rel_path)
 
     def _probe_speed(self, files: List[dict]) -> List[dict]:
         """Download the smallest file first to decide HF vs mirror.
 
+        _download_one() already handles HF→mirror fallback internally, so
+        this method only needs to pick a probe file and delegate. If both
+        HF and mirror fail, we re-raise so the parent _run() can abort.
+
         Returns the remaining files to download in parallel.
         """
         if not self.mirror_url:
+            # No mirror at all → just use HF and hope for the best.
             self._use_mirror = False
             return files
 
@@ -631,9 +755,11 @@ class ModelDownloader:
 
         logger.info("Speed probe: %s (%s)", probe["path"],
                      _fmt_size(probe.get("size", 0)))
-        self._download_one(probe)
+        self._download_one(probe)  # raises only if both HF and mirror fail
 
         if self._use_mirror is None:
+            # Probe finished on HF without triggering the slow-speed signal
+            # (e.g. file smaller than SPEED_TEST_BYTES). Stay on HF.
             self._use_mirror = False
         logger.info("Endpoint decided: %s",
                      self.mirror_url if self._use_mirror else HF_MAIN_ENDPOINT)

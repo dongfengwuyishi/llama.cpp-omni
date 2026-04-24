@@ -18,6 +18,20 @@ import asyncio
 import argparse
 import logging
 import time
+
+# ---------------------------------------------------------------------------
+# 🔧 防止系统级 HTTP 代理劫持 gateway → worker 的 loopback 通信
+# ---------------------------------------------------------------------------
+# Gateway 进程只向本地 worker(s) 发请求，不需要任何外网。
+# Windows 上 httpx 默认 trust_env=True 并读注册表系统代理 (WinINET)，
+# 常见场景：用户装了 Clash/V2Ray 把系统代理指到 127.0.0.1:7890 ——
+# 于是 httpx 把 "http://localhost:22701/health" 发给 Clash，回 502。
+# 直接整体禁用当前进程的代理是最稳的做法。
+for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+           "http_proxy", "https_proxy", "all_proxy"):
+    os.environ.pop(_k, None)
+os.environ["NO_PROXY"] = "*"
+os.environ["no_proxy"] = "*"
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -305,7 +319,9 @@ async def chat(request: Request):
     task_start = datetime.now()
 
     try:
-        async with httpx.AsyncClient(timeout=worker_pool.request_timeout) as client:
+        # trust_env=False: worker.url 永远是 loopback，不走系统代理
+        async with httpx.AsyncClient(timeout=worker_pool.request_timeout,
+                                     trust_env=False) as client:
             resp = await client.post(
                 f"{worker.url}/chat",
                 json=request_body,

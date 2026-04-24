@@ -18,6 +18,26 @@ import os
 import re
 import json
 import time
+
+# ---------------------------------------------------------------------------
+# 🔧 防止系统级 HTTP 代理劫持内部 loopback 通信
+# ---------------------------------------------------------------------------
+# worker 只做两件事：(1) 监听本地 HTTP (uvicorn)；(2) 向本地 llama-server
+# 发 HTTP 请求。它从不走外网（HF 下载是 GUI 端 windows_app.py 干的）。
+#
+# 而 Windows 上 httpx/requests 默认 trust_env=True，会同时读：
+#   1) 环境变量 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY
+#   2) Windows 注册表 (Internet Settings) 里的系统代理 (WinINET)
+# 很多用户装了 Clash / V2Ray，系统代理被指向 127.0.0.1:7890。此时
+# httpx 会把 "http://localhost:22700" 发到那个代理，Clash 直接回 502，
+# 结果 gateway 认为 worker 不健康，前端看到"worker 状态未 ready"。
+#
+# 对 worker 进程，任何网络都是 loopback，直接整体禁用代理最稳。
+for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+           "http_proxy", "https_proxy", "all_proxy"):
+    os.environ.pop(_k, None)
+os.environ["NO_PROXY"] = "*"
+os.environ["no_proxy"] = "*"
 import uuid
 import asyncio
 import argparse
