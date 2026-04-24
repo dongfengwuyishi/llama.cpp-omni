@@ -1615,7 +1615,7 @@ class CppBackendWorker:
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/update_session_config",
             json=req_body,
-            timeout=30.0,
+            timeout=90.0,
         )
         if resp.status_code != 200:
             raise RuntimeError(f"update_session_config failed: {resp.text}")
@@ -1645,7 +1645,7 @@ class CppBackendWorker:
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/prefill",
             json=req_body,
-            timeout=30.0,
+            timeout=120.0,
         )
         if resp.status_code != 200:
             logger.error(f"prefill failed (cnt={cnt}): {resp.text}")
