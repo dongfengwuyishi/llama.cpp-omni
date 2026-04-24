@@ -17,6 +17,20 @@ desktop/packaging/.cache/
 desktop/dist/
 desktop/build/
 
+# Windows packaging — auto-generated icon + PyInstaller outputs
+desktop/packaging/windows/Comni.ico
+desktop/packaging/windows/build/
+desktop/packaging/windows/dist/
+desktop/packaging/windows/python-embed/
+
+# React mobile frontend — dev-time artifacts (source of truth is apps/frontend-mobile/)
+# NOTE: frontend/mobile/ (build:static output) is committed so DMG/EXE packagers
+#       don't need Node/bun at package time. Re-generate via:
+#           cd apps/frontend-mobile && npm run build:static
+frontend-mobile/node_modules/
+frontend-mobile/dist/
+frontend-mobile/.turbo/
+
 # Logs
 *.log
 desktop/*.log

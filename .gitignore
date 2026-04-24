@@ -201,3 +201,34 @@ poetry.toml
 # Output directories
 tools/omni/output/
 tools/omni/output_*/
+
+# ---------------------------------------------------------------------------
+# Desktop app / PyInstaller / Python embed packaging artifacts
+# ---------------------------------------------------------------------------
+
+# Root-level PyInstaller output (apps/desktop/packaging/windows produces here)
+/dist/
+
+# PyInstaller / Inno Setup per-package outputs
+apps/desktop/packaging/windows/build/
+apps/desktop/packaging/windows/dist/
+apps/desktop/packaging/windows/Output/
+apps/desktop/packaging/windows/python-embed/
+apps/desktop/packaging/windows/Comni.ico
+apps/desktop/dist/
+apps/desktop/build/
+
+# Embedded Python runtime (shipped with the Windows app)
+python-embed/
+**/site-packages/
+*.pyd
+*.whl
+*.msgpack
+
+# Python bytecode / cache (extend existing rules)
+*.pyc
+*.pyo
+
+# Installer binaries produced locally
+*Setup*.exe
+Comni-*.exe

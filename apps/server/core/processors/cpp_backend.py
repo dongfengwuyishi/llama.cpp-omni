@@ -37,6 +37,216 @@ logger = logging.getLogger("cpp_backend")
 _AUDIO_INPUT_SR = 16000
 _AUDIO_OUTPUT_SR = 24000
 
+_IS_WIN = sys.platform.startswith("win")
+_CREATE_NO_WINDOW = 0x08000000  # Windows CreateProcess flag
+
+# ---------------------------------------------------------------------------
+# Windows process-management helpers
+# ---------------------------------------------------------------------------
+# Motivation:
+#   * 原实现里所有进程管理代码都是 Linux 风格 (os.getpgid, os.killpg,
+#     lsof, SIGKILL). 在 Windows 上这些要么不存在, 要么直接走到 except 被
+#     悄悄吞掉, 导致两个症状:
+#       1) _kill_stale_server_on_port 根本杀不掉老 llama-server, 连续 stop/
+#          start 会在端口上堆残留, 最终内存/句柄泄漏.
+#       2) Comni.exe 关闭时 subprocess.terminate() = TerminateProcess, worker
+#          来不及跑 atexit / shutdown(), llama-server.exe 成为孤儿长期驻留.
+#
+#   * 这里提供 Windows-native 的 4 个 helper:
+#       - _win_create_kill_on_close_job()    建 Job Object (kill-on-close)
+#       - _win_assign_process_to_job(j,pid)  把某进程加进该 Job
+#       - _kill_pid_windows(pid)             taskkill /F /T 强杀进程树
+#       - _kill_processes_on_port_windows()  netstat -ano + taskkill
+#
+#   * Job Object + JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 是 Windows 上唯一
+#     100% 可靠的"父死子必死"机制: worker 进程持有 Job HANDLE; worker 不管
+#     被正常 exit / 被 TerminateProcess / 整个 Comni.exe 崩溃 kill, OS 都
+#     会在该进程结束时关闭它持有的 HANDLE, 从而触发 Job 清理, Job 里所有
+#     进程 (这里就是 llama-server.exe) 会被 OS 强制杀掉.
+
+def _win_create_kill_on_close_job():
+    """Create a Windows Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+
+    Returns the HANDLE (int) or None if not on Windows / creation failed.
+    Caller must keep the HANDLE alive for the entire lifetime during which
+    child processes should be tied to this process's lifetime."""
+    if not _IS_WIN:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    JobObjectExtendedLimitInformation = 9
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit",     ctypes.c_int64),
+            ("LimitFlags",              wintypes.DWORD),
+            ("MinimumWorkingSetSize",   ctypes.c_size_t),
+            ("MaximumWorkingSetSize",   ctypes.c_size_t),
+            ("ActiveProcessLimit",      wintypes.DWORD),
+            ("Affinity",                ctypes.c_size_t),
+            ("PriorityClass",           wintypes.DWORD),
+            ("SchedulingClass",         wintypes.DWORD),
+        ]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo",                IO_COUNTERS),
+            ("ProcessMemoryLimit",    ctypes.c_size_t),
+            ("JobMemoryLimit",        ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed",     ctypes.c_size_t),
+        ]
+
+    CreateJobObjectW = kernel32.CreateJobObjectW
+    CreateJobObjectW.restype = wintypes.HANDLE
+    CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+
+    SetInformationJobObject = kernel32.SetInformationJobObject
+    SetInformationJobObject.restype = wintypes.BOOL
+    SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ]
+
+    try:
+        hJob = CreateJobObjectW(None, None)
+        if not hJob:
+            raise OSError(f"CreateJobObject failed: {ctypes.get_last_error()}")
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = SetInformationJobObject(
+            hJob,
+            JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not ok:
+            err = ctypes.get_last_error()
+            kernel32.CloseHandle(hJob)
+            raise OSError(f"SetInformationJobObject failed: {err}")
+        return hJob
+    except Exception as e:
+        logger.warning(f"_win_create_kill_on_close_job: {e}")
+        return None
+
+
+def _win_assign_process_to_job(hJob, pid: int) -> bool:
+    """Assign *pid* to the given Job HANDLE. Returns True on success."""
+    if not _IS_WIN or not hJob:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    PROCESS_SET_QUOTA  = 0x0100
+    PROCESS_TERMINATE  = 0x0001
+
+    OpenProcess = kernel32.OpenProcess
+    OpenProcess.restype = wintypes.HANDLE
+    OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+
+    AssignProcessToJobObject = kernel32.AssignProcessToJobObject
+    AssignProcessToJobObject.restype = wintypes.BOOL
+    AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+
+    hProc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+    if not hProc:
+        logger.warning(f"OpenProcess pid={pid} failed: {ctypes.get_last_error()}")
+        return False
+    try:
+        if not AssignProcessToJobObject(hJob, hProc):
+            err = ctypes.get_last_error()
+            # 87 = ERROR_INVALID_PARAMETER: 通常是这个进程已在另一个不允许 breakaway 的 Job 里
+            # (比如被 Explorer 启动的某些场景).  这种情况下我们只能在 shutdown 时靠
+            # taskkill 兜底, 不是致命错误.
+            logger.warning(f"AssignProcessToJobObject pid={pid} failed: {err}")
+            return False
+        return True
+    finally:
+        kernel32.CloseHandle(hProc)
+
+
+def _kill_pid_windows(pid: int) -> None:
+    """Hard kill a PID and its descendants with ``taskkill /F /T``."""
+    if not _IS_WIN:
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True, check=False,
+            creationflags=_CREATE_NO_WINDOW,
+            timeout=10,
+        )
+    except Exception as e:
+        logger.debug(f"taskkill pid={pid} failed: {e}")
+
+
+def _kill_processes_on_port_windows(port: int) -> None:
+    """netstat 找 LISTENING 在 *port* 上的 PID, 逐个 taskkill /F /T."""
+    if not _IS_WIN:
+        return
+    # NOTE: on non-English Windows (zh-CN, ja-JP, ...) netstat's table header
+    # is emitted in the local ANSI codepage (GBK/CP932/...). Using text=True
+    # here would let subprocess decode with Python's default encoding (often
+    # UTF-8) and crash inside the background _readerthread with
+    # UnicodeDecodeError, which leaves stdout as None and breaks the outer
+    # try/except. Decode manually with errors="replace" instead.
+    try:
+        raw = subprocess.check_output(
+            ["netstat", "-ano", "-p", "TCP"],
+            stderr=subprocess.DEVNULL,
+            creationflags=_CREATE_NO_WINDOW,
+            timeout=5,
+        )
+    except Exception as e:
+        logger.debug(f"netstat failed: {e}")
+        return
+
+    if not raw:
+        return
+    try:
+        out = raw.decode("mbcs", errors="replace")
+    except Exception:
+        out = raw.decode("utf-8", errors="replace")
+
+    port_suffix = f":{port}"
+    pids: set = set()
+    for line in out.splitlines():
+        # 典型行: "  TCP    0.0.0.0:19060    0.0.0.0:0    LISTENING    12345"
+        parts = line.split()
+        if len(parts) < 5 or parts[0] != "TCP":
+            continue
+        local_addr, state = parts[1], parts[3]
+        if state != "LISTENING" or not local_addr.endswith(port_suffix):
+            continue
+        try:
+            pids.add(int(parts[-1]))
+        except ValueError:
+            pass
+
+    if not pids:
+        return
+    for pid in pids:
+        logger.warning(f"Killing stale process on port {port}: pid={pid}")
+        _kill_pid_windows(pid)
+    time.sleep(1)
+
 # Token2Wav device: "gpu:0" 让 flow matching 使用 Metal 加速（vocoder 由 C++ 侧自动降 CPU）
 # C++ 端有 GPU→CPU 自动降级，所以 macOS 上也可以安全使用 gpu:0
 _DEFAULT_TOKEN2WAV_DEVICE = "gpu:0"
@@ -214,6 +424,10 @@ class CppBackendWorker:
         self._cpp_server_port = cpp_server_port or (19060 + gpu_id)
         self._cpp_server_url = f"http://127.0.0.1:{self._cpp_server_port}"
         self._cpp_process: Optional[subprocess.Popen] = None
+        # Windows Job Object (kill-on-close) — 所有 llama-server 子进程都
+        # assign 到它. worker 进程一旦退出, HANDLE 随之 close, OS 会杀光
+        # Job 内一切还活着的进程, 不会留下孤儿 llama-server.exe.
+        self._cpp_job = None
         self._http_client = None  # httpx.Client (sync)
         self._temp_dir = tempfile.mkdtemp(prefix="cpp_backend_")
         self._output_dir = os.path.join(llamacpp_root, f"tools/omni/output_{self._cpp_server_port}")
@@ -241,6 +455,7 @@ class CppBackendWorker:
         logger.info(f"[GPU {self.gpu_id}] Starting C++ llama-server...")
 
         import httpx
+        # trust_env=False: llama-server 永远是 loopback，避免系统代理 (如 Clash) 劫持
         self._http_client = httpx.Client(
             timeout=httpx.Timeout(600.0, connect=30.0),
             trust_env=False,
@@ -448,14 +663,36 @@ class CppBackendWorker:
 
     @staticmethod
     def _kill_stale_server_on_port(port: int) -> None:
-        """Kill any leftover llama-server process listening on *port*."""
+        """Kill any leftover llama-server process LISTENING on *port*.
+
+        Windows: netstat -ano + taskkill /F /T (already filters by LISTENING)
+        POSIX  : lsof -sTCP:LISTEN -ti + SIGKILL
+
+        注意：lsof 默认返回所有与该端口相关的 socket，包括**作为客户端连接到
+        该端口**的进程。worker.py 通过 httpx 长连接到 llama-server 的 19060，
+        不加 -sTCP:LISTEN 会把 worker 自己的 PID 也返回，然后被 SIGKILL，
+        导致 omni duplex 会话结束后 worker 自杀、gateway 与 worker 失联。
+        """
+        if _IS_WIN:
+            _kill_processes_on_port_windows(port)
+            return
         try:
             out = subprocess.check_output(
-                ["lsof", "-ti", f"tcp:{port}"], text=True, stderr=subprocess.DEVNULL
+                ["lsof", "-sTCP:LISTEN", "-ti", f"tcp:{port}"],
+                text=True, stderr=subprocess.DEVNULL
             ).strip()
             if out:
+                own_pid = os.getpid()
                 for pid_str in out.splitlines():
-                    pid = int(pid_str.strip())
+                    try:
+                        pid = int(pid_str.strip())
+                    except ValueError:
+                        continue
+                    # 双保险：即便 lsof 有边界行为，也绝不 kill 本进程
+                    if pid == own_pid:
+                        logger.warning(
+                            f"Refusing to kill self (pid={pid}) on port {port}")
+                        continue
                     logger.warning(f"Killing stale process on port {port}: pid={pid}")
                     try:
                         os.kill(pid, signal.SIGKILL)
@@ -466,22 +703,61 @@ class CppBackendWorker:
             pass
 
     def is_cpp_healthy(self) -> bool:
-        """Check if the underlying C++ llama-server is alive (process + HTTP)."""
+        """Fast liveness check (process-only, safe to call from async handlers).
+
+        Only checks whether the llama-server subprocess is still running.
+        Does NOT issue a network call: that would block the asyncio event
+        loop, which on Windows has been observed to starve /health
+        responses and eventually freeze the worker under concurrent load
+        (gateway's 15s heartbeat + worker's 3s requests.get).
+        """
         proc = self._cpp_process
         if proc is None or proc.poll() is not None:
             return False
+        return True
+
+    def is_cpp_responsive(self, timeout: float = 3.0) -> bool:
+        """Blocking HTTP liveness check — only call from a thread pool."""
+        if not self.is_cpp_healthy():
+            return False
         try:
             import requests as _req
-            r = _req.get(f"{self._cpp_server_url}/health", timeout=3)
+            r = _req.get(
+                f"{self._cpp_server_url}/health",
+                timeout=timeout,
+                proxies={"http": None, "https": None},
+            )
             return r.status_code == 200
         except Exception:
             return False
 
     def _stop_cpp_server(self) -> None:
-        if self._cpp_process is not None:
-            proc = self._cpp_process
-            try:
-                if proc.poll() is None:
+        if self._cpp_process is None:
+            return
+        proc = self._cpp_process
+        try:
+            if proc.poll() is None:
+                if _IS_WIN:
+                    # Windows: os.getpgid / killpg / SIGKILL 都不存在.
+                    # 先 taskkill /F /T 强杀整棵进程树 (llama-server 自身可能拉起
+                    # CUDA helper / flow matching 线程), 再 terminate() 兜底.
+                    _kill_pid_windows(proc.pid)
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            pass
+                else:
                     try:
                         pgid = os.getpgid(proc.pid)
                         os.killpg(pgid, signal.SIGTERM)
@@ -501,11 +777,17 @@ class CppBackendWorker:
                         except Exception:
                             proc.kill()
                         proc.wait(timeout=5)
-            except Exception as e:
-                logger.warning(f"_stop_cpp_server: {e}")
-            finally:
-                self._cpp_process = None
-                logger.info("llama-server stopped")
+        except Exception as e:
+            logger.warning(f"_stop_cpp_server: {e}")
+        finally:
+            self._cpp_process = None
+            # Defensive: 万一进程树里还有漏网的 (比如 Job 不生效的环境),
+            # 按端口再扫一遍.
+            try:
+                self._kill_stale_server_on_port(self._cpp_server_port)
+            except Exception:
+                pass
+            logger.info("llama-server stopped")
 
     def full_reinit(self) -> None:
         """每次会话结束后完全重启 llama-server，保证下次会话状态绝对干净。"""
@@ -969,12 +1251,34 @@ class CppBackendWorker:
 
         logger.info(f"Starting C++ server: {' '.join(cmd)}")
 
-        self._cpp_process = subprocess.Popen(
-            cmd, env=env, cwd=self.llamacpp_root,
+        popen_kwargs: Dict[str, Any] = dict(
+            env=env, cwd=self.llamacpp_root,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             bufsize=1, encoding="utf-8", errors="replace",
-            start_new_session=True,
         )
+        if _IS_WIN:
+            # CREATE_NO_WINDOW: 不弹控制台黑框. 不要加 CREATE_NEW_PROCESS_GROUP,
+            # 否则 llama-server 会脱离当前进程组, Ctrl+C 等传播会断掉.
+            popen_kwargs["creationflags"] = _CREATE_NO_WINDOW
+        else:
+            # POSIX: 放到独立 session, 便于后面 killpg.
+            popen_kwargs["start_new_session"] = True
+
+        self._cpp_process = subprocess.Popen(cmd, **popen_kwargs)
+
+        # Windows: 把 llama-server 加入 kill-on-close Job Object.
+        # worker 进程死了 (正常退出 / TerminateProcess / 崩溃) 都会关闭 HANDLE,
+        # Job 里所有进程会被 OS 自动杀掉, 杜绝孤儿 llama-server.exe.
+        if _IS_WIN:
+            if self._cpp_job is None:
+                self._cpp_job = _win_create_kill_on_close_job()
+            if self._cpp_job is not None:
+                ok = _win_assign_process_to_job(self._cpp_job, self._cpp_process.pid)
+                if ok:
+                    logger.info(
+                        f"llama-server pid={self._cpp_process.pid} "
+                        f"assigned to kill-on-close Job"
+                    )
 
         def _log_reader():
             try:
@@ -1002,9 +1306,19 @@ class CppBackendWorker:
         import requests
         for i in range(300):
             try:
-                r = requests.get(f"{self._cpp_server_url}/health", timeout=2)
+                r = requests.get(
+                    f"{self._cpp_server_url}/health",
+                    timeout=2,
+                    proxies={"http": None, "https": None},
+                )
                 if r.status_code == 200:
                     logger.info(f"C++ server ready after {i+1}s")
+                    # /health returns 200 as soon as HTTP listen is up, but
+                    # the internal omni runtime still finishes warmup in the
+                    # background. Calling /v1/stream/omni_init immediately
+                    # races with that warmup and yields a 502. Give the C++
+                    # side a couple of seconds to settle before returning.
+                    time.sleep(2.0)
                     return
             except Exception:
                 pass
@@ -1013,14 +1327,35 @@ class CppBackendWorker:
         raise RuntimeError("C++ server startup timeout (300s)")
 
     def _find_server_binary(self) -> str:
-        candidates = [
-            os.path.join(self.llamacpp_root, "build/bin/llama-server"),
-            os.path.join(self.llamacpp_root, "build/bin/Release/llama-server"),
-        ]
-        if platform.system() != "Windows":
-            candidates.append(os.path.join(self.llamacpp_root, "build-x64-linux-cuda-release/bin/llama-server"))
+        # __file__ sits at <root>/apps/server/core/processors/cpp_backend.py
+        # Walk up 4 parents → <root>; this is the real install/repo root
+        # regardless of what config.json says about llamacpp_root (which can
+        # be stale if a config.json was baked-in on the build machine).
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _own_root = os.path.abspath(os.path.join(_here, "..", "..", "..", ".."))
+        roots = [self.llamacpp_root, _own_root]
+        # Deduplicate while preserving order
+        seen = set()
+        roots = [r for r in roots if not (r in seen or seen.add(r))]
+
+        if platform.system() == "Windows":
+            rel_paths = [
+                "build/bin/Release/llama-server.exe",
+                "build/bin/llama-server.exe",
+                "bin/llama-server.exe",
+            ]
+        else:
+            rel_paths = [
+                "build/bin/llama-server",
+                "build/bin/Release/llama-server",
+                "build-x64-linux-cuda-release/bin/llama-server",
+            ]
+
+        candidates = [os.path.join(r, p) for r in roots for p in rel_paths]
         for c in candidates:
             if os.path.exists(c):
+                if os.path.dirname(c) != os.path.join(self.llamacpp_root, os.path.dirname(rel_paths[0])):
+                    logger.info(f"_find_server_binary: resolved via fallback: {c}")
                 return c
         return candidates[0]
 
@@ -1079,28 +1414,92 @@ class CppBackendWorker:
         if _is_custom:
             logger.info(f"  voice_clone_prompt={prompts['voice_clone_prompt'][:100]!r}...")
             logger.info(f"  assistant_prompt={prompts['assistant_prompt'][:100]!r}...")
-        resp = self._http_client.post(
-            f"{self._cpp_server_url}/v1/stream/omni_init",
-            json=req_body,
-            timeout=120.0,
-        )
-        if resp.status_code != 200:
-            # Re-init can fail when switching media_type (C++ omni_free + omni_init
-            # doesn't always clean up properly). Restart the entire C++ server.
+
+        # IMPORTANT: the Windows build of llama-server's embedded HTTP server
+        # returns a bare 502 on the very first POST sent by httpx/h11 (some
+        # TCP-level / connection-reuse behaviour). The `requests` library
+        # doesn't trigger this, so we use it just for this one-shot call
+        # and keep httpx for the streaming paths that depend on httpx.stream().
+        import requests as _rq
+        url = f"{self._cpp_server_url}/v1/stream/omni_init"
+
+        # 小工具：当网络异常发生时，合成一个"失败"的 resp，让后面的
+        # `if resp.status_code != 200` 分支能正常触发 restart fallback。
+        class _FailedResp:
+            def __init__(self, text: str):
+                self.status_code = 599  # 自定义，表示网络层失败
+                self.text = text
+            def json(self):
+                return {}
+
+        resp: Any = None
+        for attempt in range(3):
+            try:
+                resp = _rq.post(
+                    url, json=req_body, timeout=120.0,
+                    proxies={"http": None, "https": None},
+                )
+                if resp.status_code == 200:
+                    break
+                logger.warning(
+                    "omni_init returned %d (attempt %d/3); retrying in 2s…",
+                    resp.status_code, attempt + 1,
+                )
+            except (_rq.exceptions.ConnectionError,
+                    _rq.exceptions.Timeout,
+                    _rq.exceptions.ChunkedEncodingError) as e:
+                # C++ server crashed / connection reset — treat as failed
+                # attempt and fall through to the restart fallback below.
+                logger.warning(
+                    "omni_init attempt %d/3 raised network error (%s); "
+                    "C++ server likely crashed — will restart",
+                    attempt + 1, type(e).__name__,
+                )
+                resp = _FailedResp(str(e))
+                break  # 直接进 restart，不再白费时间重试
+            time.sleep(2.0)
+
+        if resp is None or resp.status_code != 200:
+            # Fall back to a full C++ server restart. This handles the case
+            # where omni_free + omni_init (e.g. on media_type switch) left
+            # the runtime in a bad state.
             logger.warning(
-                "omni_init failed (status=%d), restarting C++ server and retrying",
+                "omni_init still failing (status=%d) — restarting C++ server",
                 resp.status_code,
             )
-            self._stop_cpp_server()
+            try:
+                self._stop_cpp_server()
+            except Exception as e:
+                logger.warning(f"_stop_cpp_server in restart fallback raised: {e}")
             time.sleep(1)
             self._start_cpp_server()
-            resp2 = self._http_client.post(
-                f"{self._cpp_server_url}/v1/stream/omni_init",
-                json=req_body,
-                timeout=120.0,
-            )
-            if resp2.status_code != 200:
-                raise RuntimeError(f"omni_init failed after restart: {resp2.text}")
+            resp2: Any = None
+            for attempt in range(3):
+                try:
+                    resp2 = _rq.post(
+                        url, json=req_body, timeout=120.0,
+                        proxies={"http": None, "https": None},
+                    )
+                    if resp2.status_code == 200:
+                        break
+                    logger.warning(
+                        "omni_init (post-restart) returned %d (attempt %d/3)",
+                        resp2.status_code, attempt + 1,
+                    )
+                except (_rq.exceptions.ConnectionError,
+                        _rq.exceptions.Timeout,
+                        _rq.exceptions.ChunkedEncodingError) as e:
+                    logger.warning(
+                        "omni_init (post-restart) attempt %d/3 raised %s: %s",
+                        attempt + 1, type(e).__name__, e,
+                    )
+                    resp2 = _FailedResp(str(e))
+                time.sleep(2.0)
+            if resp2 is None or resp2.status_code != 200:
+                raise RuntimeError(
+                    f"omni_init failed after restart: "
+                    f"{getattr(resp2, 'status_code', 'n/a')} "
+                    f"{getattr(resp2, 'text', '')}")
             payload2 = resp2.json()
             self._maybe_update_kv_cache_length(payload2)
             logger.info(f"omni_init success (after restart): {payload2}")
@@ -1133,14 +1532,26 @@ class CppBackendWorker:
 
         if mode_changed or media_type_changed:
             # Full re-init when switching duplex_mode or media_type.
-            # This restarts all TTS/T2W threads with the correct function,
-            # avoiding subtle state corruption from mode switches.
+            #
+            # 注意：不能只调 omni_init(reuse_model=True)。上游 llama.cpp sync
+            # 后，第二次 load TTS 模型会抛 "invalid vector subscript"（某处
+            # vector 越界，可能是 ggml/llama 加载路径的 state 污染），导致
+            # llama-server crash、conn reset。唯一可靠的方案是把
+            # llama-server.exe 完全重启：fresh process → fresh omni_init。
+            #
+            # 代价：约 30~60s 的模型重载延迟。但它 100% 可靠。
             logger.info(
                 "session mode changed "
                 f"(duplex: {self._last_duplex_mode} -> {duplex_mode}, "
                 f"media_type: {self._last_media_type} -> {media_type}), "
-                "calling omni_init for clean restart"
+                "restarting C++ server for clean state"
             )
+            try:
+                self._stop_cpp_server()
+            except Exception as e:
+                logger.warning(f"_stop_cpp_server during mode-switch raised: {e}")
+            time.sleep(1.0)
+            self._start_cpp_server()
             self._call_omni_init(
                 media_type=media_type,
                 duplex_mode=duplex_mode,
@@ -1149,8 +1560,12 @@ class CppBackendWorker:
             )
             self._last_duplex_mode = duplex_mode
             self._last_media_type = media_type
-            # 即使刚 omni_init 完，后面仍需要下发 update_session_config，
-            # 以便 C++ 端应用新的 sampling 参数（C++ 在 init 时只使用默认值）。
+            # 即使刚 omni_init 完，后面仍需要下发 update_session_config：
+            #   1) omni_init 只在 ref_audio_path 被设置时 prefill voice_audio，
+            #      其它 field（sampling 等）仍需 update_session_config 同步；
+            #   2) C++ 在 init 时只使用默认的 sampling 参数，新值必须通过
+            #      update_session_config 才能下发。
+            # 所以这里 fall through 到下面的 lightweight 分支。
 
         self._last_duplex_mode = duplex_mode
         self._last_media_type = media_type
@@ -1665,12 +2080,23 @@ class CppBackendWorker:
     def shutdown(self) -> None:
         if self._cpp_process:
             logger.info("Stopping C++ server...")
-            self._cpp_process.terminate()
+            # 走统一的 _stop_cpp_server: 它已经在 Windows 上用 taskkill /F /T
+            # 强杀进程树, 并会按端口再扫一遍兜底.
             try:
-                self._cpp_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._cpp_process.kill()
-            self._cpp_process = None
+                self._stop_cpp_server()
+            except Exception as e:
+                logger.warning(f"shutdown _stop_cpp_server: {e}")
+
+        if _IS_WIN and self._cpp_job is not None:
+            try:
+                import ctypes
+                # 关闭 HANDLE 会触发 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                # (对 Job 里还活着的进程兜底强杀).
+                ctypes.windll.kernel32.CloseHandle(self._cpp_job)
+            except Exception as e:
+                logger.debug(f"CloseHandle(job): {e}")
+            finally:
+                self._cpp_job = None
 
         if self._http_client:
             self._http_client.close()
