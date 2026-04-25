@@ -1459,40 +1459,6 @@ class MainWindow(QMainWindow):
         self._comp_label = QLabel(get_component_status_text())
         self._comp_label.setStyleSheet("color: #666; font-size: 11px;")
         mc_l.addWidget(self._comp_label)
-
-        # ─ Context size picker (tunes KV cache footprint) ─
-        ctx_row = QHBoxLayout()
-        ctx_row.setSpacing(8)
-        ctx_lbl = QLabel("Context")
-        ctx_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #333;")
-        ctx_lbl.setFixedWidth(58)
-        ctx_row.addWidget(ctx_lbl)
-
-        self._ctx_combo = QComboBox()
-        for cs in CTX_SIZE_CHOICES:
-            self._ctx_combo.addItem(f"{cs // 1024}K  ({cs})", cs)
-        try:
-            from server.model_hub import load_comni_config
-            cur_cs = load_comni_config().get(
-                "ctx_size", _recommend_ctx_size(_detect_system_ram_gb()))
-            if cur_cs not in CTX_SIZE_CHOICES:
-                cur_cs = _recommend_ctx_size(_detect_system_ram_gb())
-            self._ctx_combo.setCurrentIndex(CTX_SIZE_CHOICES.index(cur_cs))
-        except Exception:
-            self._ctx_combo.setCurrentIndex(1)  # 8192
-        self._ctx_combo.setFixedWidth(140)
-        self._ctx_combo.currentIndexChanged.connect(self._on_ctx_size_changed)
-        ctx_row.addWidget(self._ctx_combo)
-
-        ram_gb = _detect_system_ram_gb()
-        ctx_hint_text = (
-            f"RAM {ram_gb:.0f} GB · larger = more memory"
-            if ram_gb > 0 else "larger ctx = more KV cache RAM")
-        ctx_hint = QLabel(ctx_hint_text)
-        ctx_hint.setStyleSheet("color: #999; font-size: 10px;")
-        ctx_row.addWidget(ctx_hint, 1)
-        mc_l.addLayout(ctx_row)
-
         root.addWidget(mc)
 
         # Service card (单卡两行,对齐 macOS 菜单栏版布局)
@@ -1556,6 +1522,33 @@ class MainWindow(QMainWindow):
         prow.addWidget(self._muted_label("auto-resolves if busy"))
         prow.addStretch(1)
         root.addLayout(prow)
+
+        # ─ Context size picker (parallel with Ports row, mirrors macOS layout) ─
+        ctx_row = QHBoxLayout()
+        ctx_row.setSpacing(6)
+        ctx_row.addWidget(self._muted_label("Context"))
+        self._ctx_combo = QComboBox()
+        for cs in CTX_SIZE_CHOICES:
+            self._ctx_combo.addItem(f"{cs // 1024}K  ({cs})", cs)
+        try:
+            from server.model_hub import load_comni_config
+            cur_cs = load_comni_config().get(
+                "ctx_size", _recommend_ctx_size(_detect_system_ram_gb()))
+            if cur_cs not in CTX_SIZE_CHOICES:
+                cur_cs = _recommend_ctx_size(_detect_system_ram_gb())
+            self._ctx_combo.setCurrentIndex(CTX_SIZE_CHOICES.index(cur_cs))
+        except Exception:
+            self._ctx_combo.setCurrentIndex(1)  # 8192
+        self._ctx_combo.setFixedWidth(120)
+        self._ctx_combo.currentIndexChanged.connect(self._on_ctx_size_changed)
+        ctx_row.addWidget(self._ctx_combo)
+
+        _ram_gb = _detect_system_ram_gb()
+        ctx_row.addWidget(self._muted_label(
+            f"RAM {_ram_gb:.0f} GB · larger = more memory"
+            if _ram_gb > 0 else "larger ctx = more KV cache RAM"))
+        ctx_row.addStretch(1)
+        root.addLayout(ctx_row)
 
         # Log
         log_hdr = QHBoxLayout()
