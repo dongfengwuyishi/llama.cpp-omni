@@ -130,8 +130,25 @@ _APP_SUPPORT.mkdir(parents=True, exist_ok=True)
 _LOG_PATH = _APP_SUPPORT / "comni_service.log"
 _APP_LOG_PATH = _APP_SUPPORT / "comni_app.log"
 
-_COMNI_HOME = Path.home() / ".comni"
-_MODELS_HOME = _COMNI_HOME / "models"
+# Models directory is resolved through comni_paths so user overrides
+# (COMNI_MODELS env var, or models_home in ~/.comni/config.json) take effect.
+# C: drive on Windows is often the smallest; users must be able to redirect
+# multi-GB GGUF files elsewhere — see "Change Models Folder…" in the GUI.
+from server.comni_paths import (
+    comni_home as _comni_home_fn,
+    models_home as _models_home_fn,
+    set_models_home as _set_models_home_fn,
+    models_home_source as _models_home_source_fn,
+    free_bytes as _free_bytes_fn,
+)
+
+
+def _comni_home() -> Path:
+    return _comni_home_fn()
+
+
+def _models_home() -> Path:
+    return _models_home_fn()
 
 # ------------------------------------------------------------
 # Logging
@@ -664,10 +681,11 @@ def check_model_dir(model_dir: str) -> dict:
 
 
 def scan_models() -> List[dict]:
-    if not _MODELS_HOME.exists():
+    home = _models_home()
+    if not home.exists():
         return []
     results = []
-    for d in sorted(_MODELS_HOME.iterdir()):
+    for d in sorted(home.iterdir()):
         if not (d.is_dir() or _is_junction_or_symlink(d)):
             continue
         check = check_model_dir(str(d))
@@ -696,11 +714,12 @@ def import_model_link(source_dir: str) -> tuple[Optional[str], Optional[str]]:
       2. Fallback: create an NTFS directory junction with `mklink /J` (no admin).
       3. On failure: return human-readable error.
     """
-    _MODELS_HOME.mkdir(parents=True, exist_ok=True)
+    home = _models_home()
+    home.mkdir(parents=True, exist_ok=True)
     src = Path(source_dir).resolve()
     if not src.is_dir():
         return None, f"Source is not a directory: {src}"
-    link = _MODELS_HOME / src.name
+    link = home / src.name
     if link.exists() or _is_junction_or_symlink(link):
         try:
             if link.resolve() == src:
@@ -2015,6 +2034,12 @@ class ModelManagerDialog(QDialog):
         self._open_dir_btn = QPushButton("Open in Explorer")
         self._open_dir_btn.clicked.connect(self._on_open_folder)
         btns.addWidget(self._open_dir_btn)
+        self._change_dir_btn = QPushButton("Change Folder…")
+        self._change_dir_btn.setToolTip(
+            "Move the models directory to another drive (e.g. D:\\)\n"
+            "Useful when C: is running low on space.")
+        self._change_dir_btn.clicked.connect(self._on_change_models_home)
+        btns.addWidget(self._change_dir_btn)
         self._remove_btn = QPushButton("Remove Selected")
         self._remove_btn.clicked.connect(self._on_remove)
         btns.addWidget(self._remove_btn)
@@ -2024,10 +2049,12 @@ class ModelManagerDialog(QDialog):
         btns.addWidget(close_btn)
         root.addLayout(btns)
 
-        info = QLabel(f"Model home:  {_MODELS_HOME}")
-        info.setStyleSheet("color:#999; font-size:10px;")
-        info.setWordWrap(True)
-        root.addWidget(info)
+        self._home_info = QLabel()
+        self._home_info.setStyleSheet("color:#999; font-size:10px;")
+        self._home_info.setWordWrap(True)
+        self._home_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._update_home_info_label()
+        root.addWidget(self._home_info)
 
         self._dl_timer = QTimer(self)
         self._dl_timer.setInterval(200)
@@ -2184,8 +2211,93 @@ class ModelManagerDialog(QDialog):
             self._refresh()
 
     def _on_open_folder(self):
-        _MODELS_HOME.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen(["explorer", str(_MODELS_HOME)])
+        home = _models_home()
+        home.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(["explorer", str(home)])
+
+    def _update_home_info_label(self) -> None:
+        home = _models_home()
+        src = _models_home_source_fn()
+        src_label = {
+            "env":     " (set via COMNI_MODELS env var)",
+            "config":  "",
+            "default": " (default)",
+        }.get(src, "")
+        free = _free_bytes_fn(home)
+        free_str = f" — {free / 1024**3:.1f} GB free" if free is not None else ""
+        self._home_info.setText(f"Models folder: {home}{src_label}{free_str}")
+
+    def _on_change_models_home(self):
+        from PySide6.QtWidgets import QFileDialog
+        current = _models_home()
+        new_dir = QFileDialog.getExistingDirectory(
+            self, "Choose a folder for Comni models", str(current.parent if current.exists() else Path.home()))
+        if not new_dir:
+            return
+        new_path = Path(new_dir).resolve()
+        # Don't let users pick a folder inside the install bundle (would
+        # be wiped on uninstall) or the same folder.
+        if new_path == current:
+            return
+        try:
+            new_path.relative_to(Path(sys.executable).resolve().parent)
+            QMessageBox.warning(
+                self, "Invalid location",
+                "Don't choose a folder inside the Comni install directory — "
+                "uninstalling the app would delete your models. Pick a folder "
+                "on a data drive (e.g. D:\\Models\\Comni).")
+            return
+        except ValueError:
+            pass
+
+        # Suggest moving existing data over.
+        existing = list(current.iterdir()) if current.exists() else []
+        move_them = False
+        if existing:
+            ret = QMessageBox.question(
+                self, "Move existing models?",
+                f"You have {len(existing)} item(s) at:\n{current}\n\n"
+                f"Move them to the new folder?\n{new_path}\n\n"
+                "Yes = move (recommended)\n"
+                "No  = leave at the current location, only future downloads "
+                "go to the new folder.",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes)
+            if ret == QMessageBox.Cancel:
+                return
+            move_them = (ret == QMessageBox.Yes)
+
+        try:
+            new_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Cannot create folder:\n{new_path}\n\n{e}")
+            return
+
+        if move_them:
+            try:
+                for child in existing:
+                    target = new_path / child.name
+                    if target.exists():
+                        QMessageBox.warning(
+                            self, "Already exists",
+                            f"'{child.name}' already exists in target. Skipping.")
+                        continue
+                    shutil.move(str(child), str(target))
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Move failed",
+                    f"Some items couldn't be moved:\n{e}\n\n"
+                    "The setting was NOT changed. Please move them manually "
+                    "and try again.")
+                return
+
+        _set_models_home_fn(new_path)
+        self._update_home_info_label()
+        self._refresh()
+        QMessageBox.information(
+            self, "Done",
+            f"Models folder is now:\n{new_path}\n\n"
+            "Future downloads will go here.")
 
     def _on_remove(self):
         models = scan_models()
