@@ -1458,6 +1458,10 @@ class AppDelegate(NSObject):
             self._gateway_proc = subprocess.Popen(
                 [sys.executable, str(_SERVER_DIR / "gateway.py"),
                  "--port", str(self._port),
+                 # 保持 HTTPS: 菜单栏 app 场景需要手机浏览器走 secure context,
+                 # 否则麦克风/摄像头被浏览器禁用. (注: upstream 曾一度改为 --http,
+                 # 但与下面 "https://{host}:{port}" 的启动日志和 mobile 使用场景
+                 # 不兼容, 这里恢复 HTTPS.)
                  "--workers", f"127.0.0.1:{self._worker_port}"],
                 env=env, cwd=str(_SERVER_DIR),
                 stdout=self._log_file, stderr=subprocess.STDOUT)

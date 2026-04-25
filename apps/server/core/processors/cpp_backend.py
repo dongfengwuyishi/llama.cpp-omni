@@ -1473,6 +1473,10 @@ class CppBackendWorker:
                 logger.warning(f"_stop_cpp_server in restart fallback raised: {e}")
             time.sleep(1)
             self._start_cpp_server()
+            # 3 次重试 + 显式抓网络异常: 重启 llama-server 后第一次连接时，偶发
+            # ConnectionResetError / chunked encoding error (尤其是 Windows)，
+            # 需要短暂 retry 让新进程 listener 就绪。同时把 kv_cache_length
+            # 从成功的那一次 payload 里同步回来。
             resp2: Any = None
             for attempt in range(3):
                 try:
@@ -1613,7 +1617,7 @@ class CppBackendWorker:
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/update_session_config",
             json=req_body,
-            timeout=30.0,
+            timeout=90.0,
         )
         if resp.status_code != 200:
             raise RuntimeError(f"update_session_config failed: {resp.text}")
@@ -1643,7 +1647,7 @@ class CppBackendWorker:
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/prefill",
             json=req_body,
-            timeout=30.0,
+            timeout=120.0,
         )
         if resp.status_code != 200:
             logger.error(f"prefill failed (cnt={cnt}): {resp.text}")

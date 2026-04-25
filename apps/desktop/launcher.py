@@ -306,6 +306,9 @@ def wait_for_health(url: str, timeout: int = 300, interval: float = 2.0) -> bool
     # Bypass any host-level HTTP proxy: loopback probes must not be intercepted.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+    # Bypass any host-level HTTP proxy: loopback probes must not be intercepted.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
     for i in range(int(timeout / interval)):
         try:
             req = urllib.request.Request(f"{url}/health")

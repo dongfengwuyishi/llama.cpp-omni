@@ -20,10 +20,43 @@ logger = logging.getLogger("comni.model_hub")
 _ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 _REGISTRY_PATH = _ASSETS_DIR / "model_registry.json"
 
-_COMNI_HOME = Path.home() / ".comni"
-_MODELS_HOME = _COMNI_HOME / "models"
-_CACHE_DIR = _COMNI_HOME / "cache"
-_COMNI_CONFIG_PATH = _COMNI_HOME / "config.json"
+# Paths are resolved lazily through comni_paths so that a user-provided
+# COMNI_MODELS env var or a "models_home" override in ~/.comni/config.json
+# takes effect without requiring callers to be restarted in a specific
+# order. See apps/server/comni_paths.py for the resolution rules.
+from comni_paths import (
+    comni_home as _comni_home_fn,
+    models_home as _models_home_fn,
+    cache_dir as _cache_dir_fn,
+    comni_config_path as _comni_config_path_fn,
+)
+
+
+def _comni_home() -> Path:
+    return _comni_home_fn()
+
+
+def _models_home() -> Path:
+    return _models_home_fn()
+
+
+def _cache_dir() -> Path:
+    return _cache_dir_fn()
+
+
+def _comni_config_path() -> Path:
+    return _comni_config_path_fn()
+
+
+# ── Backwards-compat module-level aliases ────────────────────────────────
+# Existing callers (windows_app.py, menubar_app.py, tests) read these
+# constants. They now reflect the *current* resolved value at import time;
+# new code should call _models_home() / _comni_home() to react to env
+# changes without a process restart.
+_COMNI_HOME = _comni_home()
+_MODELS_HOME = _models_home()
+_CACHE_DIR = _cache_dir()
+_COMNI_CONFIG_PATH = _comni_config_path()
 
 HF_MAIN_ENDPOINT = "https://huggingface.co"
 # Built-in fallback mirror used when HuggingFace is unreachable and the user
@@ -134,9 +167,10 @@ def match_spec_by_dir(dir_name: str) -> Optional[dict]:
 # ── Comni Config (App-level, separate from server config) ─
 
 def load_comni_config() -> dict:
-    if _COMNI_CONFIG_PATH.exists():
+    p = _comni_config_path()
+    if p.exists():
         try:
-            with open(_COMNI_CONFIG_PATH, encoding="utf-8") as f:
+            with open(p, encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
@@ -144,8 +178,9 @@ def load_comni_config() -> dict:
 
 
 def save_comni_config(cfg: dict):
-    _COMNI_HOME.mkdir(parents=True, exist_ok=True)
-    with open(_COMNI_CONFIG_PATH, "w", encoding="utf-8") as f:
+    _comni_home().mkdir(parents=True, exist_ok=True)
+    p = _comni_config_path()
+    with open(p, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=4, ensure_ascii=False)
 
 
@@ -344,7 +379,7 @@ def sha256_file(filepath: str, progress_cb: Optional[ProgressCallback] = None) -
 
 def _manifest_cache_path(hf_repo: str) -> Path:
     safe = hf_repo.replace("/", "_")
-    return _CACHE_DIR / f"manifest_{safe}.json"
+    return _cache_dir() / f"manifest_{safe}.json"
 
 
 def fetch_remote_manifest(hf_repo: str, force: bool = False) -> Dict[str, dict]:
@@ -399,7 +434,7 @@ def fetch_remote_manifest(hf_repo: str, force: bool = False) -> Dict[str, dict]:
         else:
             return manifest
 
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _cache_dir().mkdir(parents=True, exist_ok=True)
     to_save = dict(manifest)
     to_save["_ts"] = time.time()
     try:
@@ -457,7 +492,7 @@ class ModelDownloader:
                  mirror_url: str = ""):
         self.spec = spec
         self.quant = quant
-        self.dest_dir = Path(dest_dir) if dest_dir else _MODELS_HOME / spec["dir_name"]
+        self.dest_dir = Path(dest_dir) if dest_dir else _models_home() / spec["dir_name"]
         self.mirror_url = mirror_url or get_hf_mirror()
         self.hf_repo = spec["hf_repo"]
         self.progress = DownloadProgress()
