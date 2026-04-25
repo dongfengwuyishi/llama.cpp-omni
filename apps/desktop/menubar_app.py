@@ -93,6 +93,71 @@ _CARD_INSET = 16
 _INNER_L = _PAD + _CARD_INSET
 _INNER_W = _CARD_W - 2 * _CARD_INSET
 
+# Context window choices exposed in the main window. Larger ctx → bigger KV
+# cache → more (unified) memory. 32K with a 7B Q4 model + vision/TTS easily
+# blows 16 GB Macs, hence the picker + RAM-aware default.
+CTX_SIZE_CHOICES = (4096, 8192, 16384, 32768)
+
+
+def _detect_system_ram_gb() -> float:
+    """Total physical RAM in GB; 0.0 if unknown.
+
+    Used to pick a sensible default ctx_size on first launch. Falls back
+    silently rather than raising — a wrong ctx_size is recoverable, but a
+    crashed launcher is not.
+    """
+    import platform as _plat
+    sysname = _plat.system()
+    try:
+        if sysname == "Darwin":
+            out = subprocess.check_output(
+                ["sysctl", "-n", "hw.memsize"], text=True, timeout=2).strip()
+            return int(out) / (1024 ** 3)
+        if sysname == "Linux":
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) / (1024 ** 2)
+        if sysname == "Windows":
+            import ctypes
+
+            class _MemStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_uint32),
+                    ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64),
+                    ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64),
+                    ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64),
+                    ("ullAvailVirtual", ctypes.c_uint64),
+                    ("sullAvailExtendedVirtual", ctypes.c_uint64),
+                ]
+
+            stat = _MemStatusEx()
+            stat.dwLength = ctypes.sizeof(_MemStatusEx)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return stat.ullTotalPhys / (1024 ** 3)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _recommend_ctx_size(ram_gb: float) -> int:
+    """Pick a default ctx_size for a machine with `ram_gb` of RAM.
+
+    Tuned for a 7B Q4 model + vision encoder + TTS sharing unified memory
+    on Apple Silicon; conservative so that base-config Macs don't OOM on
+    the very first run.
+    """
+    if ram_gb <= 0:
+        return 8192        # unknown machine — pick the safe value
+    if ram_gb <= 16:
+        return 8192        # M-series base, mac mini, etc.
+    if ram_gb <= 32:
+        return 16384       # mid-tier
+    return 32768           # workstation / high-end
+
 
 class ServiceState:
     STOPPED = "stopped"
@@ -348,9 +413,13 @@ def save_config(model_dir: str, gateway_port: int = DEFAULT_GATEWAY_PORT,
 
     try:
         from server.model_hub import load_comni_config
-        vb = load_comni_config().get("vision_backend", "auto")
+        comni_cfg = load_comni_config()
+        vb = comni_cfg.get("vision_backend", "auto")
         if vb in ("auto", "metal", "coreml"):
             config["cpp_backend"]["vision_backend"] = vb
+        cs = comni_cfg.get("ctx_size")
+        if isinstance(cs, int) and cs in CTX_SIZE_CHOICES:
+            config["cpp_backend"]["ctx_size"] = cs
     except Exception:
         pass
 
@@ -451,6 +520,7 @@ class AppDelegate(NSObject):
 
         self._auto_migrate_legacy()
         self._auto_import_legacy_config_model()
+        self._ensure_ctx_size_default()
 
         self._build_menu_bar()
         self._build_main_window()
@@ -517,6 +587,29 @@ class AppDelegate(NSObject):
         return gw, wk
 
     # ── First Launch ─────────────────────────────────────────
+
+    @objc.python_method
+    def _ensure_ctx_size_default(self):
+        """Stamp a RAM-aware ctx_size into ~/.comni/config.json on first run.
+
+        Once written, the user's choice (whether kept or changed via the
+        main window picker) is sticky, so we never override an explicit
+        value here.
+        """
+        try:
+            from server.model_hub import load_comni_config, save_comni_config
+            cfg = load_comni_config()
+            cs = cfg.get("ctx_size")
+            if isinstance(cs, int) and cs in CTX_SIZE_CHOICES:
+                return
+            ram_gb = _detect_system_ram_gb()
+            recommended = _recommend_ctx_size(ram_gb)
+            cfg["ctx_size"] = recommended
+            save_comni_config(cfg)
+            logger.info("First-run ctx_size default: %d (RAM=%.1f GB)",
+                        recommended, ram_gb)
+        except Exception:
+            logger.exception("_ensure_ctx_size_default failed")
 
     def _run_first_launch_check(self):
         issues = []
@@ -784,6 +877,40 @@ class AppDelegate(NSObject):
                 size=9, color=NSColor.tertiaryLabelColor())
             cv.addSubview_(self._ane_status_label)
             y -= 4
+
+        # ── Context Size (cross-platform: tunes KV cache footprint) ──
+        y -= 24
+        cv.addSubview_(self._make_label("Context", x=_INNER_L, y=y + 2, w=54, h=20,
+                                         size=11, color=NSColor.tertiaryLabelColor()))
+        from AppKit import NSPopUpButton
+        self._ctx_size_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(_INNER_L + 56, y, 110, 22), False)
+        for cs in CTX_SIZE_CHOICES:
+            label = f"{cs // 1024}K  ({cs})" if cs >= 1024 else str(cs)
+            self._ctx_size_popup.addItemWithTitle_(label)
+        try:
+            from server.model_hub import load_comni_config
+            cur_cs = load_comni_config().get("ctx_size", _recommend_ctx_size(
+                _detect_system_ram_gb()))
+            if cur_cs not in CTX_SIZE_CHOICES:
+                cur_cs = _recommend_ctx_size(_detect_system_ram_gb())
+            idx = CTX_SIZE_CHOICES.index(cur_cs)
+            self._ctx_size_popup.selectItemAtIndex_(idx)
+        except Exception:
+            self._ctx_size_popup.selectItemAtIndex_(1)  # 8192
+        self._ctx_size_popup.setTarget_(self)
+        self._ctx_size_popup.setAction_(b"onContextSizeChanged:")
+        self._ctx_size_popup.setFont_(NSFont.systemFontOfSize_(11))
+        cv.addSubview_(self._ctx_size_popup)
+
+        ram_gb = _detect_system_ram_gb()
+        ctx_hint = (f"RAM {ram_gb:.0f} GB · larger = more memory"
+                    if ram_gb > 0 else "larger ctx = more KV cache RAM")
+        self._ctx_hint_label = self._make_label(
+            ctx_hint, x=_INNER_L + 172, y=y + 3, w=240, h=16,
+            size=9, color=NSColor.tertiaryLabelColor())
+        cv.addSubview_(self._ctx_hint_label)
+        y -= 4
 
         # ── Log Section ──
         log_hdr_y = y - 22
@@ -1505,6 +1632,22 @@ class AppDelegate(NSObject):
             self._append_log(f"Vision backend → {vb} (restart service to apply)\n")
         except Exception:
             logger.exception("onVisionBackendChanged_ failed")
+
+    @objc.typedSelector(b'v@:@')
+    def onContextSizeChanged_(self, sender):
+        try:
+            idx = sender.indexOfSelectedItem()
+            if idx < 0 or idx >= len(CTX_SIZE_CHOICES):
+                return
+            cs = CTX_SIZE_CHOICES[idx]
+            from server.model_hub import load_comni_config, save_comni_config
+            cfg = load_comni_config()
+            cfg["ctx_size"] = cs
+            save_comni_config(cfg)
+            self._append_log(
+                f"Context size → {cs} ({cs // 1024}K) — restart service to apply\n")
+        except Exception:
+            logger.exception("onContextSizeChanged_ failed")
 
     @objc.typedSelector(b'v@:@')
     def onCopyURL_(self, sender):

@@ -806,6 +806,57 @@ def get_component_status_text(model_dir: Optional[str] = None) -> str:
     return "  ".join(parts)
 
 
+# Context window choices exposed in the main window. Larger ctx → bigger KV
+# cache → more VRAM/RAM. 32K with a 7B Q4 model + vision/TTS easily blows
+# 8 GB GPUs / 16 GB RAM machines, hence the picker + RAM-aware default.
+CTX_SIZE_CHOICES = (4096, 8192, 16384, 32768)
+
+
+def _detect_system_ram_gb() -> float:
+    """Total physical RAM in GB on Windows; 0.0 if unknown.
+
+    Used to pick a sensible default ctx_size on first launch. Falls back
+    silently rather than raising — a wrong ctx_size is recoverable, but a
+    crashed launcher is not.
+    """
+    try:
+        class _MemStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32),
+                ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64),
+                ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64),
+                ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64),
+                ("ullAvailVirtual", ctypes.c_uint64),
+                ("sullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        stat = _MemStatusEx()
+        stat.dwLength = ctypes.sizeof(_MemStatusEx)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+        return stat.ullTotalPhys / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def _recommend_ctx_size(ram_gb: float) -> int:
+    """Pick a default ctx_size for a machine with `ram_gb` of RAM.
+
+    On Windows the heavy lifting usually goes to dedicated GPU VRAM, but
+    the picker still scales by system RAM as a rough proxy for machine
+    tier — base laptops vs workstations.
+    """
+    if ram_gb <= 0:
+        return 8192
+    if ram_gb <= 16:
+        return 8192
+    if ram_gb <= 32:
+        return 16384
+    return 32768
+
+
 def save_config(model_dir: str, gateway_port: int = DEFAULT_GATEWAY_PORT,
                 worker_base_port: int = DEFAULT_WORKER_BASE_PORT):
     if _CONFIG_PATH.exists():
@@ -825,6 +876,15 @@ def save_config(model_dir: str, gateway_port: int = DEFAULT_GATEWAY_PORT,
     config["cpp_backend"]["llamacpp_root"] = str(_REPO_ROOT)
     # Windows: no CoreML/ANE
     config["cpp_backend"]["vision_backend"] = "auto"
+
+    try:
+        from server.model_hub import load_comni_config
+        cs = load_comni_config().get("ctx_size")
+        if isinstance(cs, int) and cs in CTX_SIZE_CHOICES:
+            config["cpp_backend"]["ctx_size"] = cs
+    except Exception:
+        pass
+
     config.setdefault("service", {})
     config["service"]["gateway_port"] = gateway_port
     config["service"]["worker_base_port"] = worker_base_port
@@ -1253,11 +1313,34 @@ class MainWindow(QMainWindow):
         self._lan_ip: Optional[str] = None  # populated when service runs
         self._qr_dialog: Optional["QRDialog"] = None
 
+        self._ensure_ctx_size_default()
         self._build_ui()
         if self._tray_available:
             self._build_tray()
         self._update_ui()
         self._run_first_launch_check()
+
+    def _ensure_ctx_size_default(self):
+        """Stamp a RAM-aware ctx_size into ~/.comni/config.json on first run.
+
+        Once written, the user's pick (via the main window picker) is sticky,
+        so we never override an explicit value here.
+        """
+        try:
+            from server.model_hub import load_comni_config, save_comni_config
+            cfg = load_comni_config()
+            cs = cfg.get("ctx_size")
+            if isinstance(cs, int) and cs in CTX_SIZE_CHOICES:
+                return
+            ram_gb = _detect_system_ram_gb()
+            recommended = _recommend_ctx_size(ram_gb)
+            cfg["ctx_size"] = recommended
+            save_comni_config(cfg)
+            logger.info(
+                "First-run ctx_size default: %d (RAM=%.1f GB)",
+                recommended, ram_gb)
+        except Exception:
+            logger.exception("_ensure_ctx_size_default failed")
 
     def _load_ports_from_config(self) -> tuple[int, int]:
         gw, wk = DEFAULT_GATEWAY_PORT, DEFAULT_WORKER_BASE_PORT
@@ -1376,6 +1459,40 @@ class MainWindow(QMainWindow):
         self._comp_label = QLabel(get_component_status_text())
         self._comp_label.setStyleSheet("color: #666; font-size: 11px;")
         mc_l.addWidget(self._comp_label)
+
+        # ─ Context size picker (tunes KV cache footprint) ─
+        ctx_row = QHBoxLayout()
+        ctx_row.setSpacing(8)
+        ctx_lbl = QLabel("Context")
+        ctx_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #333;")
+        ctx_lbl.setFixedWidth(58)
+        ctx_row.addWidget(ctx_lbl)
+
+        self._ctx_combo = QComboBox()
+        for cs in CTX_SIZE_CHOICES:
+            self._ctx_combo.addItem(f"{cs // 1024}K  ({cs})", cs)
+        try:
+            from server.model_hub import load_comni_config
+            cur_cs = load_comni_config().get(
+                "ctx_size", _recommend_ctx_size(_detect_system_ram_gb()))
+            if cur_cs not in CTX_SIZE_CHOICES:
+                cur_cs = _recommend_ctx_size(_detect_system_ram_gb())
+            self._ctx_combo.setCurrentIndex(CTX_SIZE_CHOICES.index(cur_cs))
+        except Exception:
+            self._ctx_combo.setCurrentIndex(1)  # 8192
+        self._ctx_combo.setFixedWidth(140)
+        self._ctx_combo.currentIndexChanged.connect(self._on_ctx_size_changed)
+        ctx_row.addWidget(self._ctx_combo)
+
+        ram_gb = _detect_system_ram_gb()
+        ctx_hint_text = (
+            f"RAM {ram_gb:.0f} GB · larger = more memory"
+            if ram_gb > 0 else "larger ctx = more KV cache RAM")
+        ctx_hint = QLabel(ctx_hint_text)
+        ctx_hint.setStyleSheet("color: #999; font-size: 10px;")
+        ctx_row.addWidget(ctx_hint, 1)
+        mc_l.addLayout(ctx_row)
+
         root.addWidget(mc)
 
         # Service card (单卡两行,对齐 macOS 菜单栏版布局)
@@ -1658,6 +1775,21 @@ class MainWindow(QMainWindow):
     @Slot()
     def on_clear_log(self):
         self._log_view.clear()
+
+    @Slot(int)
+    def _on_ctx_size_changed(self, idx: int):
+        if idx < 0 or idx >= len(CTX_SIZE_CHOICES):
+            return
+        cs = CTX_SIZE_CHOICES[idx]
+        try:
+            from server.model_hub import load_comni_config, save_comni_config
+            cfg = load_comni_config()
+            cfg["ctx_size"] = cs
+            save_comni_config(cfg)
+            self._append_log(
+                f"Context size → {cs} ({cs // 1024}K) — restart service to apply\n")
+        except Exception as e:
+            self._append_log(f"Save ctx_size failed: {e}\n")
 
     @Slot()
     def on_manage_models(self):
