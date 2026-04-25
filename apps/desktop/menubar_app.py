@@ -143,6 +143,29 @@ def _detect_system_ram_gb() -> float:
     return 0.0
 
 
+def _load_build_info() -> dict:
+    """Read apps/build_info.json shipped in the .app bundle.
+
+    Empty dict in dev mode (running from source); the dict is populated
+    by build_dmg.sh and includes "version", "build_commit", "build_time".
+    """
+    path = _APPS_ROOT / "build_info.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _format_version_tag() -> str:
+    """Short human-readable version, e.g. 'v1.0.2' or 'dev'."""
+    bi = _load_build_info()
+    v = bi.get("version")
+    if isinstance(v, str) and v:
+        return f"v{v}" if not v.startswith("v") else v
+    return "dev"
+
+
 def _recommend_ctx_size(ram_gb: float) -> int:
     """Pick a default ctx_size for a machine with `ram_gb` of RAM.
 
@@ -659,6 +682,14 @@ class AppDelegate(NSObject):
         self._status_item = sb.statusItemWithLength_(NSVariableStatusItemLength)
         self._status_item.setTitle_("Comni")
         menu = NSMenu.alloc().init()
+        # First (disabled) menu item is the version label. Single source of
+        # truth for "which build is this" — easy to read off when triaging
+        # bug reports: "open menu, read first line".
+        version_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            f"Comni {_format_version_tag()}", None, "")
+        version_item.setEnabled_(False)
+        menu.addItem_(version_item)
+        menu.addItem_(NSMenuItem.separatorItem())
         self._menu_status = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Status: Stopped", None, "")
         self._menu_status.setEnabled_(False)
