@@ -402,7 +402,7 @@ class CppBackendWorker:
         duplex_pause_timeout: float = 60.0,
         llm_model: str = "",
         cpp_server_port: Optional[int] = None,
-        ctx_size: int = 32768,
+        ctx_size: int = 8192,
         n_gpu_layers: int = 99,
         vision_backend: str = "auto",
         **kwargs,

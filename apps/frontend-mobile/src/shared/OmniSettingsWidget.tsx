@@ -132,8 +132,15 @@ export function OmniSettingsWidget({ open, bridge, onClose }: OmniSettingsWidget
   const [systemPrompt, setSystemPrompt] = useState('')
   const [lengthPenalty, setLengthPenalty] = useState(1.1)
   const [playbackDelay, setPlaybackDelay] = useState(0)
-  const [maxKv, setMaxKv] = useState(8192)
-  const [stopOnPrune, setStopOnPrune] = useState(true)
+  // Defaults aligned with the desktop ctx_size cap (8K). MaxKV is a
+  // FRONTEND auto-stop ceiling; we leave 1K of headroom below the ctx so the
+  // C++ sliding-window prune (triggers around ctx-2048) gets a chance to
+  // gracefully recycle KV before the front-end yanks the session.
+  const [maxKv, setMaxKv] = useState(7168)
+  // Off by default: pruning is the *normal* way long chats stay alive on a
+  // small ctx, not an error condition. Leaving this on caused users to be
+  // dropped after 5–10 turns even though the backend was happy to continue.
+  const [stopOnPrune, setStopOnPrune] = useState(false)
 
   const [presets, setPresets] = useState<PresetMetadata[]>([])
   const [userPresets, setUserPresets] = useState<UserPreset[]>([])
@@ -458,7 +465,9 @@ export function OmniSettingsWidget({ open, bridge, onClose }: OmniSettingsWidget
   }
 
   function handleKvChange(value: number) {
-    const v = Number.isFinite(value) ? value : 8192
+    // Keep in sync with the default in useState above (and the desktop
+    // CTX_SIZE_CHOICES upper bound). NaN / blank input → 7168, not 8192.
+    const v = Number.isFinite(value) ? Math.min(Math.max(value, 512), 8192) : 7168
     setMaxKv(v)
     syncToBridge({ kv: v })
   }
@@ -568,7 +577,10 @@ export function OmniSettingsWidget({ open, bridge, onClose }: OmniSettingsWidget
             </label>
             <label className="settings-field">
               <span>Max KV (tok)</span>
-              <input className="settings-input" type="number" min="512" max="16384" step="512" value={maxKv} onChange={(e) => handleKvChange(Number(e.target.value))} />
+              {/* Cap matches the desktop's CTX_SIZE_CHOICES upper bound (8K).
+                  Going higher does nothing on the typical desktop install — the
+                  C++ backend will prune at its own ctx-2048 trigger first. */}
+              <input className="settings-input" type="number" min="512" max="8192" step="512" value={maxKv} onChange={(e) => handleKvChange(Number(e.target.value))} />
             </label>
             <label className="settings-field" style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
               <input

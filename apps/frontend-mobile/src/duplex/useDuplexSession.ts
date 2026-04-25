@@ -300,7 +300,10 @@ export function useDuplexSession(
         mediaRef.current = media
       }
       const session = new runtime.DuplexSession(withVideo ? 'omni' : 'adx', {
-        getMaxKvTokens: () => 8192,
+        // Keep front-end auto-stop ceiling 1K below the desktop's ctx_size cap
+        // (8K) — leaves room for the C++ duplex sliding-window prune to take
+        // over before we'd otherwise yank the session.
+        getMaxKvTokens: () => 7168,
         getPlaybackDelayMs: () => 200,
         outputSampleRate: 24000,
       })

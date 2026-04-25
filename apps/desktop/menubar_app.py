@@ -94,9 +94,34 @@ _INNER_L = _PAD + _CARD_INSET
 _INNER_W = _CARD_W - 2 * _CARD_INSET
 
 # Context window choices exposed in the main window. Larger ctx → bigger KV
-# cache → more (unified) memory. 32K with a 7B Q4 model + vision/TTS easily
-# blows 16 GB Macs, hence the picker + RAM-aware default.
-CTX_SIZE_CHOICES = (4096, 8192, 16384, 32768)
+# cache → more (unified) memory. We deliberately cap the picker at 8K on the
+# desktop build:
+#   * MiniCPM-o is shipped for end-side use — voice/video chats almost never
+#     need more than ~8K of live context once the C++ duplex sliding-window
+#     prune kicks in.
+#   * 16K/32K KV cache fights with the vision/audio encoders and pushes
+#     16-24 GB Macs into swap or wired-memory pressure.
+#   * Power users on 64GB+ workstations can still hand-edit ctx_size in
+#     ~/.comni/config.json — this picker just hides the foot-gun by default.
+CTX_SIZE_CHOICES = (4096, 8192)
+CTX_SIZE_MAX = max(CTX_SIZE_CHOICES)
+
+
+def _coerce_ctx_size(cs: object) -> int | None:
+    """Map any incoming ctx_size value onto an allowed choice.
+
+    Returns None for values we can't parse at all (caller decides whether to
+    fall back to a recommended default). Values larger than CTX_SIZE_MAX are
+    clamped down — this is what migrates 16K/32K configs left over from
+    earlier Comni builds without forcing the user to re-pick.
+    """
+    if not isinstance(cs, int):
+        return None
+    if cs in CTX_SIZE_CHOICES:
+        return cs
+    if cs > CTX_SIZE_MAX:
+        return CTX_SIZE_MAX
+    return min(CTX_SIZE_CHOICES, key=lambda c: abs(c - cs))
 
 # Download source choices: (config value, UI label). "auto" walks the chain
 # HF → HF mirror → ModelScope so it works for both overseas and domestic
@@ -178,19 +203,21 @@ def _format_version_tag() -> str:
 
 
 def _recommend_ctx_size(ram_gb: float) -> int:
-    """Pick a default ctx_size for a machine with `ram_gb` of RAM.
+    """Default ctx_size for first launch.
 
-    Tuned for a 7B Q4 model + vision encoder + TTS sharing unified memory
-    on Apple Silicon; conservative so that base-config Macs don't OOM on
-    the very first run.
+    Heuristic:
+      * <8 GB unified memory  → 4K, otherwise the model + KV cache + Comni
+        overhead pushes the OS into swap and the very first message stalls.
+      * Everything else       → 8K. Plenty for multi-turn voice/video chats;
+        the C++ duplex sliding-window prune kicks in well before 8K is
+        exhausted, so nothing is "lost".
+
+    Note we deliberately never recommend >8K on the desktop build — see
+    CTX_SIZE_CHOICES for the rationale.
     """
-    if ram_gb <= 0:
-        return 8192        # unknown machine — pick the safe value
-    if ram_gb <= 16:
-        return 8192        # M-series base, mac mini, etc.
-    if ram_gb <= 32:
-        return 16384       # mid-tier
-    return 32768           # workstation / high-end
+    if 0 < ram_gb < 8:
+        return 4096
+    return 8192
 
 
 class ServiceState:
@@ -446,14 +473,28 @@ def save_config(model_dir: str, gateway_port: int = DEFAULT_GATEWAY_PORT,
     config["service"]["worker_base_port"] = worker_base_port
 
     try:
-        from server.model_hub import load_comni_config
+        from server.model_hub import load_comni_config, save_comni_config
         comni_cfg = load_comni_config()
         vb = comni_cfg.get("vision_backend", "auto")
         if vb in ("auto", "metal", "coreml"):
             config["cpp_backend"]["vision_backend"] = vb
-        cs = comni_cfg.get("ctx_size")
-        if isinstance(cs, int) and cs in CTX_SIZE_CHOICES:
-            config["cpp_backend"]["ctx_size"] = cs
+        raw_cs = comni_cfg.get("ctx_size")
+        coerced = _coerce_ctx_size(raw_cs)
+        if coerced is not None:
+            config["cpp_backend"]["ctx_size"] = coerced
+            # Migrate the user's persisted choice in-place when we had to
+            # clamp it (e.g. 16384 → 8192 after the desktop build dropped
+            # the bigger options). Keeps the GUI dropdown and runtime in
+            # sync, and avoids a confusing "I picked 32K, why am I on 8K?"
+            if raw_cs != coerced:
+                comni_cfg["ctx_size"] = coerced
+                try:
+                    save_comni_config(comni_cfg)
+                    logger.info(
+                        "Migrated ctx_size in ~/.comni/config.json: %r -> %d",
+                        raw_cs, coerced)
+                except Exception:
+                    logger.exception("ctx_size migration save failed")
     except Exception:
         pass
 
@@ -626,15 +667,24 @@ class AppDelegate(NSObject):
     def _ensure_ctx_size_default(self):
         """Stamp a RAM-aware ctx_size into ~/.comni/config.json on first run.
 
-        Once written, the user's choice (whether kept or changed via the
-        main window picker) is sticky, so we never override an explicit
-        value here.
+        Also migrates legacy values (16K / 32K from earlier Comni builds) to
+        the current allowed range. The desktop picker now caps at 8K
+        (see CTX_SIZE_CHOICES); without the clamp, the dropdown would
+        silently fall back to the recommended default and the user's
+        runtime would mysteriously shrink. Migrating in-place keeps the
+        change visible and one-time only.
         """
         try:
             from server.model_hub import load_comni_config, save_comni_config
             cfg = load_comni_config()
-            cs = cfg.get("ctx_size")
-            if isinstance(cs, int) and cs in CTX_SIZE_CHOICES:
+            raw_cs = cfg.get("ctx_size")
+            coerced = _coerce_ctx_size(raw_cs)
+            if coerced is not None and raw_cs == coerced:
+                return  # already a legal value
+            if coerced is not None and raw_cs != coerced:
+                cfg["ctx_size"] = coerced
+                save_comni_config(cfg)
+                logger.info("Migrated ctx_size %r → %d", raw_cs, coerced)
                 return
             ram_gb = _detect_system_ram_gb()
             recommended = _recommend_ctx_size(ram_gb)
@@ -932,14 +982,14 @@ class AppDelegate(NSObject):
             self._ctx_size_popup.addItemWithTitle_(label)
         try:
             from server.model_hub import load_comni_config
-            cur_cs = load_comni_config().get("ctx_size", _recommend_ctx_size(
-                _detect_system_ram_gb()))
-            if cur_cs not in CTX_SIZE_CHOICES:
+            raw_cs = load_comni_config().get("ctx_size")
+            cur_cs = _coerce_ctx_size(raw_cs)
+            if cur_cs is None:
                 cur_cs = _recommend_ctx_size(_detect_system_ram_gb())
             idx = CTX_SIZE_CHOICES.index(cur_cs)
             self._ctx_size_popup.selectItemAtIndex_(idx)
         except Exception:
-            self._ctx_size_popup.selectItemAtIndex_(1)  # 8192
+            self._ctx_size_popup.selectItemAtIndex_(CTX_SIZE_CHOICES.index(8192))
         self._ctx_size_popup.setTarget_(self)
         self._ctx_size_popup.setAction_(b"onContextSizeChanged:")
         self._ctx_size_popup.setFont_(NSFont.systemFontOfSize_(11))

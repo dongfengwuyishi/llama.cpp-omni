@@ -176,8 +176,8 @@ class CppBackendConfig(BaseModel):
         description="C++ llama-server 端口（默认 19060 + gpu_id）",
     )
     ctx_size: int = Field(
-        default=32768,
-        description="LLM 上下文窗口大小",
+        default=8192,
+        description="LLM 上下文窗口大小（默认 8K，兼顾首次体验流畅；可在 GUI 设置里调大）",
     )
     n_gpu_layers: int = Field(
         default=99,

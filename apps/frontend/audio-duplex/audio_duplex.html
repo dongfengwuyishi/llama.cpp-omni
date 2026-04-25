@@ -113,14 +113,14 @@
                     <input type="number" class="cg-input-sm" id="playbackDelay" value="200" min="0" max="2000" step="50">
                     <span style="font-size:10px;color:#888;">ms</span>
                 </div>
-                <div class="cg-row inline" data-tip="Max KV cache size, limits conversation context length">
+                <div class="cg-row inline" data-tip="Front-end soft ceiling. Should be ≤ backend ctx_size (typically 8K on the desktop build). Going higher does nothing — backend will prune first.">
                     <span class="cg-label" style="flex:none;">MaxKV</span>
-                    <input type="number" class="cg-input-sm" id="maxKvTokens" value="8192" min="512" max="131072" step="512">
+                    <input type="number" class="cg-input-sm" id="maxKvTokens" value="7168" min="512" max="8192" step="512">
                     <span style="font-size:10px;color:#888;">tok</span>
                 </div>
-                <div class="cg-row inline" data-tip="Auto-stop the session when the C++ backend prunes the KV cache at a round boundary (sliding window). Useful when MaxKV is set above what the backend will actually allow, so the ceiling above never triggers.">
+                <div class="cg-row inline" data-tip="Auto-stop the session when the C++ backend prunes the KV cache (sliding window). Off by default — pruning is the normal way long chats keep going on a small ctx, not an error.">
                     <label style="display:flex;align-items:center;gap:6px;font-size:11px;cursor:pointer;">
-                        <input type="checkbox" id="stopOnKvShrink" checked>
+                        <input type="checkbox" id="stopOnKvShrink">
                         Stop on KV pruning (sliding window)
                     </label>
                 </div>

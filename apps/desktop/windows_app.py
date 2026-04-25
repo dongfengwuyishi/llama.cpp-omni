@@ -826,9 +826,36 @@ def get_component_status_text(model_dir: Optional[str] = None) -> str:
 
 
 # Context window choices exposed in the main window. Larger ctx → bigger KV
-# cache → more VRAM/RAM. 32K with a 7B Q4 model + vision/TTS easily blows
-# 8 GB GPUs / 16 GB RAM machines, hence the picker + RAM-aware default.
-CTX_SIZE_CHOICES = (4096, 8192, 16384, 32768)
+# cache → more VRAM/RAM. We deliberately cap the picker at 8K on the desktop
+# build:
+#   * MiniCPM-o is shipped for end-side use — the typical user runs on a
+#     6-12 GB GPU or 16 GB RAM, where 16K/32K KV cache fights with the
+#     vision/audio encoders for memory and degrades to CPU offload.
+#   * Multi-turn voice/video chats almost never need more than ~8K of live
+#     context once the C++ sliding-window prune kicks in.
+#   * Anything bigger should be a server build, not a desktop app.
+# Power users on workstations can still hand-edit ctx_size in
+# ~/.comni/config.json — the picker just hides the foot-gun by default.
+CTX_SIZE_CHOICES = (4096, 8192)
+CTX_SIZE_MAX = max(CTX_SIZE_CHOICES)
+
+
+def _coerce_ctx_size(cs: object) -> int | None:
+    """Map any incoming ctx_size value onto an allowed choice.
+
+    Returns None for values we can't parse at all (caller decides whether to
+    fall back to a recommended default). Values larger than CTX_SIZE_MAX are
+    clamped down — this is what migrates 16K/32K configs left over from
+    earlier Comni builds, without forcing the user to re-pick.
+    """
+    if not isinstance(cs, int):
+        return None
+    if cs in CTX_SIZE_CHOICES:
+        return cs
+    if cs > CTX_SIZE_MAX:
+        return CTX_SIZE_MAX
+    # Unusual small values (e.g. 2048) — snap to the nearest allowed choice.
+    return min(CTX_SIZE_CHOICES, key=lambda c: abs(c - cs))
 
 # Download source choices exposed in the main window — same values the
 # macOS app writes to ~/.comni/config.json's ``download_source`` so the
@@ -871,19 +898,22 @@ def _detect_system_ram_gb() -> float:
 
 
 def _recommend_ctx_size(ram_gb: float) -> int:
-    """Pick a default ctx_size for a machine with `ram_gb` of RAM.
+    """Default ctx_size for first launch.
 
-    On Windows the heavy lifting usually goes to dedicated GPU VRAM, but
-    the picker still scales by system RAM as a rough proxy for machine
-    tier — base laptops vs workstations.
+    Heuristic:
+      * <8 GB RAM (laptops, mini-PCs)        → 4K, otherwise the model +
+        KV cache + Comni overhead pushes the OS into swap immediately and
+        the very first message stutters for ~30s.
+      * Everything else                      → 8K. Plenty for multi-turn
+        voice/video chats; the C++ duplex sliding-window prune kicks in
+        well before 8K is exhausted, so nothing is "lost".
+
+    Note we deliberately never recommend >8K on the desktop build — see the
+    rationale next to CTX_SIZE_CHOICES.
     """
-    if ram_gb <= 0:
-        return 8192
-    if ram_gb <= 16:
-        return 8192
-    if ram_gb <= 32:
-        return 16384
-    return 32768
+    if 0 < ram_gb < 8:
+        return 4096
+    return 8192
 
 
 def save_config(model_dir: str, gateway_port: int = DEFAULT_GATEWAY_PORT,
@@ -907,10 +937,24 @@ def save_config(model_dir: str, gateway_port: int = DEFAULT_GATEWAY_PORT,
     config["cpp_backend"]["vision_backend"] = "auto"
 
     try:
-        from server.model_hub import load_comni_config
-        cs = load_comni_config().get("ctx_size")
-        if isinstance(cs, int) and cs in CTX_SIZE_CHOICES:
-            config["cpp_backend"]["ctx_size"] = cs
+        from server.model_hub import load_comni_config, save_comni_config
+        user_cfg = load_comni_config()
+        raw_cs = user_cfg.get("ctx_size")
+        coerced = _coerce_ctx_size(raw_cs)
+        if coerced is not None:
+            config["cpp_backend"]["ctx_size"] = coerced
+            # Migrate the user's persisted choice in-place when we had to
+            # clamp it (e.g. 16384 → 8192). Otherwise the dropdown re-opens
+            # showing a stale value and the GUI ↔ runtime drift forever.
+            if raw_cs != coerced:
+                user_cfg["ctx_size"] = coerced
+                try:
+                    save_comni_config(user_cfg)
+                    logger.info(
+                        "Migrated ctx_size in ~/.comni/config.json: %r -> %d",
+                        raw_cs, coerced)
+                except Exception:
+                    logger.exception("ctx_size migration save failed")
     except Exception:
         pass
 
@@ -1013,6 +1057,230 @@ def _assign_process_to_job_win(hJob, pid: int) -> bool:
             kernel32.CloseHandle(hProc)
     except Exception:
         return False
+
+
+# ============================================================
+# Single-instance & orphan cleanup
+#
+# Why this exists: users naturally double-click Comni.exe, click X, then
+# double-click again before the model has finished loading / unloading.
+# Without these helpers each launch starts a fresh Comni.exe process while
+# the previous one is still inside a multi-GB GGUF mmap or VRAM upload —
+# they pile up, ports collide, and after a minute or two five tray icons
+# and five MainWindows pop up at once. Reproduced from a user report on
+# 2026-04-26: "开了好几次, 过了一两分钟之后, 响应了, 弹了5个 omni".
+# ============================================================
+
+_SINGLE_INSTANCE_MUTEX_NAME = "Comni-SingleInstance-v1"
+_MAIN_WINDOW_TITLE = "Comni — MiniCPM-o 4.5"  # used to find existing window
+
+
+def _acquire_single_instance_lock():
+    """Try to take the single-instance mutex.
+
+    Returns:
+        - mutex_handle (truthy) if THIS process is the first instance.
+          Caller must keep the handle alive (just stash on a global / Qt
+          object); OS releases it on process death.
+        - None if another instance already holds it. Caller should
+          activate that instance's window and exit.
+    """
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ERROR_ALREADY_EXISTS = 183
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [
+            ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR,
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        # Use the local namespace (no "Global\\" prefix) — single-instance
+        # is per-Windows-session, not per-machine. Two different users
+        # logged in via fast user switching each get their own Comni.
+        handle = kernel32.CreateMutexW(None, True, _SINGLE_INSTANCE_MUTEX_NAME)
+        last_err = ctypes.get_last_error()
+        if not handle:
+            logger.warning("CreateMutexW failed (err=%d)", last_err)
+            return None
+        if last_err == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return None
+        return handle
+    except Exception:
+        logger.exception("single-instance mutex setup failed")
+        return None
+
+
+def _activate_existing_comni_window() -> bool:
+    """Find the running Comni's main window and bring it to the foreground.
+
+    Used when our process detects another instance via the single-instance
+    mutex. Restores from minimized / hidden-to-tray state.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetWindowTextW.argtypes = [
+            wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        SW_RESTORE = 9
+
+        EnumWindowsProc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
+
+        found: list[int] = []
+
+        def cb(hwnd, _lparam):
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            # Match by prefix so version suffix changes don't break us.
+            if buf.value.startswith("Comni"):
+                found.append(int(hwnd))
+                return False  # stop enumeration
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(cb), 0)
+        if not found:
+            return False
+        hwnd = found[0]
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        logger.exception("activate existing window failed")
+        return False
+
+
+def _process_path(pid: int) -> Optional[Path]:
+    """Return the full image path of `pid`, or None on error / no perms.
+
+    Uses QueryFullProcessImageNameW which works for cross-architecture
+    (32-bit caller → 64-bit target) and only needs PROCESS_QUERY_LIMITED_INFORMATION,
+    so we can inspect processes started by other elevated apps too.
+    """
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD,
+            wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        h = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(len(buf))
+            if not kernel32.QueryFullProcessImageNameW(
+                    h, 0, buf, ctypes.byref(size)):
+                return None
+            return Path(buf.value)
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception:
+        return None
+
+
+def _enumerate_pids() -> list[int]:
+    """Return all PIDs visible to the current process."""
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        from ctypes import wintypes
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        psapi.EnumProcesses.restype = wintypes.BOOL
+        psapi.EnumProcesses.argtypes = [
+            ctypes.POINTER(wintypes.DWORD), wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        # 4096 PIDs is way more than any sane Windows session has.
+        arr = (wintypes.DWORD * 4096)()
+        cb_needed = wintypes.DWORD(0)
+        if not psapi.EnumProcesses(arr, ctypes.sizeof(arr),
+                                   ctypes.byref(cb_needed)):
+            return []
+        n = cb_needed.value // ctypes.sizeof(wintypes.DWORD)
+        return [int(arr[i]) for i in range(n) if arr[i] != 0]
+    except Exception:
+        return []
+
+
+def _kill_orphan_subprocesses() -> int:
+    """Kill leftover Comni-owned subprocesses (worker / gateway / llama-server).
+
+    "Owned" means: the process's executable lives inside our install
+    directory tree (`_REPO_ROOT`). This is a strict whitelist — we never
+    touch a python.exe / llama-server.exe that's part of an unrelated
+    project, even if it happens to be running.
+
+    Returns the number of processes killed. Safe to call multiple times.
+    """
+    if not sys.platform.startswith("win"):
+        return 0
+
+    self_pid = os.getpid()
+    install_root = _REPO_ROOT.resolve()
+    targets: list[tuple[int, Path]] = []
+
+    for pid in _enumerate_pids():
+        if pid == self_pid:
+            continue
+        path = _process_path(pid)
+        if path is None:
+            continue
+        try:
+            path_resolved = path.resolve()
+            path_resolved.relative_to(install_root)
+        except (OSError, ValueError):
+            continue
+        # Only kill known child binaries — not Comni.exe itself (the
+        # other instance handling is via the mutex).
+        name = path_resolved.name.lower()
+        if name in ("python.exe", "pythonw.exe", "llama-server.exe"):
+            targets.append((pid, path_resolved))
+
+    if not targets:
+        return 0
+
+    logger.warning(
+        "found %d orphan subprocess(es) from a previous Comni run; killing",
+        len(targets))
+    for pid, path in targets:
+        logger.warning("  pid=%d  %s", pid, path)
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, check=False,
+                creationflags=0x08000000)
+        except Exception as e:
+            logger.warning("    taskkill pid=%d failed: %s", pid, e)
+    # Give the OS a moment to release ports.
+    time.sleep(0.5)
+    return len(targets)
 
 
 # ============================================================
@@ -1176,6 +1444,23 @@ class ServiceController(QThread):
         # 手机浏览器要求 secure context 才能启用麦克风/摄像头/WebRTC,
         # 本地访问也不成问题 — 首次进入浏览器会弹不安全警告,
         # 点「高级 → 继续访问」即可。
+        #
+        # 启动前先确保证书覆盖当前 LAN IP — 老证书没有 SAN,
+        # Android Chrome 会拒绝授予 getUserMedia 权限。
+        try:
+            from server.cert_gen import ensure_cert_for_lan  # type: ignore
+            certs_dir = _APPS_ROOT / "certs"
+            cert_path, key_path, lan_ips = ensure_cert_for_lan(certs_dir)
+            if lan_ips:
+                self.log_line.emit(
+                    f"  TLS cert covers: localhost, 127.0.0.1, "
+                    f"{', '.join(lan_ips)}\n")
+        except Exception as e:
+            logger.warning("cert ensure failed, falling back to existing cert: %s", e)
+            self.log_line.emit(
+                f"  Warning: could not refresh TLS cert ({e}). "
+                "Camera/mic on phone may not work.\n")
+
         gateway_cmd = [
             python_exe, str(_SERVER_DIR / "gateway.py"),
             "--port", str(self._gw_port),
@@ -1352,14 +1637,25 @@ class MainWindow(QMainWindow):
     def _ensure_ctx_size_default(self):
         """Stamp a RAM-aware ctx_size into ~/.comni/config.json on first run.
 
-        Once written, the user's pick (via the main window picker) is sticky,
-        so we never override an explicit value here.
+        Also migrates legacy values (16K / 32K from earlier Comni builds) down
+        to the current allowed range — those builds let users pick larger
+        values, but the desktop picker now caps at 8K (see CTX_SIZE_CHOICES).
+        Without the clamp, the dropdown silently falls back to the
+        recommended default and the user's runtime would mysteriously shrink
+        from "32K I picked last week" → "8K". Migrating in-place keeps the
+        change visible and one-time only.
         """
         try:
             from server.model_hub import load_comni_config, save_comni_config
             cfg = load_comni_config()
-            cs = cfg.get("ctx_size")
-            if isinstance(cs, int) and cs in CTX_SIZE_CHOICES:
+            raw_cs = cfg.get("ctx_size")
+            coerced = _coerce_ctx_size(raw_cs)
+            if coerced is not None and raw_cs == coerced:
+                return  # already a legal value, nothing to do
+            if coerced is not None and raw_cs != coerced:
+                cfg["ctx_size"] = coerced
+                save_comni_config(cfg)
+                logger.info("Migrated ctx_size %r → %d", raw_cs, coerced)
                 return
             ram_gb = _detect_system_ram_gb()
             recommended = _recommend_ctx_size(ram_gb)
@@ -1561,13 +1857,14 @@ class MainWindow(QMainWindow):
             self._ctx_combo.addItem(f"{cs // 1024}K  ({cs})", cs)
         try:
             from server.model_hub import load_comni_config
-            cur_cs = load_comni_config().get(
-                "ctx_size", _recommend_ctx_size(_detect_system_ram_gb()))
-            if cur_cs not in CTX_SIZE_CHOICES:
+            raw_cs = load_comni_config().get("ctx_size")
+            cur_cs = _coerce_ctx_size(raw_cs)
+            if cur_cs is None:
                 cur_cs = _recommend_ctx_size(_detect_system_ram_gb())
             self._ctx_combo.setCurrentIndex(CTX_SIZE_CHOICES.index(cur_cs))
         except Exception:
-            self._ctx_combo.setCurrentIndex(1)  # 8192
+            # Fallback to 8K when in doubt — _recommend_ctx_size's default.
+            self._ctx_combo.setCurrentIndex(CTX_SIZE_CHOICES.index(8192))
         self._ctx_combo.setFixedWidth(120)
         self._ctx_combo.currentIndexChanged.connect(self._on_ctx_size_changed)
         ctx_row.addWidget(self._ctx_combo)
@@ -1672,17 +1969,62 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _really_quit(self):
+        # If the service is up (even mid-load), we must drain children
+        # synchronously. Letting Qt exit while llama-server is still
+        # in a multi-GB GGUF mmap leaves zombies that hold ports / VRAM
+        # for ~30s and cause the next launch to misbehave.
         if self._controller.is_running():
             ret = QMessageBox.question(
                 self, "Quit Comni",
-                "Service is running. Stop and quit?",
+                "Service is running. Stop and quit?\n\n"
+                "Note: if a model is still loading, this can take "
+                "up to ~30 seconds while it unmaps from VRAM.",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             if ret != QMessageBox.Yes:
                 return
-            self._controller.stop_service()
-            self._controller.wait(8000)
-        self._tray.hide()
+
+            # Visual feedback so users don't think the app froze and
+            # start clicking Comni.exe again (the very thing that
+            # triggered this bug in the first place).
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self._set_quitting_ui()
+            try:
+                self._controller.stop_service()
+                # 60s is enough for an Apple-Silicon-tier model unload
+                # *and* the worker/gateway clean shutdown. Previously
+                # 8s — empirically too short under load.
+                if not self._controller.wait(60_000):
+                    logger.warning(
+                        "controller.wait() timed out, forcing kill")
+            finally:
+                QApplication.restoreOverrideCursor()
+
+        # Belt-and-suspenders: even if the controller cleaned up its
+        # own children, Job-Object kill-on-close fires when *this*
+        # process exits. But if Job creation failed silently for any
+        # reason (rare; AV blocking ctypes), explicitly nuke any
+        # leftovers right before quit so the next launch is clean.
+        try:
+            _kill_orphan_subprocesses()
+        except Exception:
+            pass
+
+        if hasattr(self, "_tray") and self._tray:
+            self._tray.hide()
         QApplication.instance().quit()
+
+    def _set_quitting_ui(self) -> None:
+        """Disable controls and show a 'Stopping…' banner while quitting."""
+        try:
+            for btn_name in ("_start_btn", "_stop_btn", "_open_btn",
+                             "_models_btn", "_qr_btn"):
+                btn = getattr(self, btn_name, None)
+                if btn is not None:
+                    btn.setEnabled(False)
+            if hasattr(self, "_status_label"):
+                self._status_label.setText("Stopping…")
+        except Exception:
+            pass
 
     # ---------- first launch ----------
 
@@ -1937,9 +2279,11 @@ class MainWindow(QMainWindow):
             self.hide()
             event.ignore()
             return
-        # No tray — accept the close; QApplication.quitOnLastWindowClosed
-        # (set to True at startup in this case) will terminate the app.
-        event.accept()
+        # No tray — drain children synchronously, otherwise Qt happily
+        # exits while llama-server is still in mmap and the next launch
+        # collides on ports.
+        event.ignore()
+        self._really_quit()
 
 
 # ============================================================
@@ -2515,6 +2859,35 @@ def main():
     logger.info("Python: %s", sys.version.split()[0])
     logger.info("Executable: %s", sys.executable)
     logger.info("Log path: %s", _APP_LOG_PATH)
+
+    # ── Single-instance guard ──────────────────────────────────────────
+    # Must run BEFORE QApplication is constructed so we don't pay the
+    # PySide6 startup cost just to immediately quit. If another Comni is
+    # already running, surface its window and exit silently — no error
+    # popup (the user just double-clicked the icon, that's not an error).
+    _SINGLE_INSTANCE_HANDLE = _acquire_single_instance_lock()
+    if _SINGLE_INSTANCE_HANDLE is None and sys.platform.startswith("win"):
+        logger.info("another Comni instance is running; activating it")
+        # Best-effort: bring the existing window to front. If we can't
+        # find it (e.g. the previous process is hung mid-startup), still
+        # exit — coming in as a second GUI would only make things worse.
+        _activate_existing_comni_window()
+        sys.exit(0)
+    logger.info("acquired single-instance mutex (handle=%s)",
+                _SINGLE_INSTANCE_HANDLE)
+
+    # Clean up zombies left by a previous abrupt exit. Strict whitelist:
+    # only kills python.exe / llama-server.exe whose image lives under
+    # our install directory. Real-world trigger: user closes Comni while
+    # llama-server is still loading a GGUF, the kernel takes ~30s to
+    # actually unmap the file, and the next launch fails to bind
+    # gateway / worker / cpp_server ports.
+    try:
+        n_killed = _kill_orphan_subprocesses()
+        if n_killed:
+            logger.info("cleaned up %d orphan subprocess(es)", n_killed)
+    except Exception:
+        logger.exception("orphan cleanup failed (non-fatal)")
 
     # Global crash handler — any unhandled exception goes to the app log
     def _excepthook(exc_type, exc, tb):

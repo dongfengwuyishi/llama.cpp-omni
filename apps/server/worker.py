@@ -709,7 +709,7 @@ async def lifespan(app: FastAPI):
             duplex_pause_timeout=config.get("duplex_pause_timeout", 60.0),
             llm_model=config.get("llm_model", ""),
             cpp_server_port=config.get("cpp_server_port"),
-            ctx_size=config.get("ctx_size", 32768),
+            ctx_size=config.get("ctx_size", 8192),
             n_gpu_layers=config.get("n_gpu_layers", 99),
             vision_backend=config.get("vision_backend", "auto"),
         )
