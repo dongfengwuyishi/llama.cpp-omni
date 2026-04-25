@@ -98,6 +98,17 @@ _INNER_W = _CARD_W - 2 * _CARD_INSET
 # blows 16 GB Macs, hence the picker + RAM-aware default.
 CTX_SIZE_CHOICES = (4096, 8192, 16384, 32768)
 
+# Download source choices: (config value, UI label). "auto" walks the chain
+# HF → HF mirror → ModelScope so it works for both overseas and domestic
+# users out of the box; users behind aggressive firewalls (where neither HF
+# nor hf-mirror reaches) can pin "modelscope" to skip the discovery step.
+DOWNLOAD_SOURCE_CHOICES = (
+    ("auto", "Auto (recommended)"),
+    ("hf", "HuggingFace"),
+    ("hf_mirror", "HF Mirror (hf-mirror.com)"),
+    ("modelscope", "ModelScope (魔搭, China)"),
+)
+
 
 def _detect_system_ram_gb() -> float:
     """Total physical RAM in GB; 0.0 if unknown.
@@ -943,6 +954,37 @@ class AppDelegate(NSObject):
         cv.addSubview_(self._ctx_hint_label)
         y -= 4
 
+        # ── Download Source (auto = HF → mirror → ModelScope) ──
+        # Ships with sane defaults; we only expose the dropdown so users
+        # behind aggressive firewalls can pin ModelScope and skip the
+        # discovery latency on the first download.
+        y -= 24
+        cv.addSubview_(self._make_label("Source", x=_INNER_L, y=y + 2, w=54, h=20,
+                                         size=11, color=NSColor.tertiaryLabelColor()))
+        self._download_source_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(_INNER_L + 56, y, 200, 22), False)
+        for _key, label in DOWNLOAD_SOURCE_CHOICES:
+            self._download_source_popup.addItemWithTitle_(label)
+        try:
+            from server.model_hub import load_comni_config
+            cur_src = load_comni_config().get("download_source", "auto")
+            keys = [k for (k, _) in DOWNLOAD_SOURCE_CHOICES]
+            self._download_source_popup.selectItemAtIndex_(
+                keys.index(cur_src) if cur_src in keys else 0)
+        except Exception:
+            self._download_source_popup.selectItemAtIndex_(0)
+        self._download_source_popup.setTarget_(self)
+        self._download_source_popup.setAction_(b"onDownloadSourceChanged:")
+        self._download_source_popup.setFont_(NSFont.systemFontOfSize_(11))
+        cv.addSubview_(self._download_source_popup)
+
+        self._download_source_hint_label = self._make_label(
+            "auto: HF → Mirror → ModelScope",
+            x=_INNER_L + 262, y=y + 3, w=240, h=16,
+            size=9, color=NSColor.tertiaryLabelColor())
+        cv.addSubview_(self._download_source_hint_label)
+        y -= 4
+
         # ── Log Section ──
         log_hdr_y = y - 22
         cv.addSubview_(self._make_label("Service Log", x=_INNER_L, y=log_hdr_y, w=120, h=20,
@@ -1679,6 +1721,22 @@ class AppDelegate(NSObject):
                 f"Context size → {cs} ({cs // 1024}K) — restart service to apply\n")
         except Exception:
             logger.exception("onContextSizeChanged_ failed")
+
+    @objc.typedSelector(b'v@:@')
+    def onDownloadSourceChanged_(self, sender):
+        try:
+            idx = sender.indexOfSelectedItem()
+            if idx < 0 or idx >= len(DOWNLOAD_SOURCE_CHOICES):
+                return
+            key, label = DOWNLOAD_SOURCE_CHOICES[idx]
+            from server.model_hub import load_comni_config, save_comni_config
+            cfg = load_comni_config()
+            cfg["download_source"] = key
+            save_comni_config(cfg)
+            self._append_log(
+                f"Download source → {label} (applies to next download)\n")
+        except Exception:
+            logger.exception("onDownloadSourceChanged_ failed")
 
     @objc.typedSelector(b'v@:@')
     def onCopyURL_(self, sender):

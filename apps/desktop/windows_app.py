@@ -830,6 +830,16 @@ def get_component_status_text(model_dir: Optional[str] = None) -> str:
 # 8 GB GPUs / 16 GB RAM machines, hence the picker + RAM-aware default.
 CTX_SIZE_CHOICES = (4096, 8192, 16384, 32768)
 
+# Download source choices exposed in the main window — same values the
+# macOS app writes to ~/.comni/config.json's ``download_source`` so the
+# user's preference survives moving between macOS and Windows builds.
+DOWNLOAD_SOURCE_CHOICES = (
+    ("auto", "Auto (recommended)"),
+    ("hf", "HuggingFace"),
+    ("hf_mirror", "HF Mirror (hf-mirror.com)"),
+    ("modelscope", "ModelScope (魔搭, China)"),
+)
+
 
 def _detect_system_ram_gb() -> float:
     """Total physical RAM in GB on Windows; 0.0 if unknown.
@@ -1569,6 +1579,32 @@ class MainWindow(QMainWindow):
         ctx_row.addStretch(1)
         root.addLayout(ctx_row)
 
+        # ─ Download source (HF / HF mirror / ModelScope) ─
+        # ModelScope (魔搭) is added so users on networks where neither HF
+        # nor hf-mirror is reachable still have a working fallback.
+        src_row = QHBoxLayout()
+        src_row.setSpacing(6)
+        src_row.addWidget(self._muted_label("Source"))
+        self._download_source_combo = QComboBox()
+        for key, label in DOWNLOAD_SOURCE_CHOICES:
+            self._download_source_combo.addItem(label, key)
+        try:
+            from server.model_hub import load_comni_config
+            cur_src = load_comni_config().get("download_source", "auto")
+            keys = [k for (k, _) in DOWNLOAD_SOURCE_CHOICES]
+            self._download_source_combo.setCurrentIndex(
+                keys.index(cur_src) if cur_src in keys else 0)
+        except Exception:
+            self._download_source_combo.setCurrentIndex(0)
+        self._download_source_combo.setFixedWidth(220)
+        self._download_source_combo.currentIndexChanged.connect(
+            self._on_download_source_changed)
+        src_row.addWidget(self._download_source_combo)
+        src_row.addWidget(self._muted_label(
+            "auto: HF → Mirror → ModelScope"))
+        src_row.addStretch(1)
+        root.addLayout(src_row)
+
         # Log
         log_hdr = QHBoxLayout()
         lh = QLabel("Service Log")
@@ -1802,6 +1838,21 @@ class MainWindow(QMainWindow):
                 f"Context size → {cs} ({cs // 1024}K) — restart service to apply\n")
         except Exception as e:
             self._append_log(f"Save ctx_size failed: {e}\n")
+
+    @Slot(int)
+    def _on_download_source_changed(self, idx: int):
+        if idx < 0 or idx >= len(DOWNLOAD_SOURCE_CHOICES):
+            return
+        key, label = DOWNLOAD_SOURCE_CHOICES[idx]
+        try:
+            from server.model_hub import load_comni_config, save_comni_config
+            cfg = load_comni_config()
+            cfg["download_source"] = key
+            save_comni_config(cfg)
+            self._append_log(
+                f"Download source → {label} (applies to next download)\n")
+        except Exception as e:
+            self._append_log(f"Save download_source failed: {e}\n")
 
     @Slot()
     def on_manage_models(self):

@@ -40,7 +40,9 @@ Web UI 首页有四张卡片，按需点击：
 - **自动** 第一次点 Start Server 会弹出下载进度条，下完就直接启动
 - **手动** 菜单栏 → Show Window → Manage Models，挑版本点 Download / Resume
 
-下载源会按网络环境自动选：国内访问 `huggingface.co` 不稳时会切到 `hf-mirror.com`。中途断网 / 关应用都没关系，下次打开点 Resume 接着下。
+下载源按网络情况自动选，按顺序回退：`huggingface.co` → `hf-mirror.com` → `modelscope.cn`（魔搭）。如果某一个不通或者下载太慢，会自动切到下一个，无需手动干预。中途断网 / 关应用都没关系，下次打开点 Resume 接着下。
+
+如果想固定走某一个源，主窗口里有 **Source** 下拉，可选 Auto / HuggingFace / HF Mirror / ModelScope。国内用户大多用默认 Auto 即可；如果在公司网络下三个源都被限制，可手动指定到能访问的那一个。
 
 如果已经有模型文件想直接导入，把整个模型目录扔进 `~/.comni/models/` 即可，Model Manager 会自动识别。
 
@@ -58,7 +60,7 @@ Mac 版菜单栏 → 主窗口 → "QR" 按钮会弹出二维码，手机扫码�
 
 ## 常见问题
 
-**模型下载很慢 / 卡住** — 如果开了 VPN 或系统代理，先关掉再试（app 默认自己走代理绕行，但有些代理会劫持所有流量）；还是不行就重启 app 让它自动切到 `hf-mirror.com`，或直接在 Model Manager 里点 Resume 继续。
+**模型下载很慢 / 卡住** — 如果开了 VPN 或系统代理，先关掉再试（app 默认自己绕开代理，但有些代理会劫持所有流量）；还是不行就在主窗口的 **Source** 下拉里手动切 `HF Mirror` 或 `ModelScope`，再点 Resume 继续下。三个源走的是完全独立的 CDN，总有一个能用。
 
 **Web UI 打不开、提示 SSL 错误** — 本地服务跑在 HTTPS 自签名证书上，浏览器会拦一次，点"高级 → 继续访问"即可。
 

@@ -5,6 +5,8 @@
             "id": "minicpm-o-4.5",
             "display_name": "MiniCPM-o 4.5",
             "hf_repo": "openbmb/MiniCPM-o-4_5-gguf",
+            "ms_repo": "OpenBMB/MiniCPM-o-4_5-gguf",
+            "ms_revision": "master",
             "description": "9B multimodal model — vision, speech, full-duplex streaming",
             "dir_name": "MiniCPM-o-4_5-gguf",
             "llm_variants": [
