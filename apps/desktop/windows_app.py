@@ -897,23 +897,62 @@ def _detect_system_ram_gb() -> float:
         return 0.0
 
 
+_VRAM_PROBE_CACHE = None  # populated lazily by _detect_vram(); see below
+
+
+def _detect_vram():
+    """Cached VRAM probe — nvidia-smi takes ~50ms, multiple callers
+    (popup init, _ensure_ctx_size_default, the GPU label) all want the
+    same answer, so we run it once per process.
+
+    Returns a vram_probe.ProbeResult or a stub with .known=False if the
+    probe module itself failed to import (e.g. very old packaging).
+    """
+    global _VRAM_PROBE_CACHE
+    if _VRAM_PROBE_CACHE is not None:
+        return _VRAM_PROBE_CACHE
+    try:
+        from server.vram_probe import detect_vram  # type: ignore
+        _VRAM_PROBE_CACHE = detect_vram()
+    except Exception:
+        logger.exception("VRAM probe failed; falling back to RAM heuristic")
+        from types import SimpleNamespace
+        _VRAM_PROBE_CACHE = SimpleNamespace(
+            total_gb=0.0, free_gb=0.0, source="error", gpu_name="", known=False)
+    return _VRAM_PROBE_CACHE
+
+
 def _recommend_ctx_size(ram_gb: float) -> int:
     """Default ctx_size for first launch.
 
-    Heuristic:
-      * <8 GB RAM (laptops, mini-PCs)        → 4K, otherwise the model +
-        KV cache + Comni overhead pushes the OS into swap immediately and
-        the very first message stutters for ~30s.
-      * Everything else                      → 8K. Plenty for multi-turn
-        voice/video chats; the C++ duplex sliding-window prune kicks in
-        well before 8K is exhausted, so nothing is "lost".
+    The signal we actually care about is **GPU VRAM**, not system RAM:
+    on a 12 GB consumer NVIDIA card (5070-class) the full omni stack
+    (LLM + KV @ 8K + vision + audio + TTS LLM + Token2Wav) overflows
+    VRAM, CUDA evicts the vocoder to host memory, and Token2Wav's RTF
+    explodes from ~0.17 to ~3.0 — that's the "8K cards, 4K smooth"
+    regression we hit in testing.
 
-    Note we deliberately never recommend >8K on the desktop build — see the
-    rationale next to CTX_SIZE_CHOICES.
+    Decision tree:
+      * NVIDIA VRAM probe succeeded:
+          - <14 GB total VRAM  → 4K  (5070/4060 Ti class — 8K guarantees
+                                       vocoder PCIE swap)
+          - ≥14 GB total VRAM  → 8K  (4080+/workstation class)
+      * Probe failed (macOS, AMD, broken driver):
+          - ram_gb <8 GB       → 4K  (laptops / mini-PCs)
+          - otherwise          → 8K  (Apple Silicon unified memory,
+                                       desktops with healthy RAM)
+
+    Note we deliberately never recommend >8K on the desktop build — see
+    the rationale next to CTX_SIZE_CHOICES.
     """
-    if 0 < ram_gb < 8:
-        return 4096
-    return 8192
+    try:
+        from server.vram_probe import recommend_ctx_size  # type: ignore
+        v = _detect_vram()
+        return recommend_ctx_size(vram_total_gb=v.total_gb, ram_gb=ram_gb)
+    except Exception:
+        if 0 < ram_gb < 8:
+            return 4096
+        return 8192
 
 
 def save_config(model_dir: str, gateway_port: int = DEFAULT_GATEWAY_PORT,
@@ -1658,12 +1697,17 @@ class MainWindow(QMainWindow):
                 logger.info("Migrated ctx_size %r → %d", raw_cs, coerced)
                 return
             ram_gb = _detect_system_ram_gb()
+            vram = _detect_vram()
             recommended = _recommend_ctx_size(ram_gb)
             cfg["ctx_size"] = recommended
             save_comni_config(cfg)
             logger.info(
-                "First-run ctx_size default: %d (RAM=%.1f GB)",
-                recommended, ram_gb)
+                "First-run ctx_size default: %d "
+                "(RAM=%.1f GB, VRAM=%.1f GB src=%s gpu=%r)",
+                recommended, ram_gb,
+                getattr(vram, "total_gb", 0.0),
+                getattr(vram, "source", "unknown"),
+                getattr(vram, "gpu_name", ""))
         except Exception:
             logger.exception("_ensure_ctx_size_default failed")
 
@@ -1870,37 +1914,27 @@ class MainWindow(QMainWindow):
         ctx_row.addWidget(self._ctx_combo)
 
         _ram_gb = _detect_system_ram_gb()
-        ctx_row.addWidget(self._muted_label(
-            f"RAM {_ram_gb:.0f} GB · larger = more memory"
-            if _ram_gb > 0 else "larger ctx = more KV cache RAM"))
+        _vram = _detect_vram()
+        # Surface the detected GPU/VRAM so users on small cards understand
+        # *why* the default is 4K. No GPU text on macOS / AMD / probe-failed
+        # boxes — falling back to the RAM hint preserves the old UX.
+        if getattr(_vram, "known", False) and _vram.total_gb > 0:
+            ctx_hint = (f"GPU {_vram.gpu_name or 'NVIDIA'} · "
+                        f"VRAM {_vram.total_gb:.0f} GB")
+        elif _ram_gb > 0:
+            ctx_hint = f"RAM {_ram_gb:.0f} GB · larger = more memory"
+        else:
+            ctx_hint = "larger ctx = more KV cache RAM"
+        ctx_row.addWidget(self._muted_label(ctx_hint))
         ctx_row.addStretch(1)
         root.addLayout(ctx_row)
 
-        # ─ Download source (HF / HF mirror / ModelScope) ─
-        # ModelScope (魔搭) is added so users on networks where neither HF
-        # nor hf-mirror is reachable still have a working fallback.
-        src_row = QHBoxLayout()
-        src_row.setSpacing(6)
-        src_row.addWidget(self._muted_label("Source"))
-        self._download_source_combo = QComboBox()
-        for key, label in DOWNLOAD_SOURCE_CHOICES:
-            self._download_source_combo.addItem(label, key)
-        try:
-            from server.model_hub import load_comni_config
-            cur_src = load_comni_config().get("download_source", "auto")
-            keys = [k for (k, _) in DOWNLOAD_SOURCE_CHOICES]
-            self._download_source_combo.setCurrentIndex(
-                keys.index(cur_src) if cur_src in keys else 0)
-        except Exception:
-            self._download_source_combo.setCurrentIndex(0)
-        self._download_source_combo.setFixedWidth(220)
-        self._download_source_combo.currentIndexChanged.connect(
-            self._on_download_source_changed)
-        src_row.addWidget(self._download_source_combo)
-        src_row.addWidget(self._muted_label(
-            "auto: HF → Mirror → ModelScope"))
-        src_row.addStretch(1)
-        root.addLayout(src_row)
+        # NOTE: download_source picker used to live here. It moved into the
+        # Model Manager dialog so it sits next to the Download buttons it
+        # actually controls. The default ("auto" → HF → Mirror → ModelScope)
+        # already covers users behind network restrictions, so hiding the
+        # dropdown from the main window de-clutters the runtime panel
+        # without losing functionality.
 
         # Log
         log_hdr = QHBoxLayout()
@@ -2181,21 +2215,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._append_log(f"Save ctx_size failed: {e}\n")
 
-    @Slot(int)
-    def _on_download_source_changed(self, idx: int):
-        if idx < 0 or idx >= len(DOWNLOAD_SOURCE_CHOICES):
-            return
-        key, label = DOWNLOAD_SOURCE_CHOICES[idx]
-        try:
-            from server.model_hub import load_comni_config, save_comni_config
-            cfg = load_comni_config()
-            cfg["download_source"] = key
-            save_comni_config(cfg)
-            self._append_log(
-                f"Download source → {label} (applies to next download)\n")
-        except Exception as e:
-            self._append_log(f"Save download_source failed: {e}\n")
-
     @Slot()
     def on_manage_models(self):
         dlg = ModelManagerDialog(self)
@@ -2403,6 +2422,37 @@ class ModelManagerDialog(QDialog):
         hdr.setStyleSheet("font-size: 15px; font-weight: 600;")
         root.addWidget(hdr)
 
+        # ─ Download source (auto = HF → Mirror → ModelScope) ─
+        # Lives here, not in the main window: the picker only affects the
+        # Download buttons below, so co-locating them keeps the scope
+        # obvious. Persisted to ~/.comni/config.json so the choice survives
+        # across sessions and across macOS/Windows builds.
+        src_row = QHBoxLayout()
+        src_row.setSpacing(6)
+        src_label = QLabel("Download from")
+        src_label.setStyleSheet("color:#666; font-size: 11px;")
+        src_row.addWidget(src_label)
+        self._dl_source_combo = QComboBox()
+        for key, label in DOWNLOAD_SOURCE_CHOICES:
+            self._dl_source_combo.addItem(label, key)
+        try:
+            from server.model_hub import load_comni_config
+            cur_src = load_comni_config().get("download_source", "auto")
+            keys = [k for (k, _) in DOWNLOAD_SOURCE_CHOICES]
+            self._dl_source_combo.setCurrentIndex(
+                keys.index(cur_src) if cur_src in keys else 0)
+        except Exception:
+            self._dl_source_combo.setCurrentIndex(0)
+        self._dl_source_combo.setFixedWidth(220)
+        self._dl_source_combo.currentIndexChanged.connect(
+            self._on_download_source_changed)
+        src_row.addWidget(self._dl_source_combo)
+        src_hint = QLabel("auto: HF → Mirror → ModelScope")
+        src_hint.setStyleSheet("color:#999; font-size: 10px;")
+        src_row.addWidget(src_hint)
+        src_row.addStretch(1)
+        root.addLayout(src_row)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -2600,6 +2650,23 @@ class ModelManagerDialog(QDialog):
         loc.setWordWrap(True)
         lay.addWidget(loc)
         return card
+
+    def _on_download_source_changed(self, idx: int):
+        if idx < 0 or idx >= len(DOWNLOAD_SOURCE_CHOICES):
+            return
+        key, label = DOWNLOAD_SOURCE_CHOICES[idx]
+        try:
+            from server.model_hub import load_comni_config, save_comni_config
+            cfg = load_comni_config()
+            cfg["download_source"] = key
+            save_comni_config(cfg)
+            # Mirror to the main window's log so the user sees feedback even
+            # though the picker now lives in this modal — otherwise changing
+            # the source feels silent.
+            self._main._append_log(
+                f"Download source → {label} (applies to next download)\n")
+        except Exception as e:
+            self._main._append_log(f"Save download_source failed: {e}\n")
 
     def _on_import(self):
         if self._main._do_import_model():

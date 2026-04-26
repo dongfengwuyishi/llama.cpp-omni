@@ -1249,6 +1249,47 @@ class CppBackendWorker:
             "--temp", "0.7",
         ]
 
+        # Probe VRAM right before launch so the log captures the exact
+        # state CUDA will see. This is forensic gold when users report
+        # "8K is choppy" — without it we have to guess whether the Token2Wav
+        # vocoder fell back to PCIE swap. See vram_probe.py for the
+        # 5070-12GB regression that motivated this check.
+        try:
+            from vram_probe import detect_vram, SAFE_8K_VRAM_GB  # type: ignore
+        except ImportError:
+            try:
+                from server.vram_probe import detect_vram, SAFE_8K_VRAM_GB  # type: ignore
+            except ImportError:
+                detect_vram = None  # type: ignore
+                SAFE_8K_VRAM_GB = 14.0  # type: ignore
+        if detect_vram is not None:
+            try:
+                v = detect_vram()
+                if v.known:
+                    logger.info(
+                        "[VRAM] gpu=%r total=%.1f GB free=%.1f GB (src=%s)",
+                        v.gpu_name, v.total_gb, v.free_gb, v.source)
+                    # Fire a loud WARNING when we know ctx_size is going to
+                    # over-commit VRAM. We don't auto-clamp here — the
+                    # desktop app already owns ctx_size selection — but a
+                    # clear breadcrumb in the log lets us correlate
+                    # "Token2Wav RTF=3.0" with "user picked 8K on a 12 GB
+                    # card" without re-running the session.
+                    if (self.ctx_size >= 8192
+                            and v.total_gb < SAFE_8K_VRAM_GB):
+                        logger.warning(
+                            "ctx_size=%d on a %.1f GB GPU is below the "
+                            "%.0f GB headroom needed for the full omni "
+                            "stack — Token2Wav vocoder will likely spill "
+                            "to host memory and RTF will jump from ~0.2 "
+                            "to ~3.0. Consider lowering ctx_size to 4096.",
+                            self.ctx_size, v.total_gb, SAFE_8K_VRAM_GB)
+                else:
+                    logger.info("[VRAM] no NVIDIA GPU detected (src=%s); "
+                                "running on Metal/CPU/AMD", v.source)
+            except Exception:
+                logger.debug("VRAM probe raised; ignoring", exc_info=True)
+
         logger.info(f"Starting C++ server: {' '.join(cmd)}")
 
         popen_kwargs: Dict[str, Any] = dict(

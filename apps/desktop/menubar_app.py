@@ -202,22 +202,47 @@ def _format_version_tag() -> str:
     return "dev"
 
 
+_VRAM_PROBE_CACHE = None  # populated lazily by _detect_vram()
+
+
+def _detect_vram():
+    """Cached VRAM probe. On Apple Silicon nvidia-smi is absent and the
+    probe returns ``known=False``, which is the right outcome — Macs
+    have unified memory, so the RAM heuristic is what we actually want.
+    Bootcamped Macs / external NVIDIA enclosures will trigger the probe
+    and benefit from VRAM-aware defaults.
+    """
+    global _VRAM_PROBE_CACHE
+    if _VRAM_PROBE_CACHE is not None:
+        return _VRAM_PROBE_CACHE
+    try:
+        from server.vram_probe import detect_vram  # type: ignore
+        _VRAM_PROBE_CACHE = detect_vram()
+    except Exception:
+        logger.exception("VRAM probe failed; falling back to RAM heuristic")
+        from types import SimpleNamespace
+        _VRAM_PROBE_CACHE = SimpleNamespace(
+            total_gb=0.0, free_gb=0.0, source="error", gpu_name="", known=False)
+    return _VRAM_PROBE_CACHE
+
+
 def _recommend_ctx_size(ram_gb: float) -> int:
     """Default ctx_size for first launch.
 
-    Heuristic:
-      * <8 GB unified memory  → 4K, otherwise the model + KV cache + Comni
-        overhead pushes the OS into swap and the very first message stalls.
-      * Everything else       → 8K. Plenty for multi-turn voice/video chats;
-        the C++ duplex sliding-window prune kicks in well before 8K is
-        exhausted, so nothing is "lost".
-
-    Note we deliberately never recommend >8K on the desktop build — see
-    CTX_SIZE_CHOICES for the rationale.
+    On Macs the relevant signal is unified RAM (since the GPU shares it).
+    On bootcamped / eGPU Macs with a discrete NVIDIA card the VRAM probe
+    will fire and gate 8K behind a 14 GB total-VRAM threshold — see the
+    Windows version of this docstring for why (Token2Wav vocoder ends up
+    PCIE-swapping when the omni stack overflows VRAM).
     """
-    if 0 < ram_gb < 8:
-        return 4096
-    return 8192
+    try:
+        from server.vram_probe import recommend_ctx_size  # type: ignore
+        v = _detect_vram()
+        return recommend_ctx_size(vram_total_gb=v.total_gb, ram_gb=ram_gb)
+    except Exception:
+        if 0 < ram_gb < 8:
+            return 4096
+        return 8192
 
 
 class ServiceState:
@@ -687,11 +712,17 @@ class AppDelegate(NSObject):
                 logger.info("Migrated ctx_size %r → %d", raw_cs, coerced)
                 return
             ram_gb = _detect_system_ram_gb()
+            vram = _detect_vram()
             recommended = _recommend_ctx_size(ram_gb)
             cfg["ctx_size"] = recommended
             save_comni_config(cfg)
-            logger.info("First-run ctx_size default: %d (RAM=%.1f GB)",
-                        recommended, ram_gb)
+            logger.info(
+                "First-run ctx_size default: %d "
+                "(RAM=%.1f GB, VRAM=%.1f GB src=%s gpu=%r)",
+                recommended, ram_gb,
+                getattr(vram, "total_gb", 0.0),
+                getattr(vram, "source", "unknown"),
+                getattr(vram, "gpu_name", ""))
         except Exception:
             logger.exception("_ensure_ctx_size_default failed")
 
@@ -996,44 +1027,28 @@ class AppDelegate(NSObject):
         cv.addSubview_(self._ctx_size_popup)
 
         ram_gb = _detect_system_ram_gb()
-        ctx_hint = (f"RAM {ram_gb:.0f} GB · larger = more memory"
-                    if ram_gb > 0 else "larger ctx = more KV cache RAM")
+        vram = _detect_vram()
+        # On bootcamped Macs / eGPU rigs we have a real NVIDIA VRAM number
+        # — show it, since that's what actually drives the recommendation.
+        # On unified-memory Apple Silicon the probe is unknown and we fall
+        # back to the RAM hint.
+        if getattr(vram, "known", False) and vram.total_gb > 0:
+            ctx_hint = f"GPU {vram.gpu_name or 'NVIDIA'} · VRAM {vram.total_gb:.0f} GB"
+        elif ram_gb > 0:
+            ctx_hint = f"RAM {ram_gb:.0f} GB · larger = more memory"
+        else:
+            ctx_hint = "larger ctx = more KV cache RAM"
         self._ctx_hint_label = self._make_label(
             ctx_hint, x=_INNER_L + 172, y=y + 3, w=240, h=16,
             size=9, color=NSColor.tertiaryLabelColor())
         cv.addSubview_(self._ctx_hint_label)
         y -= 4
 
-        # ── Download Source (auto = HF → mirror → ModelScope) ──
-        # Ships with sane defaults; we only expose the dropdown so users
-        # behind aggressive firewalls can pin ModelScope and skip the
-        # discovery latency on the first download.
-        y -= 24
-        cv.addSubview_(self._make_label("Source", x=_INNER_L, y=y + 2, w=54, h=20,
-                                         size=11, color=NSColor.tertiaryLabelColor()))
-        self._download_source_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(_INNER_L + 56, y, 200, 22), False)
-        for _key, label in DOWNLOAD_SOURCE_CHOICES:
-            self._download_source_popup.addItemWithTitle_(label)
-        try:
-            from server.model_hub import load_comni_config
-            cur_src = load_comni_config().get("download_source", "auto")
-            keys = [k for (k, _) in DOWNLOAD_SOURCE_CHOICES]
-            self._download_source_popup.selectItemAtIndex_(
-                keys.index(cur_src) if cur_src in keys else 0)
-        except Exception:
-            self._download_source_popup.selectItemAtIndex_(0)
-        self._download_source_popup.setTarget_(self)
-        self._download_source_popup.setAction_(b"onDownloadSourceChanged:")
-        self._download_source_popup.setFont_(NSFont.systemFontOfSize_(11))
-        cv.addSubview_(self._download_source_popup)
-
-        self._download_source_hint_label = self._make_label(
-            "auto: HF → Mirror → ModelScope",
-            x=_INNER_L + 262, y=y + 3, w=240, h=16,
-            size=9, color=NSColor.tertiaryLabelColor())
-        cv.addSubview_(self._download_source_hint_label)
-        y -= 4
+        # NOTE: download_source picker used to live here. It moved into the
+        # Model Manager window so it sits next to the Download buttons it
+        # actually controls. The "auto" default already chains
+        # HF → Mirror → ModelScope, so users behind firewalls don't lose
+        # anything by the picker being one click further away.
 
         # ── Log Section ──
         log_hdr_y = y - 22
@@ -1114,6 +1129,37 @@ class AppDelegate(NSObject):
         cv.addSubview_(self._make_label("Available Models", x=pad, y=y, w=300, h=22,
                                          size=16, bold=True))
         y -= 8
+
+        # ── Download source picker ──
+        # Moved here from the main window: this selector only affects the
+        # Download buttons in the cards below, so co-locating them keeps
+        # scope obvious. Persisted via ~/.comni/config.json so the choice
+        # carries over to the next session and to the Windows build.
+        y -= 26
+        cv.addSubview_(self._make_label(
+            "Download from", x=pad, y=y + 2, w=110, h=20,
+            size=11, color=NSColor.secondaryLabelColor()))
+        self._download_source_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(pad + 110, y, 200, 22), False)
+        for _key, label in DOWNLOAD_SOURCE_CHOICES:
+            self._download_source_popup.addItemWithTitle_(label)
+        try:
+            from server.model_hub import load_comni_config
+            cur_src = load_comni_config().get("download_source", "auto")
+            keys = [k for (k, _) in DOWNLOAD_SOURCE_CHOICES]
+            self._download_source_popup.selectItemAtIndex_(
+                keys.index(cur_src) if cur_src in keys else 0)
+        except Exception:
+            self._download_source_popup.selectItemAtIndex_(0)
+        self._download_source_popup.setTarget_(self)
+        self._download_source_popup.setAction_(b"onDownloadSourceChanged:")
+        self._download_source_popup.setFont_(NSFont.systemFontOfSize_(11))
+        cv.addSubview_(self._download_source_popup)
+        cv.addSubview_(self._make_label(
+            "auto: HF → Mirror → ModelScope",
+            x=pad + 320, y=y + 3, w=240, h=16,
+            size=9, color=NSColor.tertiaryLabelColor()))
+        y -= 6
 
         try:
             from server.model_hub import list_available_models, _MODELS_HOME as mh
