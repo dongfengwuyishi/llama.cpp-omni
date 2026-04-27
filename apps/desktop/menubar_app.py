@@ -824,6 +824,12 @@ class AppDelegate(NSObject):
         y -= 30
         cv.addSubview_(self._make_label("Comni", x=0, y=y, w=WIN_W, h=28,
                                          size=22, bold=True, align=NSTextAlignmentCenter))
+        # 主窗右上角的 About 入口 —— 否则 About 只能从菜单栏状态项的下拉里点到，
+        # 用户在主窗里完全看不到。位置贴边，不抢标题视觉重心。
+        about_btn = self._make_button(
+            "About", x=WIN_W - _PAD - 64, y=y + 2, w=64, h=22,
+            action="menuAbout:")
+        cv.addSubview_(about_btn)
         y -= 20
         cv.addSubview_(self._make_label("Omni inference in C/C++",
                                          x=0, y=y, w=WIN_W, h=18, size=11.5,

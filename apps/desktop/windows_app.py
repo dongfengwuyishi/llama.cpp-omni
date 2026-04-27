@@ -1745,10 +1745,22 @@ class MainWindow(QMainWindow):
         root.setSpacing(10)
 
         # Title
+        # 标题行做成 [stretch] [Title] [stretch] [About] 的水平布局，
+        # 让 About 按钮贴右上角。否则用户只能从托盘菜单点 About，主窗看不到入口。
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.addStretch(1)
         title = QLabel("Comni")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 22px; font-weight: 600;")
-        root.addWidget(title)
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        about_btn = QPushButton("About")
+        about_btn.setFixedSize(64, 22)
+        about_btn.setStyleSheet("QPushButton { font-size: 11px; }")
+        about_btn.clicked.connect(self.on_show_about)
+        title_row.addWidget(about_btn)
+        root.addLayout(title_row)
         subtitle = QLabel("Omni inference in C/C++")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setStyleSheet("color: #888; font-size: 11px;")

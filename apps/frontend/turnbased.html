@@ -17,13 +17,20 @@
         }
         [data-tooltip]:hover::after { opacity: 1; transition-delay: 0.2s; }
 
+        html {
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+        }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Noto Sans SC', sans-serif;
             background: #f5f5f0;
             color: #2d2d2d;
-            height: 100vh;
+            min-height: 100vh;
+            min-height: 100dvh;
             display: flex;
             flex-direction: column;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
         }
 
         /* 顶部导航 */
@@ -63,6 +70,8 @@
             justify-content: center;
             padding: 40px 20px;
             gap: 32px;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
         }
         .initial-view.hidden { display: none; }
 
@@ -112,41 +121,6 @@
             color: #999;
             margin-bottom: 4px;
         }
-        /* TTS Ref Audio 控件 */
-        .tts-ref-wrap {
-            padding: 8px 10px;
-            background: #fafaf8;
-            border: 1px solid #e8e6e0;
-            border-radius: 8px;
-            font-size: 12px;
-        }
-        .tts-ref-wrap .tts-ref-header {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            margin-bottom: 6px;
-            color: #666;
-            font-weight: 500;
-        }
-        .tts-ref-wrap .tts-ref-options {
-            display: flex;
-            gap: 12px;
-            align-items: center;
-            margin-bottom: 4px;
-        }
-        .tts-ref-wrap .tts-ref-options label {
-            display: inline;
-            margin-bottom: 0;
-            cursor: pointer;
-            color: #555;
-        }
-        .tts-ref-wrap .tts-ref-hint {
-            font-size: 11px;
-            color: #aaa;
-            margin-top: 2px;
-        }
-        .tts-ref-wrap .tts-ref-hint.warning { color: #d4a017; }
-        .tts-ref-wrap .tts-ref-upload { margin-top: 6px; }
         .sc-field textarea {
             width: 100%;
             border: 1px solid #e5e5e0;
@@ -190,6 +164,7 @@
             margin: 0 auto;
             padding: 0 16px;
             overflow: hidden;
+            min-height: 0;
         }
         .chat-view.hidden { display: none; }
 
@@ -883,7 +858,7 @@
     <!-- ========== 初始视图（ChatGPT 风格） ========== -->
     <div class="initial-view" id="initialView">
         <div class="initial-title">MiniCPM-o 4.5</div>
-        <div class="initial-subtitle">Turn-based Chat</div>
+        <div class="initial-subtitle" id="initialSubtitle">Turn-based Chat</div>
 
         <!-- Preset + System 配置 -->
         <div class="system-config-card" style="padding:16px 20px;">
@@ -894,16 +869,8 @@
                     <div class="sc-field">
                         <label>System Content (text + audio, reorderable)</label>
                         <div id="sysContentEditorInit"></div>
-                    </div>
-                    <div class="sc-field">
-                        <div class="tts-ref-wrap" id="ttsRefWrapInit">
-                            <div class="tts-ref-header">TTS Ref Audio (voice cloning)</div>
-                            <div class="tts-ref-options">
-                                <label><input type="radio" name="ttsRefModeInit" value="extract" checked onchange="onTtsRefModeChange()"> Extract from System</label>
-                                <label><input type="radio" name="ttsRefModeInit" value="independent" onchange="onTtsRefModeChange()"> Independent</label>
-                            </div>
-                            <div class="tts-ref-hint" id="ttsRefHintInit"></div>
-                            <div class="tts-ref-upload" id="ttsRefUploadInit" style="display:none;"></div>
+                        <div style="margin-top:6px;font-size:11px;color:#888;line-height:1.5;">
+                            System prompt audio and text here still affect voice style. However, the current web UI cannot replace the C++ TTS cache (`prompt_cache.gguf`). For full TTS voice replacement, follow the <a href="https://github.com/OpenSQZ/MiniCPM-V-CookBook/blob/main/deployment/llama.cpp-omni/%E6%8D%A2%E9%9F%B3%E8%89%B2%E6%8C%87%E5%8D%97.md" target="_blank" rel="noopener">voice guide</a>.
                         </div>
                     </div>
                 </div>
@@ -971,16 +938,8 @@
                 <div class="sc-field">
                     <label>System Content</label>
                     <div id="sysContentEditorChat"></div>
-                </div>
-                <div class="sc-field">
-                    <div class="tts-ref-wrap" id="ttsRefWrapChat">
-                        <div class="tts-ref-header">TTS Ref Audio</div>
-                        <div class="tts-ref-options">
-                            <label><input type="radio" name="ttsRefModeChat" value="extract" checked onchange="onTtsRefModeChange()"> Extract from System</label>
-                            <label><input type="radio" name="ttsRefModeChat" value="independent" onchange="onTtsRefModeChange()"> Independent</label>
-                        </div>
-                        <div class="tts-ref-hint" id="ttsRefHintChat"></div>
-                        <div class="tts-ref-upload" id="ttsRefUploadChat" style="display:none;"></div>
+                    <div style="margin-top:6px;font-size:11px;color:#888;line-height:1.5;">
+                        System prompt audio and text here still affect voice style. However, the current web UI cannot replace the C++ TTS cache (`prompt_cache.gguf`). For full TTS voice replacement, follow the <a href="https://github.com/OpenSQZ/MiniCPM-V-CookBook/blob/main/deployment/llama.cpp-omni/%E6%8D%A2%E9%9F%B3%E8%89%B2%E6%8C%87%E5%8D%97.md" target="_blank" rel="noopener">voice guide</a>.
                     </div>
                 </div>
             </div>
@@ -1048,6 +1007,7 @@
         </div>
     </div>
 
+<script src="/static/shared/i18n.js"></script>
 <script src="/static/ref-audio-player.js"></script>
 <script src="/static/shared/preset-selector.js"></script>
 <script src="/static/system-content-editor.js"></script>
@@ -1075,11 +1035,6 @@ const state = {
     composeEditorChat: null, // UserContentEditor 实例（对话视图）
     currentView: 'initial', // 'initial' | 'conversation'
     editingIndex: -1,   // 正在编辑的消息索引
-    // TTS Ref Audio（独立于系统 prompt 中的 LLM ref audio）
-    ttsRefAudioMode: 'extract',     // 'extract' | 'independent'
-    ttsRefAudioData: null,          // 独立上传时的 base64 数据
-    ttsRefAudioName: '',            // 独立上传时的文件名
-    ttsRefAudioDuration: 0,         // 独立上传时的时长
 };
 
 const API_BASE = window.location.origin;
@@ -1092,11 +1047,11 @@ function init() {
     // 创建 Compose Editor（初始视图 + 对话视图）— compose 模式融入外层容器
     state.composeEditorInit = new UserContentEditor(
         document.getElementById('composeEditorInit'),
-        { placeholder: 'Type or press Space to record...', onSubmit: () => sendFirstMessage(), compose: true, showImageBtn: false }
+        { placeholder: (window.I18n?.t?.typeOrRecord || 'Type or press Space to record...'), onSubmit: () => sendFirstMessage(), compose: true, showImageBtn: false }
     );
     state.composeEditorChat = new UserContentEditor(
         document.getElementById('composeEditorChat'),
-        { placeholder: 'Type or press Space to record...', onSubmit: () => sendMessage(), compose: true, showImageBtn: false }
+        { placeholder: (window.I18n?.t?.typeOrRecord || 'Type or press Space to record...'), onSubmit: () => sendMessage(), compose: true, showImageBtn: false }
     );
 
     // 默认让 chat compose editor 成为 Space 键目标
@@ -1244,14 +1199,12 @@ function initSystemContentEditors() {
         if (_sceChat) _sceChat.setItems(items);
         state.requestId = 'req_' + Date.now();
         updateSysConfigBarSummary();
-        updateTtsRefHints();  // 系统内容变更时更新 TTS 提取验证
     };
     const onChangeFromChat = (items) => {
         state.systemContentList = items;
         if (_sceInit) _sceInit.setItems(items);
         state.requestId = 'req_' + Date.now();
         updateSysConfigBarSummary();
-        updateTtsRefHints();
     };
 
     _sceInit = new SystemContentEditor(document.getElementById('sysContentEditorInit'), {
@@ -1264,9 +1217,6 @@ function initSystemContentEditors() {
     // 设置默认内容
     _sceInit.setItems(state.systemContentList);
     _sceChat.setItems(state.systemContentList);
-
-    // 初始化 TTS Ref Audio 独立上传控件
-    initTtsRefAudioControls();
 
     // 加载默认 ref audio 并填充到 audio items
     fetchDefaultRefAudio();
@@ -1293,7 +1243,6 @@ function _applyTurnbasedPreset(preset, { audioLoaded } = {}) {
     if (_sceChat) _sceChat.setItems(items);
     state.requestId = 'req_' + Date.now();
     updateSysConfigBarSummary();
-    updateTtsRefHints();
 }
 
 let _presetInit = null, _presetChat = null;
@@ -1342,7 +1291,6 @@ async function fetchDefaultRefAudio() {
         if (_sceInit) _sceInit.setItems(state.systemContentList);
         if (_sceChat) _sceChat.setItems(state.systemContentList);
         updateSysConfigBarSummary();
-        updateTtsRefHints();  // 默认 ref audio 加载后更新 TTS 提取验证
         console.log(`Default ref audio loaded: ${data.name} (${data.duration}s)`);
     } catch (e) {
         console.warn('Failed to load default ref audio:', e);
@@ -1354,9 +1302,10 @@ async function checkServiceStatus() {
         const resp = await fetch(`${API_BASE}/status`);
         const data = await resp.json();
         const el = document.getElementById('serviceStatus');
-        let text = `Workers: ${data.idle_workers}/${data.total_workers} idle`;
+        const _t = window.I18n?.t || {};
+        let text = `${_t.workers || 'Workers'}: ${data.idle_workers}/${data.total_workers} ${_t.idle || 'idle'}`;
         if (data.queue_length > 0) {
-            text += ` | Queue: ${data.queue_length}`;
+            text += ` | ${_t.queue || 'Queue'}: ${data.queue_length}`;
         }
         el.textContent = text;
         el.className = 'status ' + (data.idle_workers > 0 ? 'online' : 'offline');
@@ -1373,7 +1322,7 @@ async function checkServiceStatus() {
         }
     } catch (e) {
         const el = document.getElementById('serviceStatus');
-        el.textContent = 'Offline';
+        el.textContent = window.I18n?.t?.offline || 'Offline';
         el.className = 'status offline';
     }
 }
@@ -1425,13 +1374,20 @@ function queueCountdownStop(msg) {
 }
 function _countdownRender() {
     const { remaining, position, queueLength } = _countdownTimer;
-    const posStr = position != null && queueLength != null
-        ? `${position}/${queueLength}, ` : (queueLength != null ? `${queueLength} in queue, ` : '');
+    const _t = window.I18n?.t || {};
+    const posLabel = position != null && queueLength != null
+        ? `${position}/${queueLength}` : (queueLength != null ? `${queueLength}` : '');
     if (remaining > 0) {
-        updateLastAssistantMessage(`Queued ${posStr}~${remaining}s remaining`, 'queue');
+        const msg = typeof _t.queued === 'function'
+            ? _t.queued(posLabel, remaining)
+            : `Queued ${posLabel}${posLabel ? ', ' : ''}~${remaining}s remaining`;
+        updateLastAssistantMessage(msg, 'queue');
     } else {
         const overtime = Math.abs(remaining);
-        updateLastAssistantMessage(`Queued ${posStr}worker busy, overtime +${overtime}s`, 'queue');
+        const msg = typeof _t.queuedOvertime === 'function'
+            ? _t.queuedOvertime(posLabel, overtime)
+            : `Queued ${posLabel}${posLabel ? ', ' : ''}worker busy, overtime +${overtime}s`;
+        updateLastAssistantMessage(msg, 'queue');
     }
 }
 
@@ -1454,7 +1410,7 @@ function switchToConversation() {
 
 function updateSysConfigBarSummary() {
     const el = document.getElementById('sysConfigBarSummary');
-    const parts = ['System Settings'];
+    const parts = [window.I18n?.t?.systemSettings || 'System Settings'];
     const texts = state.systemContentList.filter(i => i.type === 'text' && i.text).length;
     const audios = state.systemContentList.filter(i => i.type === 'audio' && i.data).length;
     const images = state.systemContentList.filter(i => i.type === 'image' && i.data).length;
@@ -1648,7 +1604,7 @@ function addMessageUI(role, content, meta = '', audioAttachments = [], msgIndex 
         // Edit 按钮（铅笔 icon）
         const editBtn = document.createElement('button');
         editBtn.className = 'msg-action-btn';
-        editBtn.title = 'Edit';
+        editBtn.title = window.I18n?.t?.edit || 'Edit';
         editBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>';
         editBtn.addEventListener('click', () => startEditMessage(msgIndex));
         actionsCol.appendChild(editBtn);
@@ -1656,7 +1612,7 @@ function addMessageUI(role, content, meta = '', audioAttachments = [], msgIndex 
         // Resend 按钮（回退箭头 icon）
         const resendBtn = document.createElement('button');
         resendBtn.className = 'msg-action-btn resend-btn';
-        resendBtn.title = 'Resend from here';
+        resendBtn.title = window.I18n?.t?.resendFromHere || 'Resend from here';
         resendBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>';
         resendBtn.addEventListener('click', () => resendFromMessage(msgIndex));
         actionsCol.appendChild(resendBtn);
@@ -1767,8 +1723,8 @@ function updateLastAssistantMeta(opts) {
     // === Line 1: [mode] Total ===
     const line1 = document.createElement('div');
     line1.className = 'meta-line';
-    let l1Parts = [label('Total', fmt(opts.totalMs))];
-    if (opts.stopped) l1Parts.push(`<span class="meta-value" style="color:#e67700;">[stopped]</span>`);
+    let l1Parts = [label(window.I18n?.t?.total || 'Total', fmt(opts.totalMs))];
+    if (opts.stopped) l1Parts.push(`<span class="meta-value" style="color:#e67700;">${window.I18n?.t?.stopped || '[stopped]'}</span>`);
     line1.innerHTML = `<span class="meta-value" style="color:#aaa;">[${modeBadge}]</span> ${l1Parts.join(sep)}`;
     metaEl.appendChild(line1);
 
@@ -1823,12 +1779,12 @@ function updateLastAssistantMeta(opts) {
         const rid = document.createElement('span');
         rid.className = 'meta-rid';
         rid.textContent = opts.requestId;
-        rid.title = `Click to copy: ${opts.requestId}`;
+        rid.title = (window.I18n?.t?.clickToCopy || 'Click to copy: ') + opts.requestId;
         rid.addEventListener('click', () => {
             navigator.clipboard.writeText(opts.requestId).then(() => {
                 rid.classList.add('copied');
                 const orig = rid.textContent;
-                rid.textContent = 'Copied!';
+                rid.textContent = window.I18n?.t?.copied || 'Copied!';
                 setTimeout(() => { rid.textContent = orig; rid.classList.remove('copied'); }, 1200);
             });
         });
@@ -1912,9 +1868,9 @@ function updateCancelStopButton() {
     const btn = document.getElementById('btnCancelStop');
     if (!btn) return;
     if (state.generationPhase === 'generating') {
-        btn.textContent = '■ Stop';
+        btn.textContent = '■ ' + (window.I18n?.t?.stop_ || 'Stop');
     } else {
-        btn.textContent = '✕ Cancel';
+        btn.textContent = window.I18n?.t?.cancelGeneration || '✕ Cancel';
     }
 }
 
@@ -2193,10 +2149,6 @@ function buildRequestMessages() {
     return msgs;
 }
 
-// ============ TTS Ref Audio 管理 ============
-
-let _ttsRapInit = null, _ttsRapChat = null;
-
 /**
  * 验证是否可以从系统轮提取 TTS ref audio。
  * 条件：恰好 1 个有数据的 audio item 且时长 < 20s。
@@ -2219,85 +2171,8 @@ function canExtractTtsRefFromSystem() {
 
 /** 获取当前 TTS ref audio base64 数据 */
 function getTtsRefAudioBase64() {
-    if (state.ttsRefAudioMode === 'extract') {
-        const result = canExtractTtsRefFromSystem();
-        return result.ok ? result.data : null;
-    }
-    return state.ttsRefAudioData;
-}
-
-/** 更新两个视图的 TTS 提取验证提示 */
-function updateTtsRefHints() {
     const result = canExtractTtsRefFromSystem();
-    for (const suffix of ['Init', 'Chat']) {
-        const hintEl = document.getElementById('ttsRefHint' + suffix);
-        if (!hintEl) continue;
-        if (state.ttsRefAudioMode === 'extract') {
-            if (result.ok) {
-                hintEl.textContent = 'Will use the audio from System Content';
-                hintEl.className = 'tts-ref-hint';
-            } else {
-                hintEl.textContent = result.reason + ' — please upload independently';
-                hintEl.className = 'tts-ref-hint warning';
-            }
-        } else {
-            hintEl.textContent = state.ttsRefAudioData
-                ? `Independent: ${state.ttsRefAudioName || 'uploaded'}`
-                : 'Please upload a TTS reference audio';
-            hintEl.className = 'tts-ref-hint' + (state.ttsRefAudioData ? '' : ' warning');
-        }
-    }
-}
-
-/** radio 切换回调 */
-function onTtsRefModeChange() {
-    // 读取当前选中的 mode（两个 radio group 同步）
-    const initRadio = document.querySelector('input[name="ttsRefModeInit"]:checked');
-    const chatRadio = document.querySelector('input[name="ttsRefModeChat"]:checked');
-    const mode = (initRadio || chatRadio)?.value || 'extract';
-    state.ttsRefAudioMode = mode;
-
-    // 同步两组 radio
-    for (const name of ['ttsRefModeInit', 'ttsRefModeChat']) {
-        const radio = document.querySelector(`input[name="${name}"][value="${mode}"]`);
-        if (radio) radio.checked = true;
-    }
-
-    // 显示/隐藏独立上传控件
-    for (const suffix of ['Init', 'Chat']) {
-        const uploadEl = document.getElementById('ttsRefUpload' + suffix);
-        if (uploadEl) uploadEl.style.display = mode === 'independent' ? '' : 'none';
-    }
-
-    updateTtsRefHints();
-}
-
-/** 初始化 TTS Ref Audio 独立上传控件（两个 RefAudioPlayer 实例） */
-function initTtsRefAudioControls() {
-    const onUpload = (base64, name, duration) => {
-        state.ttsRefAudioData = base64;
-        state.ttsRefAudioName = name;
-        state.ttsRefAudioDuration = duration;
-        // 同步两个 player 的显示
-        if (_ttsRapInit) _ttsRapInit.setAudio(base64, name, duration);
-        if (_ttsRapChat) _ttsRapChat.setAudio(base64, name, duration);
-        updateTtsRefHints();
-    };
-    const onRemove = () => {
-        state.ttsRefAudioData = null;
-        state.ttsRefAudioName = '';
-        state.ttsRefAudioDuration = 0;
-        if (_ttsRapInit) _ttsRapInit.clear();
-        if (_ttsRapChat) _ttsRapChat.clear();
-        updateTtsRefHints();
-    };
-
-    const rapOpts = { theme: 'light', onUpload, onRemove };
-    _ttsRapInit = new RefAudioPlayer(document.getElementById('ttsRefUploadInit'), rapOpts);
-    _ttsRapChat = new RefAudioPlayer(document.getElementById('ttsRefUploadChat'), rapOpts);
-
-    // 初始验证提示
-    updateTtsRefHints();
+    return result.ok ? result.data : null;
 }
 
 // ============ 发送首条消息 ============
@@ -2932,7 +2807,7 @@ async function exportConversation() {
         if (items.length > 0) exportMessages.push({ role: msg.role, content: items });
     }
 
-    if (exportMessages.length === 0) { alert('No messages to export.'); return; }
+    if (exportMessages.length === 0) { alert(window.I18n?.t?.noMessagesToExport || 'No messages to export.'); return; }
 
     const encoded = encode({ messages: exportMessages });
     const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -3146,12 +3021,91 @@ const _saveShareUI = new SaveShareUI({ containerId: 'save-share-container', appT
 </script>
 <script type="module">
 import { initNav } from '/static/shared/app-nav.js';
+import { t } from '/static/shared/i18n-module.js';
 initNav('turnbased');
+
+// ── Page title ──
+document.title = t.turnbasedChat + ' – MiniCPM-o 4.5';
+
+// ── Header status & subtitle ──
+document.getElementById('serviceStatus').textContent = t.connecting;
+document.getElementById('initialSubtitle').textContent = t.turnbasedChat;
+
+// Language toggle is injected by app-nav.js via createLangToggle().
+
+// ── System config summaries ──
+const _scCard = document.getElementById('systemConfigCard');
+if (_scCard) { const s = _scCard.querySelector('summary'); if (s) s.textContent = t.advancedSystemSettings; }
+const _scBarSummary = document.getElementById('sysConfigBarSummary');
+if (_scBarSummary && _scBarSummary.textContent.startsWith('System Settings')) _scBarSummary.textContent = t.systemSettings;
+
+// ── System Content field labels ──
+document.querySelectorAll('.sc-field > label').forEach(lbl => {
+    const txt = lbl.textContent.trim();
+    if (txt.startsWith('System Content')) lbl.textContent = t.systemContent;
+});
+
+// ── TTS Ref Audio headers ──
+document.querySelectorAll('.tts-ref-header').forEach(el => { el.textContent = t.ttsRefAudio; });
+
+// ── TTS radio labels ──
+document.querySelectorAll('.tts-ref-options label').forEach(lbl => {
+    const radio = lbl.querySelector('input[type="radio"]');
+    if (!radio) return;
+    if (radio.value === 'extract') lbl.lastChild.textContent = ' ' + t.extractFromSystem;
+    else if (radio.value === 'independent') lbl.lastChild.textContent = ' ' + t.independent;
+});
+
+// ── Input hints (Hold Space / Enter / Drag & drop) ──
+document.querySelectorAll('.input-hints').forEach(hintsEl => {
+    const items = hintsEl.querySelectorAll('.hint-item');
+    if (items[0]) { const svg = items[0].querySelector('svg'); items[0].textContent = ''; items[0].appendChild(svg); items[0].append(' ' + t.holdSpaceToRecord); }
+    if (items[1]) { const svg = items[1].querySelector('svg'); items[1].textContent = ''; items[1].appendChild(svg); items[1].append(' ' + t.enterToSend); }
+    if (items[2]) { const svg = items[2].querySelector('svg'); items[2].textContent = ''; items[2].appendChild(svg); items[2].append(' ' + t.dragDropHint); }
+});
+
+// ── Drop overlay text ──
+document.querySelectorAll('.drag-overlay').forEach(el => { el.textContent = '📎 ' + t.dropOverlayText; });
+
+// ── Toggle labels (Streaming / Voice Response) ──
+document.querySelectorAll('.toggle-label').forEach(lbl => {
+    const txt = lbl.textContent.trim();
+    if (txt === 'Streaming') lbl.textContent = t.streaming;
+    else if (txt === 'Voice Response') lbl.textContent = t.voiceResponse;
+});
+
+// ── new tokens / len_pen labels ──
+document.querySelectorAll('.opt-group label, .input-options > label').forEach(lbl => {
+    const txt = lbl.textContent.trim();
+    if (txt === 'new tokens' || txt === 'tokens') lbl.textContent = t.newTokens;
+    else if (txt === 'len_pen') lbl.textContent = t.lenPen;
+});
+
+// ── Mic button title + Space hint ──
+document.querySelectorAll('.btn-mic').forEach(btn => {
+    btn.title = t.recordAudio;
+    const kbd = btn.querySelector('.kbd-hint');
+    if (kbd) { btn.childNodes[0].textContent = '🎤 '; }
+});
+
+// ── Export .msgpack button ──
+document.querySelectorAll('.btn-export').forEach(btn => {
+    const svg = btn.querySelector('svg');
+    if (svg) { const sh = svg.outerHTML; btn.innerHTML = sh + '\n                ' + t.exportMsgpack; }
+});
+
+// ── Generating... / Cancel ──
+const _typingSpan = document.querySelector('#typingIndicator > span');
+if (_typingSpan) _typingSpan.textContent = t.generating;
+const _cancelBtn = document.getElementById('btnCancelStop');
+if (_cancelBtn) _cancelBtn.textContent = t.cancelGeneration;
+
+// ── Compose editor placeholders (set after UCE creates the textareas) ──
+document.querySelectorAll('.uce-empty-ta').forEach(ta => { ta.placeholder = t.typeOrRecord; });
 </script>
 <script type="module">
 import { initFaqSidebar } from '/static/shared/faq-sidebar.js';
 initFaqSidebar('turnbased');
 </script>
-<!-- comni:sig:e2b7a4d5 -->
 </body>
 </html>

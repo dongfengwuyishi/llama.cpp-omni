@@ -6,6 +6,7 @@
     <title>MiniCPMO45 Omni Demo</title>
     <link rel="stylesheet" href="/static/duplex/duplex-shared.css">
     <link rel="stylesheet" href="/static/omni/omni.css">
+    <script src="/static/shared/i18n.js"></script>
 </head>
 <body>
 
@@ -165,33 +166,59 @@
     <!-- Other Config -->
     <div class="panel-config">
         <details class="config-group" open>
-            <summary>Session</summary>
+            <summary>Response Length Controls</summary>
+            <div class="cg-body">
+                <div class="cg-row" data-tip="Controls AI response length, >1 = longer responses">
+                    <div class="cg-row inline">
+                        <span class="cg-label" style="flex:none;">Length Penalty</span>
+                        <input type="number" class="cg-input-sm" id="omniLengthPenalty" value="1.1" min="0.1" max="5.0" step="0.05">
+                    </div>
+                    <div class="lp-presets" style="display:flex;flex-direction:column;gap:4px;">
+                        <div style="display:flex;align-items:center;gap:6px;">
+                            <button type="button" class="lp-preset-btn" data-lp="1.2" title="Verbose — encourages longer, detailed responses">Verbose</button>
+                            <span style="font-size:10px;color:#999;">Longer, detailed replies</span>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:6px;">
+                            <button type="button" class="lp-preset-btn active" data-lp="1.1" title="Balanced — moderate response length">Balanced</button>
+                            <span style="font-size:10px;color:#999;">Moderate length</span>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:6px;">
+                            <button type="button" class="lp-preset-btn" data-lp="1.05" title="Concise & Precise — shorter, focused replies">Concise</button>
+                            <span style="font-size:10px;color:#999;">Short, focused answers</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </details>
+        <details class="config-group" open>
+            <summary>Vision Settings</summary>
+            <div class="cg-body">
+                <div class="cg-row inline" data-tip="High-Definition vision: 1 source + 2 slices = 192 tok/frame, better for text/details, +100ms latency">
+                    <span class="cg-label" style="flex:none;">High-Definition Vision</span>
+                    <input type="checkbox" id="visionHD">
+                    <span style="font-size:10px;color:#888;" id="visionHint">64 tok</span>
+                </div>
+            </div>
+        </details>
+        <details class="config-group">
+            <summary>Other Settings</summary>
             <div class="cg-body">
                 <div class="cg-row inline" data-tip="Buffer before playback starts, higher = more stable but more latency">
                     <span class="cg-label" style="flex:none;">Delay</span>
                     <input type="number" class="cg-input-sm" id="playbackDelay" value="200" min="0" max="2000" step="50">
                     <span style="font-size:10px;color:#888;">ms</span>
                 </div>
-                <div class="cg-row inline" data-tip="Front-end soft ceiling. Should be ≤ backend ctx_size (typically 8K on the desktop build). Going higher does nothing — backend will prune first.">
+                <div class="cg-row inline" data-tip="Max KV cache size — hard limit 8192 (max training context length)">
                     <span class="cg-label" style="flex:none;">MaxKV</span>
-                    <input type="number" class="cg-input-sm" id="maxKvTokens" value="7168" min="512" max="8192" step="512">
+                    <input type="number" class="cg-input-sm" id="maxKvTokens" value="8192" min="512" max="8192" step="512">
                     <span style="font-size:10px;color:#888;">tok</span>
+                    <span style="font-size:9px;color:#b08050;">≤ 8192 (max training length)</span>
                 </div>
-                <div class="cg-row inline" data-tip="Auto-stop the session when the C++ backend prunes the KV cache (sliding window). Off by default — pruning is the normal way long chats keep going on a small ctx, not an error.">
+                <div class="cg-row inline" data-tip="Auto-stop the session when the C++ backend prunes the KV cache at a round boundary (sliding window). Useful when MaxKV is set above what the backend will actually allow, so the ceiling above never triggers.">
                     <label style="display:flex;align-items:center;gap:6px;font-size:11px;cursor:pointer;">
-                        <input type="checkbox" id="stopOnKvShrink">
+                        <input type="checkbox" id="stopOnKvShrink" checked>
                         Stop on KV pruning (sliding window)
                     </label>
-                </div>
-                <div class="cg-row inline" data-tip="Controls AI response length, >1 = longer responses">
-                    <span class="cg-label" style="flex:none;">Length Penalty</span>
-                    <input type="number" class="cg-input-sm" id="omniLengthPenalty" value="1.05" min="0.1" max="5.0" step="0.05">
-                    <span style="font-size:10px;color:#888;">&gt;1 = longer</span>
-                </div>
-                <div class="cg-row inline" data-tip="HD vision: 1 source + 2 slices = 192 tok/frame, better for text/details, +100ms latency">
-                    <span class="cg-label" style="flex:none;">Vision HD</span>
-                    <input type="checkbox" id="visionHD">
-                    <span style="font-size:10px;color:#888;" id="visionHint">64 tok</span>
                 </div>
             </div>
         </details>
@@ -209,7 +236,7 @@
                 <button class="device-refresh-btn" id="omniBtnRefreshDevices" data-tip="Refresh device list">Refresh</button>
             </div>
         </details>
-        <details class="config-group" open>
+        <details class="config-group">
             <summary>Fullscreen Subtitle</summary>
             <div class="cg-body">
                 <div class="cg-row inline">
@@ -251,16 +278,8 @@
                     <span class="cg-label">LLM Ref Audio (system prompt)</span>
                     <div id="omniRefAudioPlayer"></div>
                 </div>
-                <div class="cg-row" style="margin-top:8px;padding-top:8px;border-top:1px solid #f0ede8;">
-                    <span class="cg-label">TTS Ref Audio (voice cloning)</span>
-                    <div style="font-size:12px;">
-                        <div style="display:flex;gap:12px;align-items:center;margin-bottom:4px;">
-                            <label style="cursor:pointer;color:#555;"><input type="radio" name="omniTtsRefMode" value="extract" checked> Same as LLM</label>
-                            <label style="cursor:pointer;color:#555;"><input type="radio" name="omniTtsRefMode" value="independent"> Independent</label>
-                        </div>
-                        <div id="omniTtsRefHint" style="font-size:11px;color:#aaa;"></div>
-                        <div id="omniTtsRefUpload" style="display:none;margin-top:6px;"></div>
-                    </div>
+                <div style="font-size:11px;color:#888;line-height:1.5;">
+                    System prompt text and reference audio here still affect voice style. However, the current web UI cannot replace the C++ TTS cache (`prompt_cache.gguf`). For full TTS voice replacement, follow the <a href="https://github.com/OpenSQZ/MiniCPM-V-CookBook/blob/main/deployment/llama.cpp-omni/%E6%8D%A2%E9%9F%B3%E8%89%B2%E6%8C%87%E5%8D%97.md" target="_blank" rel="noopener">voice guide</a>.
                 </div>
             </div>
         </details>
@@ -310,12 +329,122 @@
 <script type="module" src="/static/omni/omni-app.js"></script>
 <script type="module">
 import { initNav } from '/static/shared/app-nav.js';
+import { t } from '/static/shared/i18n-module.js';
 initNav('omni');
+
+const _i18n = (sel, text) => { const el = document.querySelector(sel); if (el) el.textContent = text; };
+_i18n('#serviceStatus', t.connecting);
+_i18n('#btnResetSettings', t.resetSettings);
+_i18n('#videoPlaceholder span', t.cameraLoading);
+_i18n('#camFlipBtn', ''); document.getElementById('camFlipBtn')?.setAttribute('title', t.flipCamera);
+_i18n('#mirrorBtn', ''); document.getElementById('mirrorBtn')?.setAttribute('title', t.mirrorFlip);
+_i18n('#fullscreenBtn', ''); document.getElementById('fullscreenBtn')?.setAttribute('title', t.fullscreen);
+_i18n('#subtitleToggleBtn', ''); document.getElementById('subtitleToggleBtn')?.setAttribute('title', t.subtitlesOnOff);
+_i18n('.status-lamp .label', t.live);
+_i18n('#fsBtnForceListen', t.forceListen);
+_i18n('#fsBtnHD', t.hd);
+_i18n('#fsBtnPause', t.pause_);
+for (const btn of [document.getElementById('fsBtnStart'), document.getElementById('fsBtnStop')]) {
+    if (!btn) continue;
+    btn.childNodes.forEach(n => {
+        if (n.nodeType === 3) {
+            if (n.textContent.includes('Start')) n.textContent = t.start;
+            else if (n.textContent.includes('Stop')) n.textContent = t.stop_;
+        }
+    });
+}
+_i18n('#btnForceListen', t.forceListen);
+_i18n('#btnHD', t.hd);
+_i18n('#btnPause', t.pause_);
+_i18n('#btnStop', t.stop_);
+_i18n('#btnStart', t.start);
+
+for (const btn of document.querySelectorAll('[data-mode="live"]')) {
+    btn.childNodes.forEach(n => { if (n.nodeType === 3) n.textContent = n.textContent.replace('Live', t.liveMode); });
+}
+for (const btn of document.querySelectorAll('[data-mode="file"]')) {
+    btn.childNodes.forEach(n => { if (n.nodeType === 3) n.textContent = n.textContent.replace('File', t.fileMode); });
+}
+
+_i18n('.fo-file-btn', t.chooseVideo);
+_i18n('#fileName', t.noFile);
+
+for (const s of document.querySelectorAll('.config-group > summary')) {
+    const txt = s.textContent.trim();
+    const map = {
+        'Response Length Controls': t.responseLengthControls,
+        'Vision Settings': t.visionSettings,
+        'Other Settings': t.otherSettings,
+        'Audio Devices': t.audioDevices,
+        'Fullscreen Subtitle': t.fullscreenSubtitle,
+        'System Prompt Details': t.systemPromptDetails,
+    };
+    if (map[txt]) s.textContent = map[txt];
+}
+
+_i18n('.conv-header span', t.conversation);
+_i18n('#convEmpty span', t.startSessionToSee);
+
+document.querySelectorAll('#fileOptions .fo-group-title').forEach(el => {
+    const m = { 'Audio': t.audio, 'Video': t.video };
+    if (m[el.textContent.trim()]) el.textContent = m[el.textContent.trim()];
+});
+document.querySelectorAll('#fileOptions .fo-label').forEach(el => {
+    const m = { 'Source': t.source, 'Playback Volume': t.playbackVolume, 'Sample t': t.sampleT, 'Pad s': t.padS };
+    if (m[el.textContent.trim()]) el.textContent = m[el.textContent.trim()];
+});
+
+const _rt = (name, val, txt) => {
+    const inp = document.querySelector(`input[name="${name}"][value="${val}"]`);
+    if (inp) inp.parentElement.childNodes.forEach(n => { if (n.nodeType === 3 && n.textContent.trim()) n.textContent = ' ' + txt; });
+};
+_rt('fileAudioMode', 'video', t.videoOnly);
+_rt('fileAudioMode', 'mic', t.micOnly);
+_rt('fileAudioMode', 'mixed', t.videoMic);
+_rt('omniTtsRefMode', 'extract', t.sameAsLLM);
+_rt('omniTtsRefMode', 'independent', t.independent);
+
+_i18n('#btnMixerToggle', t.mixer);
+
+document.querySelectorAll('.cg-label').forEach(el => {
+    const m = {
+        'Length Penalty': t.lengthPenalty, 'High-Definition Vision': t.hdVision,
+        'Delay': t.delay, 'MaxKV': t.maxKV,
+        'Mic': t.mic, 'Speaker': t.speaker,
+        'Height': t.height, 'Opacity %': t.opacityPercent,
+        'LLM Ref Audio (system prompt)': t.llmRefAudio,
+        'TTS Ref Audio (voice cloning)': t.ttsRefAudio,
+    };
+    if (m[el.textContent.trim()]) el.textContent = m[el.textContent.trim()];
+});
+
+document.querySelectorAll('.lp-preset-btn').forEach(btn => {
+    const lp = btn.dataset.lp, hint = btn.nextElementSibling;
+    if (lp === '1.2') { btn.textContent = t.verbose; if (hint) hint.textContent = t.verboseHint; }
+    else if (lp === '1.1') { btn.textContent = t.balanced; if (hint) hint.textContent = t.balancedHint; }
+    else if (lp === '1.05') { btn.textContent = t.concise; if (hint) hint.textContent = t.conciseHint; }
+});
+
+const _sib = (id, txt) => { const s = document.getElementById(id)?.nextElementSibling; if (s) s.textContent = txt; };
+_sib('playbackDelay', t.ms);
+_sib('maxKvTokens', t.tok);
+const _tokN = document.getElementById('maxKvTokens')?.nextElementSibling;
+if (_tokN?.nextElementSibling) _tokN.nextElementSibling.textContent = t.maxKVHint;
+_sib('fsSubHeight', t.percentFromBottom);
+
+const _sp = document.getElementById('systemPrompt');
+if (_sp) _sp.placeholder = t.systemPromptPlaceholder;
+
+_i18n('#omniBtnRefreshDevices', t.refresh);
+_i18n('#omniWaveformPlaceholder span', t.micWaveform);
+
+const _recL = document.getElementById('recCheckbox')?.parentElement;
+if (_recL) _recL.childNodes.forEach(n => { if (n.nodeType === 3 && n.textContent.trim()) n.textContent = ' ' + t.rec; });
+_i18n('#btnDownloadRec', t.downloadRec);
 </script>
 <script type="module">
 import { initFaqSidebar } from '/static/shared/faq-sidebar.js';
 initFaqSidebar('omni');
 </script>
-<!-- comni:sig:b8e4f1a2 -->
 </body>
 </html>
