@@ -1749,7 +1749,7 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 22px; font-weight: 600;")
         root.addWidget(title)
-        subtitle = QLabel("Multimodal AI  —  Local Inference")
+        subtitle = QLabel("Omni inference in C/C++")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setStyleSheet("color: #888; font-size: 11px;")
         root.addWidget(subtitle)
@@ -1987,6 +1987,9 @@ class MainWindow(QMainWindow):
         act_show = menu.addAction("Show Window")
         act_show.triggered.connect(self._restore_window)
         menu.addSeparator()
+        act_about = menu.addAction("About Comni…")
+        act_about.triggered.connect(self.on_show_about)
+        menu.addSeparator()
         act_quit = menu.addAction("Quit")
         act_quit.triggered.connect(self._really_quit)
         self._tray.setContextMenu(menu)
@@ -2131,6 +2134,55 @@ class MainWindow(QMainWindow):
     @Slot()
     def on_open_browser(self):
         webbrowser.open(f"https://localhost:{self._gw_port}")
+
+    @Slot()
+    def on_show_about(self):
+        """About 对话框：项目链接 / 模型仓库 / 上游引擎致谢。
+
+        使用 QMessageBox + RichText，再把内部 label 的 openExternalLinks
+        打开，让 <a> 链接默认走系统浏览器（QMessageBox 默认不开）。
+        """
+        body = (
+            "<div align='center'>"
+            "<h2 style='margin:0'>Comni</h2>"
+            "<p style='color:#666; margin:4px 0'>Omni inference in C/C++</p>"
+            f"<p style='color:#999; margin:0; font-size:11px'>"
+            f"{_format_version_tag()}</p>"
+            "</div>"
+            "<hr>"
+            "<p><b>This app</b><br>"
+            "<a href='https://github.com/tc-mb/llama.cpp-omni'>"
+            "llama.cpp-omni — GitHub</a></p>"
+            "<p><b>Model — MiniCPM-o 4.5</b><br>"
+            "<a href='https://github.com/OpenBMB/MiniCPM-o'>"
+            "Project page (GitHub)</a><br>"
+            "<a href='https://huggingface.co/openbmb/MiniCPM-o-4_5-gguf'>"
+            "Weights on Hugging Face</a><br>"
+            "<a href='https://modelscope.cn/models/OpenBMB/MiniCPM-o-4_5-gguf'>"
+            "Weights on ModelScope</a></p>"
+            "<p><b>Built on</b><br>"
+            "<a href='https://github.com/ggml-org/llama.cpp'>"
+            "llama.cpp (upstream)</a></p>"
+            "<p style='color:#999; font-size:11px'>MIT License</p>"
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("About Comni")
+        box.setTextFormat(Qt.RichText)
+        box.setText(body)
+        try:
+            ic = self.windowIcon()
+            if not ic.isNull():
+                box.setIconPixmap(ic.pixmap(64, 64))
+        except Exception:
+            pass
+        box.setStandardButtons(QMessageBox.Ok)
+        # 默认 QMessageBox 不开链接 —— 把内部 label 的 openExternalLinks 打开
+        try:
+            for lbl in box.findChildren(QLabel):
+                lbl.setOpenExternalLinks(True)
+        except Exception:
+            pass
+        box.exec()
 
     @Slot()
     def on_copy_url(self):

@@ -1,6 +1,6 @@
 # llama.cpp-omni
 
-**llama.cpp-omni** is a high-performance Omni multimodal inference engine built on [llama.cpp](https://github.com/ggml-org/llama.cpp).
+**Omni inference in C/C++**, built on [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 - 🚀 **First Full-Duplex Omni Streaming Engine** — The first open-source C++ inference framework supporting full-duplex, omni-modal streaming video calls
 - ⚡ **Lightweight & Efficient** — Inherits llama.cpp's high-performance characteristics with GGUF quantization support and low memory footprint

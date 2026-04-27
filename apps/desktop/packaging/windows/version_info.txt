@@ -20,7 +20,7 @@ VSVersionInfo(
       StringTable(
         u'040904B0',
         [StringStruct(u'CompanyName', u'Comni'),
-        StringStruct(u'FileDescription', u'Comni — Multimodal AI Local Inference'),
+        StringStruct(u'FileDescription', u'Comni — Omni inference in C/C++'),
         StringStruct(u'FileVersion', u'1.0.0.0'),
         StringStruct(u'InternalName', u'Comni'),
         StringStruct(u'LegalCopyright', u'MIT License'),

@@ -798,6 +798,9 @@ class AppDelegate(NSObject):
             "Show Window", "menuShowWindow:", "w"))
         menu.addItem_(NSMenuItem.separatorItem())
         menu.addItem_(NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "About Comni…", "menuAbout:", ""))
+        menu.addItem_(NSMenuItem.separatorItem())
+        menu.addItem_(NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Quit", "menuQuit:", "q"))
         self._status_item.setMenu_(menu)
 
@@ -822,7 +825,7 @@ class AppDelegate(NSObject):
         cv.addSubview_(self._make_label("Comni", x=0, y=y, w=WIN_W, h=28,
                                          size=22, bold=True, align=NSTextAlignmentCenter))
         y -= 20
-        cv.addSubview_(self._make_label("Multimodal AI  —  Local Inference",
+        cv.addSubview_(self._make_label("Omni inference in C/C++",
                                          x=0, y=y, w=WIN_W, h=18, size=11.5,
                                          color=NSColor.secondaryLabelColor(),
                                          align=NSTextAlignmentCenter))
@@ -1989,6 +1992,129 @@ class AppDelegate(NSObject):
         except Exception:
             logger.exception("onCopyMobileURL_ failed")
 
+    # ── About Window ─────────────────────────────────────────
+    #
+    # 单独的 "About Comni" 窗口，集中展示项目相关链接：
+    #   - 本 app 的 cpp 引擎源码（llama.cpp-omni）
+    #   - 模型仓库（MiniCPM-o on GitHub / HF / ModelScope）
+    #   - 上游引擎 llama.cpp（致谢）
+    #
+    # 入口点：菜单栏下拉里的 "About Comni…"。
+    # 链接通过 setTag_(idx) + self._about_link_urls 列表查表打开，
+    # 避免每条链接写一个独立的 selector。
+
+    def _present_about_window(self):
+        """About 窗口：项目链接、模型仓库链接、致谢。复用同一窗口。"""
+        aw_w, aw_h = 380, 420
+        if getattr(self, "_about_window", None) is None:
+            rect = NSMakeRect(0, 0, aw_w, aw_h)
+            mask = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                rect, mask, NSBackingStoreBuffered, False)
+            win.setTitle_("About Comni")
+            win.setReleasedWhenClosed_(False)
+            cv = win.contentView()
+
+            # tag → URL 表。顺序就是按钮 setTag_ 的 index，
+            # onOpenAboutLink_ 用 sender.tag() 从这里查。
+            self._about_link_urls = [
+                "https://github.com/tc-mb/llama.cpp-omni",
+                "https://github.com/OpenBMB/MiniCPM-o",
+                "https://huggingface.co/openbmb/MiniCPM-o-4_5-gguf",
+                "https://modelscope.cn/models/OpenBMB/MiniCPM-o-4_5-gguf",
+                "https://github.com/ggml-org/llama.cpp",
+            ]
+
+            y = aw_h - 36
+
+            # ── Header: 名字 / slogan / 版本号 ──
+            cv.addSubview_(self._make_label(
+                "Comni", x=0, y=y, w=aw_w, h=28,
+                size=22, bold=True, align=NSTextAlignmentCenter))
+            y -= 26
+            cv.addSubview_(self._make_label(
+                "Omni inference in C/C++", x=0, y=y, w=aw_w, h=18,
+                size=11.5, color=NSColor.secondaryLabelColor(),
+                align=NSTextAlignmentCenter))
+            y -= 16
+            cv.addSubview_(self._make_label(
+                _format_version_tag(), x=0, y=y, w=aw_w, h=14,
+                size=10, color=NSColor.tertiaryLabelColor(),
+                align=NSTextAlignmentCenter))
+            y -= 18
+
+            # ── 上分割线 ──
+            sep = NSBox.alloc().initWithFrame_(NSMakeRect(20, y, aw_w - 40, 1))
+            sep.setBoxType_(2)  # NSBoxSeparator
+            cv.addSubview_(sep)
+            y -= 18
+
+            # 行布局尺寸
+            BTN_W, BTN_H = 130, 22
+            ROW_H = 26
+            SEC_GAP = 6
+
+            def _section(title, yy):
+                cv.addSubview_(self._make_label(
+                    title, x=20, y=yy, w=aw_w - 40, h=18,
+                    size=12, bold=True, color=NSColor.secondaryLabelColor()))
+                return yy - 22
+
+            def _link_row(text, btn_title, tag, yy):
+                cv.addSubview_(self._make_label(
+                    text, x=28, y=yy + 2, w=aw_w - 28 - BTN_W - 24, h=20, size=12))
+                btn = self._make_button(
+                    btn_title, x=aw_w - 20 - BTN_W, y=yy, w=BTN_W, h=BTN_H,
+                    action="onOpenAboutLink:")
+                btn.setTag_(tag)
+                cv.addSubview_(btn)
+                return yy - ROW_H
+
+            # ── 本项目 ──
+            y = _section("This app", y)
+            y = _link_row("llama.cpp-omni", "GitHub →", 0, y)
+            y -= SEC_GAP
+
+            # ── 模型 ──
+            y = _section("Model — MiniCPM-o 4.5", y)
+            y = _link_row("Project page", "GitHub →", 1, y)
+            y = _link_row("Model weights (GGUF)", "Hugging Face →", 2, y)
+            y = _link_row("Model weights (GGUF)", "ModelScope →", 3, y)
+            y -= SEC_GAP
+
+            # ── 上游引擎致谢 ──
+            y = _section("Built on", y)
+            y = _link_row("llama.cpp (upstream)", "GitHub →", 4, y)
+
+            # ── 底部 footer ──
+            sep2 = NSBox.alloc().initWithFrame_(NSMakeRect(20, 30, aw_w - 40, 1))
+            sep2.setBoxType_(2)
+            cv.addSubview_(sep2)
+            cv.addSubview_(self._make_label(
+                "MIT License",
+                x=0, y=10, w=aw_w, h=14,
+                size=10, color=NSColor.tertiaryLabelColor(),
+                align=NSTextAlignmentCenter))
+
+            win.center()
+            self._about_window = win
+
+        self._about_window.makeKeyAndOrderFront_(None)
+        try:
+            NSApp.activateIgnoringOtherApps_(True)
+        except Exception:
+            pass
+
+    @objc.typedSelector(b'v@:@')
+    def onOpenAboutLink_(self, sender):
+        try:
+            idx = sender.tag()
+            urls = getattr(self, "_about_link_urls", [])
+            if 0 <= idx < len(urls):
+                webbrowser.open(urls[idx])
+        except Exception:
+            logger.exception("onOpenAboutLink_ failed")
+
     @objc.typedSelector(b'v@:@')
     def onOpenLog_(self, sender):
         try:
@@ -2250,6 +2376,12 @@ class AppDelegate(NSObject):
     def menuShowWindow_(self, sender):
         self._window.makeKeyAndOrderFront_(None)
         NSApp.activateIgnoringOtherApps_(True)
+    @objc.typedSelector(b'v@:@')
+    def menuAbout_(self, sender):
+        try:
+            self._present_about_window()
+        except Exception:
+            logger.exception("menuAbout_ failed")
     @objc.typedSelector(b'v@:@')
     def menuQuit_(self, sender):
         logger.info("menuQuit_ — shutting down")
