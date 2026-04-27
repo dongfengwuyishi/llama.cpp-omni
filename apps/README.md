@@ -8,7 +8,7 @@
 
 1. 双击打开 `Comni-macOS-arm64-<version>.dmg`
 2. 把 `Comni.app` 拖到 `Applications`
-3. 首次启动会被 Gatekeeper 拦截：右键 → 打开 → 再次点"打开"
+3. 在 Launchpad 找到 Comni 双击启动
 
 **Windows**
 
@@ -65,6 +65,13 @@ Mac 版菜单栏 → 主窗口 → "QR" 按钮会弹出二维码，手机扫码�
 **Web UI 打不开、提示 SSL 错误** — 本地服务跑在 HTTPS 自签名证书上，浏览器会拦一次，点"高级 → 继续访问"即可。
 
 **推理很慢** — 打开主窗口的"后端"设置，确认 Vision 后端用的是 CoreML / CUDA 而不是 CPU。
+
+**macOS 提示"无法打开 / 已损坏 / 来自身份不明的开发者"** — 这是非公证版本被 Gatekeeper 拦截。任选其一：
+
+- **图形方式**：系统设置 → 隐私与安全性 → 滚到底部 → "Comni 已被阻止" → 点"仍要打开" → 输入电脑密码
+- **命令行方式（一行搞定）**：`xattr -cr /Applications/Comni.app`，然后正常双击
+
+> Sequoia (macOS 15+) 不再支持 "右键-打开" 的旧绕过方法，必须走上面两个之一。
 
 ## 反馈
 

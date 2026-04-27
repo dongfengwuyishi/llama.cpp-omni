@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Comni hardened-runtime entitlements.
+
+        Comni bundles a standalone CPython interpreter plus third-party Python
+        wheels (numpy, onnxruntime, librosa, soundfile, PyQt/PyObjC, …) whose
+        native .so/.dylib files are signed by other teams.  We therefore have
+        to disable library validation; without it python3 refuses to dlopen
+        those dependencies and the app dies on launch.
+
+        ONNX Runtime, librosa, and a few BLAS backends generate executable
+        memory at runtime, so JIT and unsigned-executable-memory must be
+        permitted as well.
+
+        Microphone / camera / network entitlements mirror the
+        NSXxxUsageDescription strings in Info.plist; they are required for
+        Gatekeeper to surface those prompts to the user.
+    -->
+
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <key>com.apple.security.device.camera</key>
+    <true/>
+
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <key>com.apple.security.network.server</key>
+    <true/>
+
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+</dict>
+</plist>
