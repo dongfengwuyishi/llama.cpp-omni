@@ -24,7 +24,13 @@ _REGISTRY_PATH = _ASSETS_DIR / "model_registry.json"
 # COMNI_MODELS env var or a "models_home" override in ~/.comni/config.json
 # takes effect without requiring callers to be restarted in a specific
 # order. See apps/server/comni_paths.py for the resolution rules.
-from comni_paths import (
+#
+# Use the `server.` prefix so this file works regardless of whether the
+# caller put `apps/` or `apps/server/` on sys.path. The desktop app only
+# adds `apps/`, which made bare `from comni_paths import ...` fail at
+# launch with ModuleNotFoundError and silently swallowed by PyObjC,
+# leaving the menubar UI half-initialized.
+from server.comni_paths import (
     comni_home as _comni_home_fn,
     models_home as _models_home_fn,
     cache_dir as _cache_dir_fn,

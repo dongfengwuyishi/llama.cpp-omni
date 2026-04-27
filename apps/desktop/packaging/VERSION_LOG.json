@@ -1,7 +1,7 @@
 {
   "_description": "Semantic version state for Comni desktop packages. Updated automatically by bump_version.py at the end of a successful build. Do not edit the 'current' map by hand unless you want to re-stamp a release.",
   "current": {
-    "macos": "1.0.6",
+    "macos": "1.0.7",
     "windows": "1.0.0"
   },
   "history": [
@@ -52,6 +52,14 @@
       "arch": "arm64",
       "built_at": "2026-04-26T05:58:21Z",
       "note": "dmg=Comni-macOS-arm64-1.0.6.dmg; sign=developer-id; notary=failed"
+    },
+    {
+      "platform": "macos",
+      "version": "1.0.7",
+      "commit": "7765da3",
+      "arch": "arm64",
+      "built_at": "2026-04-27T02:56:30Z",
+      "note": "dmg=Comni-macOS-arm64-1.0.7.dmg; sign=developer-id; notary=failed"
     }
   ]
 }
