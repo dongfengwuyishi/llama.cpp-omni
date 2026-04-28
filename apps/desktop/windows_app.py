@@ -116,6 +116,33 @@ _DESKTOP_DIR = _APPS_ROOT / "desktop"
 _CONFIG_PATH = _SERVER_DIR / "config.json"
 _CONFIG_EXAMPLE = _SERVER_DIR / "config.example.json"
 
+
+# ------------------------------------------------------------
+# Build metadata helpers — mirror of the macOS implementation in
+# menubar_app.py. Both platforms read apps/build_info.json that is
+# written by the packaging step (build_dmg.sh on macOS, the Windows
+# spec/installer on win32). In dev / source-tree mode the file is
+# absent, in which case we fall back to "dev".
+# About 对话框、菜单栏标题等都需要 _format_version_tag() —— 之前
+# windows_app.py 只调了它没定义，点 About 直接 NameError 弹不出来。
+# ------------------------------------------------------------
+def _load_build_info() -> dict:
+    path = _APPS_ROOT / "build_info.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _format_version_tag() -> str:
+    """Short human-readable version, e.g. 'v1.0.16' or 'dev'."""
+    bi = _load_build_info()
+    v = bi.get("version")
+    if isinstance(v, str) and v:
+        return f"v{v}" if not v.startswith("v") else v
+    return "dev"
+
 # Make `from server.model_hub import ...` work
 if str(_APPS_ROOT) not in sys.path:
     sys.path.insert(0, str(_APPS_ROOT))
@@ -1745,10 +1772,13 @@ class MainWindow(QMainWindow):
         root.setSpacing(10)
 
         # Title
-        # 标题行做成 [stretch] [Title] [stretch] [About] 的水平布局，
-        # 让 About 按钮贴右上角。否则用户只能从托盘菜单点 About，主窗看不到入口。
+        # 标题行：[64px spacer] [stretch] [Title] [stretch] [About 64px]
+        # 左侧加一个跟 About 按钮等宽的占位，否则 stretch 不对称、"Comni"
+        # 会被挤到偏左 ~32px。这里宁可多写一行也别让用户感觉标题歪。
+        _ABOUT_BTN_W = 64
         title_row = QHBoxLayout()
         title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.addSpacing(_ABOUT_BTN_W)
         title_row.addStretch(1)
         title = QLabel("Comni")
         title.setAlignment(Qt.AlignCenter)
@@ -1756,7 +1786,7 @@ class MainWindow(QMainWindow):
         title_row.addWidget(title)
         title_row.addStretch(1)
         about_btn = QPushButton("About")
-        about_btn.setFixedSize(64, 22)
+        about_btn.setFixedSize(_ABOUT_BTN_W, 22)
         about_btn.setStyleSheet("QPushButton { font-size: 11px; }")
         about_btn.clicked.connect(self.on_show_about)
         title_row.addWidget(about_btn)

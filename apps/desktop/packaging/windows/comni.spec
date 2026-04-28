@@ -71,6 +71,27 @@ hiddenimports += _qr_hidden
 # ------------------------------------------------------------
 datas = list(_qr_datas)
 
+# Directories whose contents must NEVER end up in the user-shipped bundle.
+# Each one was a real footgun before:
+#   * "packaging"   — build scripts + python-embed/ duplicate; left in
+#                     once and ballooned the bundle by ~440 MB raw / ~150
+#                     MB after LZMA. python-embed is already shipped
+#                     separately at resources/python-embed/.
+#   * "node_modules"— frontend build intermediates; sometimes 100s of MB
+#                     even though the produced bundle in mobile/assets/
+#                     is what we actually need.
+#   * "data" / "sessions" — SessionRecorder writes audio replays here when
+#                     the app runs from source. Recordings of dev sessions
+#                     are private + irrelevant to end users.
+#   * "tmp" / ".venv"/ "__pycache__" — usual suspects.
+_EXCLUDE_DIR_NAMES = {
+    "__pycache__", "tmp", ".venv",
+    "packaging",
+    "node_modules",
+    "data", "sessions",
+}
+
+
 # Ship the apps/ folder as resources/apps/ — needed at runtime
 def _collect_apps_folder():
     out = []
@@ -80,7 +101,14 @@ def _collect_apps_folder():
         if not src.is_dir():
             continue
         for root, dirs, files in os.walk(src):
-            dirs[:] = [d for d in dirs if d not in ("__pycache__", "tmp", ".venv")]
+            # Mutate dirs[] in place so os.walk skips excluded subtrees
+            # entirely — this is the documented way to prune the walk.
+            dirs[:] = [d for d in dirs if d not in _EXCLUDE_DIR_NAMES]
+            # Skip dev-generated session output trees like ".../tools/omni/output_19060".
+            # They get written by the running C++ server. Source tree
+            # shouldn't contain them, but a previous PyInstaller run with
+            # the bundle still hot-loaded can leave them behind.
+            dirs[:] = [d for d in dirs if not d.startswith("output_")]
             for f in files:
                 if f.endswith((".pyc", ".pyo")):
                     continue
@@ -103,6 +131,44 @@ def _collect_apps_folder():
     return out
 
 datas += _collect_apps_folder()
+
+# ------------------------------------------------------------
+# build_info.json — stamps the version into the bundle so the
+# About dialog and the macOS menubar title can show "v1.0.x".
+# Sourced from the COMNI_BUILD_VERSION env var, which build.ps1
+# sets when the user passes -Version. If unset, version is empty
+# and _format_version_tag() falls back to "dev".
+# ------------------------------------------------------------
+import json as _json
+import tempfile as _tempfile
+import datetime as _datetime
+import subprocess as _subprocess
+
+_bi_version = os.environ.get("COMNI_BUILD_VERSION", "").strip()
+_bi_commit = ""
+try:
+    _bi_commit = _subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=str(REPO_ROOT), text=True,
+        stderr=_subprocess.DEVNULL,
+    ).strip()
+except Exception:
+    pass
+_bi_payload = {
+    "version": _bi_version,
+    "build_time": _datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "build_commit": _bi_commit,
+}
+# PyInstaller copies the source file using its original basename into
+# the destination directory; the file MUST already be named
+# build_info.json on disk. Put it in its own temp subdir to avoid
+# clobbering / being clobbered by other tools using TEMP.
+_bi_dir = Path(_tempfile.mkdtemp(prefix="comni_bi_"))
+_bi_path = _bi_dir / "build_info.json"
+_bi_path.write_text(_json.dumps(_bi_payload), encoding="utf-8")
+datas.append((str(_bi_path), "resources/apps"))
+print(f"[spec] build_info.json: version={_bi_version or '(empty -> dev)'} "
+      f"commit={_bi_commit or '(none)'}")
 
 # ------------------------------------------------------------
 # Ship the embedded Python distribution prepared by
