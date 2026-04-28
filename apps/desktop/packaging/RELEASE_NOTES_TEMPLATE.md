@@ -2,12 +2,14 @@
 
 每次发新 release 都按本模板填写 release body，保持各版本格式一致。
 
+整体的版本号约定见 [`VERSIONING.md`](./VERSIONING.md)：Comni 使用单一版本号同时覆盖 macOS 与 Windows，每次 release 把同一个数字 +1。
+
 ---
 
 ## 模板
 
 ```markdown
-## Comni — macOS v{MAC_VER} + Windows v{WIN_VER}
+## Comni v{VER}
 
 **Omni inference in C/C++**, built on [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
@@ -53,13 +55,12 @@
 
 | 占位 | 含义 | 示例 |
 |------|------|------|
-| `{MAC_VER}` | 本次 macOS 版本号 | `1.0.10` |
-| `{WIN_VER}` | 本次 Windows 版本号 | `1.0.15` |
+| `{VER}` | 本次 release 的版本号；对 macOS 和 Windows 使用同一个值 | `1.0.19` |
 | `{ITEM_x}` | 用户感知到的变化，3-6 条短 bullet | `优化端侧 UI` |
 
 ## 字段约定
 
-- **H2 标题**：固定写 `## Comni — macOS v{MAC_VER} + Windows v{WIN_VER}`，包含品牌词与双平台版本号。
+- **H2 标题**：固定写 `## Comni v{VER}`，包含品牌词与版本号；不要分平台单独写两份。
 - **副标语**：固定写 `**Omni inference in C/C++**, built on [llama.cpp](...)`。与 README / About 弹窗 / 仓库 description 一致。
 - **Download 表**：表头固定 `| 平台 | 链接 |`；链接用 markdown 内联格式 `` [`文件名`](URL) ``；URL 始终指向 `releases/latest/download/<不带版本号的别名>`。
 - **What's new**：只写用户感知到的变化，3-6 条短 bullet。
@@ -68,13 +69,15 @@
 
 ## 资产命名约定
 
-每个平台同时上传两个同内容文件：
+每个平台同时上传两个同内容文件，版本号都用本次 release 的统一 `{VER}`：
 
 | 文件名 | 用途 |
 |--------|------|
-| `Comni-macOS-arm64-{MAC_VER}.dmg` | 带版本号，归档 / 历史回溯 |
+| `Comni-macOS-arm64-{VER}.dmg` | 带版本号，归档 / 历史回溯 |
 | `Comni-macOS-arm64.dmg` | 不带版本号，作为永久最新链 |
-| `Comni-Setup-{WIN_VER}-win64.exe` | 带版本号，归档 / 历史回溯 |
+| `Comni-Setup-{VER}-win64.exe` | 带版本号，归档 / 历史回溯 |
 | `Comni-Setup-win64.exe` | 不带版本号，作为永久最新链 |
 
 不带版本号的别名是公众号 / 官网外链固定地址，每次发新 release 时把它一起更新。
+
+如果某次 release 只更新了一个平台，另一平台的 `.dmg` / `.exe` 仍然以同一个 `{VER}` 重新发布；其内容（SHA-256）与上一版完全一致，仅是为了让 `releases/latest/download/...` 永远指向最新 release。

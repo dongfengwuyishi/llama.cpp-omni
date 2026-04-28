@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 """
-Shared version manager for Comni macOS/Windows packaging.
+Shared version manager for Comni packaging.
 
-State lives in apps/desktop/packaging/VERSION_LOG.json so both platforms
-write to the same log and testers can tell at a glance which build any
-installer in the wild corresponds to.
+Comni uses a single release version covering both macOS and Windows.
+State lives in apps/desktop/packaging/VERSION_LOG.json so every build
+shares one monotonically increasing number, regardless of which
+platform actually got rebuilt this round.
 
 Subcommands
 -----------
-peek <platform> [--bump {patch,minor,major}] [--set X.Y.Z]
+peek [--bump {patch,minor,major}] [--set X.Y.Z]
     Print the version the next build *would* produce.
     Does NOT modify VERSION_LOG.json. Used by the build scripts to stamp
     artifact names before the build has succeeded.
 
-record <platform> --version X.Y.Z [--commit H] [--arch A] [--note TEXT]
+record --version X.Y.Z [--commit H] [--platform P] [--arch A] [--note TEXT]
     Commit a successful build: update "current" and append a history entry.
     Called at the very end of the build scripts so failed builds do not
-    waste version numbers.
+    waste version numbers. --platform is recorded in history only; it
+    does not gate the version number.
 
-Platforms: macos | windows
 Default bump part: patch
+
+Backward-compatible note
+------------------------
+For convenience, `peek` and `record` still accept a leading positional
+platform argument (one of: macos | windows). It is recorded in history
+but does NOT shard the version sequence — every build bumps the single
+shared counter.
 """
 from __future__ import annotations
 
@@ -37,10 +45,20 @@ _PLATFORMS = ("macos", "windows")
 
 def _load(path: Path) -> dict:
     if not path.exists():
-        return {"current": {}, "history": []}
+        return {"current": _DEFAULT_VERSION, "history": []}
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    data.setdefault("current", {})
+    # Normalise legacy {"current": {"macos": ..., "windows": ...}} shape into
+    # the unified single-string form. Pick the highest seen version so the
+    # series stays monotonic across the migration.
+    cur = data.get("current")
+    if isinstance(cur, dict):
+        seen = [v for v in cur.values() if isinstance(v, str)]
+        try:
+            data["current"] = max(seen, key=_parse_version) if seen else _DEFAULT_VERSION
+        except ValueError:
+            data["current"] = _DEFAULT_VERSION
+    data.setdefault("current", _DEFAULT_VERSION)
     data.setdefault("history", [])
     return data
 
@@ -69,20 +87,17 @@ def _bump(ver: str, part: str) -> str:
     return f"{a}.{b}.{c + 1}"
 
 
-def _next_version(data: dict, platform: str, bump: str, explicit: str | None) -> str:
+def _next_version(data: dict, bump: str, explicit: str | None) -> str:
     if explicit:
         _parse_version(explicit)  # validate
         return explicit
-    current = data["current"].get(platform)
-    if current is None:
-        # First ever build on this platform: start at default, do not bump.
-        return _DEFAULT_VERSION
+    current = data.get("current") or _DEFAULT_VERSION
     return _bump(current, bump)
 
 
 def _cmd_peek(args: argparse.Namespace) -> int:
     data = _load(Path(args.log))
-    print(_next_version(data, args.platform, args.bump, args.explicit))
+    print(_next_version(data, args.bump, args.explicit))
     return 0
 
 
@@ -90,7 +105,7 @@ def _cmd_record(args: argparse.Namespace) -> int:
     _parse_version(args.version)  # validate before touching the log
     log_path = Path(args.log)
     data = _load(log_path)
-    data["current"][args.platform] = args.version
+    data["current"] = args.version
     entry = {
         "platform": args.platform,
         "version": args.version,
@@ -108,7 +123,8 @@ def _cmd_record(args: argparse.Namespace) -> int:
 
 def _cmd_show(args: argparse.Namespace) -> int:
     data = _load(Path(args.log))
-    print(json.dumps(data.get("current", {}), indent=2, ensure_ascii=False))
+    print(json.dumps({"current": data.get("current", _DEFAULT_VERSION)},
+                     indent=2, ensure_ascii=False))
     return 0
 
 
@@ -119,14 +135,17 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_peek = sub.add_parser("peek", help="Print next version, do not write.")
-    p_peek.add_argument("platform", choices=_PLATFORMS)
+    # Optional positional kept for backwards compatibility with build scripts
+    # that still pass `peek macos` / `peek windows`. Ignored for the actual
+    # version computation — the unified counter is always used.
+    p_peek.add_argument("platform", nargs="?", choices=_PLATFORMS, default=None)
     p_peek.add_argument("--bump", default="patch", choices=("patch", "minor", "major"))
     p_peek.add_argument("--set", dest="explicit", default=None,
                         help="Override the computed version with an explicit X.Y.Z.")
     p_peek.set_defaults(func=_cmd_peek)
 
     p_rec = sub.add_parser("record", help="Record a successful build.")
-    p_rec.add_argument("platform", choices=_PLATFORMS)
+    p_rec.add_argument("platform", nargs="?", choices=_PLATFORMS, default="macos")
     p_rec.add_argument("--version", required=True)
     p_rec.add_argument("--commit", default="")
     p_rec.add_argument("--arch", default="")

@@ -1075,10 +1075,15 @@ class CppBackendWorker:
         from core.schemas.chat import ChatResponse
         from core.processors.base import MiniCPMOProcessorMixin
 
+        generation = getattr(request, "generation", None)
+        length_penalty = float(getattr(generation, "length_penalty", 1.1) or 1.1)
+        sampling = _sampling_from_generation(generation)
+
         self._call_update_session_config(
             media_type=2,
             duplex_mode=False,
             voice_audio=self.ref_audio_path or "",
+            sampling=sampling,
         )
         self._reset_output_dir()
         self._round_number = 0
@@ -1098,7 +1103,11 @@ class CppBackendWorker:
 
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/decode",
-            json={"stream": True, "round_idx": self._round_number},
+            json={
+                "stream": True,
+                "round_idx": self._round_number,
+                "length_penalty": length_penalty,
+            },
             timeout=600.0,
         )
         self._round_number += 1
@@ -1121,10 +1130,12 @@ class CppBackendWorker:
                      sampling: Optional[Dict[str, Any]] = None) -> str:
         """Chat prefill — reset_context=True 时重置会话上下文
 
-        system_content: 如未提供，自动从 msgs 中的 system role 抽取 content
-        sampling: 可选，C++ 端识别的 sampling 字段（如 tts_temperature 等）
+        system_content: 如未提供，自动从 msgs 中的 system role 提取 content
         """
-        media_type = 2 if omni_mode else 1
+        # chat 路径统一走 omni 编码器（与 demo 对齐）：原来按 omni_mode 切到
+        # media_type=1 会让 C++ 不加载视觉编码器，但 chat_prefill 本身可以混
+        # text/image/audio，强制 omni 反而更稳。
+        media_type = 2
         effective_system_content = system_content
         if effective_system_content is None and msgs:
             for m in msgs:
@@ -1162,8 +1173,9 @@ class CppBackendWorker:
 
         for msg in prefill_msgs:
             content_list = msg.get("content", [])
-            if isinstance(content_list, str):
-                continue
+            # 纯文本消息会被 _convert_to_model_msgs 拍扁成裸字符串，统一包成列表，
+            # 让下面循环里的 isinstance(item, str) 分支接住，否则用户输入会被
+            # 整段丢弃，模型只看到 system prompt → 胡言乱语 / 空响应。
             if not isinstance(content_list, list):
                 content_list = [content_list]
             for item in content_list:
@@ -1172,17 +1184,15 @@ class CppBackendWorker:
                     self._call_prefill(temp_audio, "", cnt)
                     self._cleanup_temp_files(temp_audio)
                     cnt += 1
+                elif isinstance(item, str):
+                    if not item:
+                        continue
+                    self._call_prefill("", "", cnt, text=item)
+                    cnt += 1
                 elif hasattr(item, 'size'):
                     temp_img = self._save_pil_image_to_temp(item, f"chat_pf_{cnt}")
                     self._call_prefill("", temp_img, cnt, max_slice_nums or -1)
                     self._cleanup_temp_files("", temp_img)
-                    cnt += 1
-                elif isinstance(item, str):
-                    if not item:
-                        continue
-                    # turnbased 纯文本输入：C++ /v1/stream/prefill 支持 text 字段，
-                    # 不传可能导致 LLM 状态未 push 用户消息，产生乱码/空响应。
-                    self._call_prefill("", "", cnt, text=item)
                     cnt += 1
         return "prefilled"
 
