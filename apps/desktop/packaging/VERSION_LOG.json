@@ -1,6 +1,6 @@
 {
   "_description": "Semantic version state for Comni desktop packages. Updated automatically by bump_version.py at the end of a successful build. Comni uses one shared release version covering both macOS and Windows; the field is a single string and bumps monotonically regardless of which platform got rebuilt this round.",
-  "current": "1.0.19",
+  "current": "1.0.21",
   "history": [
     {
       "platform": "macos",
@@ -113,6 +113,22 @@
       "arch": "arm64",
       "built_at": "2026-04-28T11:26:39Z",
       "note": "release=v1.0.19; assets=Comni-macOS-arm64-1.0.19.dmg,Comni-Setup-1.0.19-win64.exe; sign=developer-id; notary=ok; supersedes v1.0.12 (deleted)"
+    },
+    {
+      "platform": "windows",
+      "version": "1.0.20",
+      "commit": "dc3640a",
+      "arch": "x64",
+      "built_at": "2026-04-28T16:29:13Z",
+      "note": "release=v1.0.20; assets=Comni-macOS-arm64-1.0.20.dmg,Comni-Setup-1.0.20-win64.exe; macos binary same as v1.0.19; windows binary newly built"
+    },
+    {
+      "platform": "macos",
+      "version": "1.0.21",
+      "commit": "dc3640a",
+      "arch": "arm64",
+      "built_at": "2026-04-29T05:11:29Z",
+      "note": "dmg=Comni-macOS-arm64-1.0.21.dmg; sign=developer-id; notary=ok"
     }
   ]
 }
