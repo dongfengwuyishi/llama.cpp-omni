@@ -2979,7 +2979,22 @@ def _fmt_bytes(n: int) -> str:
 
 
 # ============================================================
-# Fallback icon (used when no Comni.ico is present)
+# Icon loading
+#
+# In frozen mode the spec ships Comni.ico to _internal/resources/
+# (i.e. <_MEIPASS>/resources/Comni.ico), and Comni.png next to it as a
+# fallback. We hunt for them in this order:
+#   1. <_MEIPASS>/resources/Comni.ico        ← frozen, primary
+#   2. <_MEIPASS>/resources/Comni.png        ← frozen, PNG fallback
+#   3. <exe>/Comni.ico                       ← user dropped one next to exe
+#   4. dev-tree packaging/windows/Comni.ico  ← running from source
+#   5. dev-tree packaging/macos/Comni.png    ← running from source, PNG
+#   6. assets/Comni.ico                      ← legacy
+# Only if all of those miss do we draw the placeholder square. The
+# placeholder used to be a blue rounded box with a white "C" — it is
+# the well-known "blue square" users see when ico shipping is broken.
+# We now draw a neutral grey square so a regression is obvious instead
+# of being silently mistaken for a brand color.
 # ============================================================
 
 def _make_fallback_icon() -> QIcon:
@@ -2987,25 +3002,47 @@ def _make_fallback_icon() -> QIcon:
     pix.fill(Qt.transparent)
     p = QPainter(pix)
     p.setRenderHint(QPainter.Antialiasing)
-    p.setBrush(QBrush(QColor("#1f7fe0")))
+    p.setBrush(QBrush(QColor("#9aa0a6")))
     p.setPen(Qt.NoPen)
     p.drawRoundedRect(4, 4, 56, 56, 12, 12)
     p.setPen(QColor("white"))
     font = QFont("Segoe UI", 24, QFont.Bold)
     p.setFont(font)
-    p.drawText(pix.rect(), Qt.AlignCenter, "C")
+    p.drawText(pix.rect(), Qt.AlignCenter, "?")
     p.end()
     return QIcon(pix)
 
 
 def _load_icon() -> QIcon:
-    for candidate in [
+    meipass = Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "_MEIPASS", "") else None
+    exe_dir = Path(sys.executable).resolve().parent
+
+    candidates: list[Path] = []
+    if meipass is not None:
+        candidates += [
+            meipass / "resources" / "Comni.ico",
+            meipass / "resources" / "Comni.png",
+            meipass / "Comni.ico",
+        ]
+    candidates += [
+        exe_dir / "Comni.ico",
         _DESKTOP_DIR / "packaging" / "windows" / "Comni.ico",
-        Path(sys.executable).parent / "Comni.ico",
+        _DESKTOP_DIR / "packaging" / "macos" / "Comni.png",
         _APPS_ROOT / "assets" / "Comni.ico",
-    ]:
-        if candidate.is_file():
-            return QIcon(str(candidate))
+    ]
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                icon = QIcon(str(candidate))
+                if not icon.isNull():
+                    logger.info("loaded app icon from %s", candidate)
+                    return icon
+        except Exception:
+            continue
+
+    logger.warning("no app icon found, using grey placeholder. searched: %s",
+                   [str(c) for c in candidates])
     return _make_fallback_icon()
 
 

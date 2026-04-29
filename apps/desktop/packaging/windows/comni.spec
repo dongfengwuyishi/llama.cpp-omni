@@ -44,6 +44,13 @@ if not ICON_ICO.is_file():
 else:
     icon_arg = str(ICON_ICO)
 
+# Also ship Comni.ico as a runtime resource so windows_app._load_icon()
+# can find it for the taskbar / system-tray icon. Without this, Qt has
+# no .ico to load at runtime and falls back to a placeholder (the
+# infamous "blue C square") even though Comni.exe itself has the right
+# icon embedded in its PE resources.
+ICON_PNG_SRC = APPS_ROOT / "desktop" / "packaging" / "macos" / "Comni.png"
+
 # ------------------------------------------------------------
 # Hidden imports — PySide6 plugins, QtWebEngineWidgets is NOT used
 # ------------------------------------------------------------
@@ -70,6 +77,13 @@ hiddenimports += _qr_hidden
 # so windows_app.py's path-resolution logic finds it.
 # ------------------------------------------------------------
 datas = list(_qr_datas)
+
+# Ship Comni.ico (and the source PNG as a fallback) into resources/ so
+# windows_app._load_icon() finds them in frozen mode.
+if ICON_ICO.is_file():
+    datas.append((str(ICON_ICO), "resources"))
+if ICON_PNG_SRC.is_file():
+    datas.append((str(ICON_PNG_SRC), "resources"))
 
 # Directories whose contents must NEVER end up in the user-shipped bundle.
 # Each one was a real footgun before:
@@ -310,13 +324,42 @@ def _keep(binary_entry):
     for prefix in _dup_prefixes:
         if name.startswith(prefix):
             return False
+    # Strip OpenSSL DLLs that came from python-embed and got auto-promoted
+    # to _internal/ root by PyInstaller. The main Comni.exe Python process
+    # is a conda build whose _ssl.pyd / _hashlib.pyd / cryptography._rust
+    # all link against the "-x64" suffixed libssl-3-x64.dll / libcrypto-3-x64.dll.
+    # The non-suffixed libssl-3.dll / libcrypto-3.dll only belong to the
+    # python.org-style embedded distribution and must stay isolated under
+    # resources/python-embed/. If both are present in _internal/ root, the
+    # second one can get pulled in via DLL search order and crash with
+    #   "OPENSSL_Uplink(...): no OPENSSL_Applink"
+    # the moment any TLS handshake fires (e.g. huggingface_hub download).
+    if name in ("libssl-3.dll", "libcrypto-3.dll"):
+        return False
     return True
 
 before = len(a.binaries)
 a.binaries = [b for b in a.binaries if _keep(b)]
 after = len(a.binaries)
-print(f"[spec] Stripped {before - after} auto-collected CUDA/llama DLL "
-      f"duplicates from _internal/")
+print(f"[spec] Stripped {before - after} auto-collected CUDA/llama/OpenSSL "
+      f"DLL duplicates from _internal/")
+
+# Same guard for a.datas: any libssl/libcrypto whose dest is "_internal/" root
+# (dest path doesn't start with "resources/") is the smoking gun for the
+# OpenSSL Uplink crash. Keep them only when shipped under resources/.
+def _keep_data(data_entry):
+    dest = data_entry[0].replace("\\", "/").lower()
+    name = os.path.basename(dest)
+    if name in ("libssl-3.dll", "libcrypto-3.dll") and not dest.startswith("resources/"):
+        return False
+    return True
+
+before_d = len(a.datas)
+a.datas = [d for d in a.datas if _keep_data(d)]
+after_d = len(a.datas)
+if before_d != after_d:
+    print(f"[spec] Stripped {before_d - after_d} stray OpenSSL DLLs from "
+          f"_internal/ root (must only live under resources/python-embed/)")
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
