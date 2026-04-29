@@ -1148,6 +1148,7 @@ class AppDelegate(NSObject):
         cv.addSubview_(self._make_label(
             "Download from", x=pad, y=y + 2, w=110, h=20,
             size=11, color=NSColor.secondaryLabelColor()))
+        from AppKit import NSPopUpButton
         self._download_source_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
             NSMakeRect(pad + 110, y, 200, 22), False)
         for _key, label in DOWNLOAD_SOURCE_CHOICES:
