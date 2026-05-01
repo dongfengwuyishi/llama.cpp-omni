@@ -94,6 +94,27 @@ endif()
 target_link_libraries  (${TARGET} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+# 单工模式 - 纯音频测试（批量 prefill + 单次 decode）
+set(TARGET_SINGLE_TEST_AUDIO llama-omni-single-test-audio)
+add_executable         (${TARGET_SINGLE_TEST_AUDIO} test/single_test_audio.cpp)
+set_target_properties  (${TARGET_SINGLE_TEST_AUDIO} PROPERTIES OUTPUT_NAME llama-omni-single-test-audio)
+target_link_libraries  (${TARGET_SINGLE_TEST_AUDIO} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_SINGLE_TEST_AUDIO} PRIVATE cxx_std_17)
+
+# 单工模式 - Omni (audio+vision) 测试
+set(TARGET_SINGLE_TEST_OMNI llama-omni-single-test-omni)
+add_executable         (${TARGET_SINGLE_TEST_OMNI} test/single_test_omni.cpp)
+set_target_properties  (${TARGET_SINGLE_TEST_OMNI} PROPERTIES OUTPUT_NAME llama-omni-single-test-omni)
+target_link_libraries  (${TARGET_SINGLE_TEST_OMNI} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_SINGLE_TEST_OMNI} PRIVATE cxx_std_17)
+
+# 双工模式测试
+set(TARGET_DUPLEX_TEST llama-omni-test-duplex)
+add_executable         (${TARGET_DUPLEX_TEST} test/test-duplex.cpp)
+set_target_properties  (${TARGET_DUPLEX_TEST} PROPERTIES OUTPUT_NAME llama-omni-test-duplex)
+target_link_libraries  (${TARGET_DUPLEX_TEST} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
+
 # # Token2Wav 测试程序 - 完整 C++ 语音合成
 # add_executable(token2wav-example token2wav/token2wav-example.cpp)
 # target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
