@@ -15,8 +15,10 @@
 import os
 import sys
 import json
+import re
 import time
 import socket
+import signal
 import subprocess
 import webbrowser
 import threading
@@ -270,6 +272,105 @@ def find_llama_server() -> Optional[str]:
         if c.exists():
             return str(c)
     return None
+
+
+def get_cpp_server_port_from_config() -> int:
+    default_port = 19060
+    if _CONFIG_PATH.exists():
+        try:
+            with open(_CONFIG_PATH, encoding="utf-8") as f:
+                port = json.load(f).get("cpp_backend", {}).get("cpp_server_port")
+            if isinstance(port, int) and port > 0:
+                return port
+        except Exception:
+            pass
+    return default_port
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def cleanup_residual_llama_server_processes() -> int:
+    """Best-effort cleanup for bundled llama-server processes left behind.
+
+    On macOS, the menu-bar app only owns gateway.py / worker.py directly. If
+    worker.py gets force-killed before FastAPI lifespan shutdown runs, the
+    standalone llama-server subprocess can survive as an orphan and keep the
+    model mmap resident. Sweep by exact bundled binary path plus the configured
+    C++ server port so we only touch this app's own inference backend.
+    """
+    server_bin = find_llama_server()
+    if not server_bin:
+        return 0
+
+    target_port = get_cpp_server_port_from_config()
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "pid=,command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except Exception as e:
+        logger.debug(f"ps scan for residual llama-server failed: {e}")
+        return 0
+
+    port_re = re.compile(r"(?:^|\s)--port(?:=|\s+)(\d+)\b")
+    pids: List[int] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_str, _, cmd = line.partition(" ")
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if server_bin not in cmd:
+            continue
+        m = port_re.search(cmd)
+        if m and int(m.group(1)) != target_port:
+            continue
+        pids.append(pid)
+
+    pids = sorted(set(pids))
+    if not pids:
+        return 0
+
+    logger.warning(
+        "Cleaning up residual llama-server process(es) on port %s: %s",
+        target_port, pids,
+    )
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.debug(f"SIGTERM pid={pid} failed: {e}")
+
+    deadline = time.time() + 3.0
+    remaining = pids
+    while remaining and time.time() < deadline:
+        time.sleep(0.1)
+        remaining = [pid for pid in remaining if _pid_is_alive(pid)]
+
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.debug(f"SIGKILL pid={pid} failed: {e}")
+
+    return len(pids)
 
 
 def get_model_dir_from_config() -> Optional[str]:
@@ -1552,6 +1653,11 @@ class AppDelegate(NSObject):
     def _do_start(self):
         try:
             logger.info("_do_start worker=%s gateway=%s", self._worker_port, self._port)
+            n_cleaned = cleanup_residual_llama_server_processes()
+            if n_cleaned:
+                self._append_log(
+                    f"Cleaned up {n_cleaned} residual llama-server process(es) from a previous run.\n"
+                )
             if _LOG_PATH.exists():
                 _LOG_PATH.write_text("")
             self._log_file = open(_LOG_PATH, "a", encoding="utf-8")
@@ -1783,6 +1889,9 @@ class AppDelegate(NSObject):
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+        n_cleaned = cleanup_residual_llama_server_processes()
+        if n_cleaned:
+            self._append_log(f"  Cleaned up {n_cleaned} residual llama-server process(es).\n")
         self._worker_proc = None
         self._gateway_proc = None
         if self._log_file:
