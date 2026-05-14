@@ -424,6 +424,8 @@ class CppBackendWorker:
         self._cpp_server_port = cpp_server_port or (19060 + gpu_id)
         self._cpp_server_url = f"http://127.0.0.1:{self._cpp_server_port}"
         self._cpp_process: Optional[subprocess.Popen] = None
+        self._cpp_server_bin: Optional[str] = None
+        self._cpp_process_started_at: Optional[float] = None
         # Windows Job Object (kill-on-close) — 所有 llama-server 子进程都
         # assign 到它. worker 进程一旦退出, HANDLE 随之 close, OS 会杀光
         # Job 内一切还活着的进程, 不会留下孤儿 llama-server.exe.
@@ -731,6 +733,43 @@ class CppBackendWorker:
         except Exception:
             return False
 
+    def get_cpp_runtime_info(self) -> Dict[str, Any]:
+        """Return ownership metadata for the current llama-server instance."""
+        proc = self._cpp_process
+        if proc is None or proc.poll() is not None:
+            return {
+                "active": False,
+                "pid": None,
+                "pgid": None,
+                "sid": None,
+                "port": self._cpp_server_port,
+                "binary_path": self._cpp_server_bin,
+                "started_at": self._cpp_process_started_at,
+            }
+
+        pid = proc.pid
+        pgid = None
+        sid = None
+        if not _IS_WIN:
+            try:
+                pgid = os.getpgid(pid)
+            except Exception:
+                pass
+            try:
+                sid = os.getsid(pid)
+            except Exception:
+                pass
+
+        return {
+            "active": True,
+            "pid": pid,
+            "pgid": pgid,
+            "sid": sid,
+            "port": self._cpp_server_port,
+            "binary_path": self._cpp_server_bin,
+            "started_at": self._cpp_process_started_at,
+        }
+
     def _stop_cpp_server(self) -> None:
         if self._cpp_process is None:
             return
@@ -781,6 +820,7 @@ class CppBackendWorker:
             logger.warning(f"_stop_cpp_server: {e}")
         finally:
             self._cpp_process = None
+            self._cpp_process_started_at = None
             # Defensive: 万一进程树里还有漏网的 (比如 Job 不生效的环境),
             # 按端口再扫一遍.
             try:
@@ -1301,6 +1341,7 @@ class CppBackendWorker:
                 logger.debug("VRAM probe raised; ignoring", exc_info=True)
 
         logger.info(f"Starting C++ server: {' '.join(cmd)}")
+        self._cpp_server_bin = server_bin
 
         popen_kwargs: Dict[str, Any] = dict(
             env=env, cwd=self.llamacpp_root,
@@ -1316,6 +1357,7 @@ class CppBackendWorker:
             popen_kwargs["start_new_session"] = True
 
         self._cpp_process = subprocess.Popen(cmd, **popen_kwargs)
+        self._cpp_process_started_at = time.time()
 
         # Windows: 把 llama-server 加入 kill-on-close Job Object.
         # worker 进程死了 (正常退出 / TerminateProcess / 崩溃) 都会关闭 HANDLE,
