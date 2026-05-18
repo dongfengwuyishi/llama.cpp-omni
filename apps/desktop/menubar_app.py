@@ -319,7 +319,7 @@ def fetch_worker_cpp_runtime_info(worker_port: int) -> Optional[dict]:
 def _read_process_snapshot(pid: int) -> Optional[dict]:
     try:
         out = subprocess.check_output(
-            ["ps", "-p", str(pid), "-o", "pid=,pgid=,command="],
+            ["ps", "-ww", "-p", str(pid), "-o", "pid=,pgid=,command="],
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=2,
@@ -415,7 +415,7 @@ def cleanup_residual_llama_server_processes() -> int:
     target_port = get_cpp_server_port_from_config()
     try:
         out = subprocess.check_output(
-            ["ps", "-axo", "pid=,command="],
+            ["ps", "-axww", "-o", "pid=,command="],
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=3,
