@@ -128,6 +128,17 @@ class WorkerHealthResponse(BaseModel):
     kv_cache_length: int = 0  # 当前 LLM KV cache token 总数
 
 
+class CppRuntimeInfoResponse(BaseModel):
+    """Current owned llama-server runtime, if this worker uses the C++ backend."""
+    active: bool
+    pid: Optional[int] = None
+    pgid: Optional[int] = None
+    sid: Optional[int] = None
+    port: Optional[int] = None
+    binary_path: Optional[str] = None
+    started_at: Optional[float] = None
+
+
 class StreamingWsMessage(BaseModel):
     """Streaming WebSocket 消息（Client → Server）"""
     type: str  # "prefill" | "generate" | "complete_turn" | "close"
@@ -783,6 +794,14 @@ async def health():
         avg_inference_time_ms=avg_time,
         kv_cache_length=kv_len,
     )
+
+
+@app.get("/cpp_runtime", response_model=CppRuntimeInfoResponse)
+async def cpp_runtime():
+    """Return ownership metadata for the current llama-server instance."""
+    if worker is None or not hasattr(worker, "get_cpp_runtime_info"):
+        return CppRuntimeInfoResponse(active=False)
+    return CppRuntimeInfoResponse(**worker.get_cpp_runtime_info())
 
 
 # ========== Chat API ==========

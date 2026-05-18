@@ -15,8 +15,10 @@
 import os
 import sys
 import json
+import re
 import time
 import socket
+import signal
 import subprocess
 import webbrowser
 import threading
@@ -270,6 +272,207 @@ def find_llama_server() -> Optional[str]:
         if c.exists():
             return str(c)
     return None
+
+
+def get_cpp_server_port_from_config() -> int:
+    default_port = 19060
+    if _CONFIG_PATH.exists():
+        try:
+            with open(_CONFIG_PATH, encoding="utf-8") as f:
+                port = json.load(f).get("cpp_backend", {}).get("cpp_server_port")
+            if isinstance(port, int) and port > 0:
+                return port
+        except Exception:
+            pass
+    return default_port
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _loopback_urlopen(url: str, timeout: float = 3.0):
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(url, timeout=timeout)
+
+
+def fetch_worker_cpp_runtime_info(worker_port: int) -> Optional[dict]:
+    try:
+        with _loopback_urlopen(f"http://127.0.0.1:{worker_port}/cpp_runtime", timeout=2.0) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read())
+        if isinstance(data, dict) and data.get("active") and isinstance(data.get("pid"), int):
+            return data
+    except Exception as e:
+        logger.debug(f"fetch_worker_cpp_runtime_info failed: {e}")
+    return None
+
+
+def _read_process_snapshot(pid: int) -> Optional[dict]:
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "pid=,pgid=,command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).strip()
+    except Exception:
+        return None
+    if not out:
+        return None
+    parts = out.split(None, 2)
+    if len(parts) < 3:
+        return None
+    try:
+        return {
+            "pid": int(parts[0]),
+            "pgid": int(parts[1]),
+            "command": parts[2],
+        }
+    except ValueError:
+        return None
+
+
+def _command_matches_runtime(command: str, runtime: dict) -> bool:
+    binary_path = runtime.get("binary_path")
+    if binary_path and binary_path not in command:
+        return False
+    port = runtime.get("port")
+    if isinstance(port, int):
+        m = re.search(r"(?:^|\s)--port(?:=|\s+)(\d+)\b", command)
+        if not m or int(m.group(1)) != port:
+            return False
+    return True
+
+
+def cleanup_owned_llama_server_process(runtime: Optional[dict]) -> bool:
+    """Terminate only the llama-server instance explicitly owned by worker.py."""
+    if not runtime or not isinstance(runtime.get("pid"), int):
+        return False
+
+    pid = int(runtime["pid"])
+    snapshot = _read_process_snapshot(pid)
+    if snapshot is None or not _command_matches_runtime(snapshot["command"], runtime):
+        return False
+
+    pgid = runtime.get("pgid")
+    if not isinstance(pgid, int) or pgid <= 0:
+        pgid = snapshot.get("pgid")
+
+    logger.warning(
+        "Cleaning up owned llama-server pid=%s pgid=%s port=%s",
+        pid, pgid, runtime.get("port"),
+    )
+    try:
+        if isinstance(pgid, int) and pgid > 0:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except Exception as e:
+        logger.debug(f"owned llama-server SIGTERM failed: {e}")
+
+    deadline = time.time() + 3.0
+    while _pid_is_alive(pid) and time.time() < deadline:
+        time.sleep(0.1)
+
+    if _pid_is_alive(pid):
+        try:
+            if isinstance(pgid, int) and pgid > 0:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return True
+        except Exception as e:
+            logger.debug(f"owned llama-server SIGKILL failed: {e}")
+
+    return True
+
+
+def cleanup_residual_llama_server_processes() -> int:
+    """Best-effort cleanup for bundled llama-server processes left behind.
+
+    On macOS, the menu-bar app only owns gateway.py / worker.py directly. If
+    worker.py gets force-killed before FastAPI lifespan shutdown runs, the
+    standalone llama-server subprocess can survive as an orphan and keep the
+    model mmap resident. Sweep by exact bundled binary path plus the configured
+    C++ server port so we only touch this app's own inference backend.
+    """
+    server_bin = find_llama_server()
+    if not server_bin:
+        return 0
+
+    target_port = get_cpp_server_port_from_config()
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "pid=,command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except Exception as e:
+        logger.debug(f"ps scan for residual llama-server failed: {e}")
+        return 0
+
+    port_re = re.compile(r"(?:^|\s)--port(?:=|\s+)(\d+)\b")
+    pids: List[int] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_str, _, cmd = line.partition(" ")
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if server_bin not in cmd:
+            continue
+        m = port_re.search(cmd)
+        if m and int(m.group(1)) != target_port:
+            continue
+        pids.append(pid)
+
+    pids = sorted(set(pids))
+    if not pids:
+        return 0
+
+    logger.warning(
+        "Cleaning up residual llama-server process(es) on port %s: %s",
+        target_port, pids,
+    )
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.debug(f"SIGTERM pid={pid} failed: {e}")
+
+    deadline = time.time() + 3.0
+    remaining = pids
+    while remaining and time.time() < deadline:
+        time.sleep(0.1)
+        remaining = [pid for pid in remaining if _pid_is_alive(pid)]
+
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.debug(f"SIGKILL pid={pid} failed: {e}")
+
+    return len(pids)
 
 
 def get_model_dir_from_config() -> Optional[str]:
@@ -1552,6 +1755,11 @@ class AppDelegate(NSObject):
     def _do_start(self):
         try:
             logger.info("_do_start worker=%s gateway=%s", self._worker_port, self._port)
+            n_cleaned = cleanup_residual_llama_server_processes()
+            if n_cleaned:
+                self._append_log(
+                    f"Cleaned up {n_cleaned} residual llama-server process(es) from a previous run.\n"
+                )
             if _LOG_PATH.exists():
                 _LOG_PATH.write_text("")
             self._log_file = open(_LOG_PATH, "a", encoding="utf-8")
@@ -1644,17 +1852,13 @@ class AppDelegate(NSObject):
         # ExceptionsList 含 localhost / 127.0.0.1，Python 的 urllib 仍然会
         # 读 $HTTP_PROXY 把请求走代理。这里用 ProxyHandler({}) 强制不走
         # 任何代理，和 curl 行为对齐。
-        import urllib.request
-        # Build an opener that ignores system HTTP proxy, so loopback probes
-        # aren't intercepted by local HTTP proxies (Clash/V2Ray etc.).
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for _ in range(timeout // 2):
             try:
-                resp = opener.open(f"{url}/health", timeout=3)
-                if resp.status == 200:
-                    data = json.loads(resp.read())
-                    if data.get("model_loaded", True):
-                        return True
+                with _loopback_urlopen(f"{url}/health", timeout=3) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read())
+                        if data.get("model_loaded", True):
+                            return True
             except Exception:
                 pass
             if self._worker_proc and self._worker_proc.poll() is not None:
@@ -1775,6 +1979,9 @@ class AppDelegate(NSObject):
     def _do_stop(self):
         logger.info("_do_stop")
         self._stop_log_tail()
+        owned_runtime = None
+        if self._worker_proc and self._worker_proc.poll() is None:
+            owned_runtime = fetch_worker_cpp_runtime_info(self._worker_port)
         for name, proc in [("Gateway", self._gateway_proc), ("Worker", self._worker_proc)]:
             if proc and proc.poll() is None:
                 self._append_log(f"  Stopping {name} (pid={proc.pid})…\n")
@@ -1783,6 +1990,14 @@ class AppDelegate(NSObject):
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+        if owned_runtime and _pid_is_alive(int(owned_runtime["pid"])):
+            if cleanup_owned_llama_server_process(owned_runtime):
+                self._append_log(
+                    f"  Cleaned up owned llama-server pid={owned_runtime['pid']}.\n"
+                )
+        n_cleaned = cleanup_residual_llama_server_processes()
+        if n_cleaned:
+            self._append_log(f"  Cleaned up {n_cleaned} residual llama-server process(es).\n")
         self._worker_proc = None
         self._gateway_proc = None
         if self._log_file:
