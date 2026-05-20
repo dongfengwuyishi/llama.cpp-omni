@@ -2,7 +2,7 @@
 
 Hits the live batch_server with a sequence of progressively harder requests
 and prints a clean human-readable report. Generated audio is dropped under
-``--output-dir`` (default: ``./smoke_out``).
+``--output-dir`` (default: ``/cache/caitianchi/data/minicpm-o-server-eval/outputs/smoke/<timestamp>/``).
 
 What it does:
     1) GET  /v1/health  — sanity check
@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import datetime
 import json
 import sys
 import time
@@ -34,6 +35,10 @@ from typing import Any, Dict, Optional
 import httpx
 import numpy as np
 import soundfile as sf
+
+DEFAULT_OUTPUT_ROOT = Path(
+    "/cache/caitianchi/data/minicpm-o-server-eval/outputs/smoke"
+)
 
 # ANSI for friendlier output
 G, Y, R, B, D = "\033[32m", "\033[33m", "\033[31m", "\033[36m", "\033[0m"
@@ -294,7 +299,11 @@ async def step_concurrent_duplex(
 
 
 async def main(args):
-    out_dir = Path(args.output_dir).expanduser().resolve()
+    if args.output_dir:
+        out_dir = Path(args.output_dir).expanduser().resolve()
+    else:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        out_dir = (DEFAULT_OUTPUT_ROOT / ts).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"endpoint: {args.endpoint}")
@@ -312,6 +321,17 @@ async def main(args):
         if not args.skip_concurrent:
             await step_concurrent_duplex(client, Path(args.user_audio), out_dir)
 
+    # Refresh the "latest" symlink so users can ``cd outputs/smoke/latest``
+    # without remembering timestamps.
+    if not args.output_dir:
+        latest = DEFAULT_OUTPUT_ROOT / "latest"
+        try:
+            if latest.is_symlink() or latest.exists():
+                latest.unlink()
+            latest.symlink_to(out_dir.name)
+        except OSError:
+            pass
+
     banner("Done.")
     print(f"Generated artefacts saved under: {out_dir}")
 
@@ -324,7 +344,14 @@ def parse_args():
         default="assets/ref_audio/ref_minicpm_signature.wav",
         help="path to a 16kHz mono wav to feed /v1/duplex_offline",
     )
-    p.add_argument("--output-dir", default="smoke_out")
+    p.add_argument(
+        "--output-dir",
+        default=None,
+        help=(
+            "Where to drop generated audio. Default: a fresh timestamped subdir "
+            "under /cache/caitianchi/data/minicpm-o-server-eval/outputs/smoke/."
+        ),
+    )
     p.add_argument("--skip-concurrent", action="store_true",
                    help="skip the final 2-way concurrent step (faster)")
     return p.parse_args()

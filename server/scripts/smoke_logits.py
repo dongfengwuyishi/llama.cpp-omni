@@ -11,13 +11,16 @@ rank-of-sampled-token sanity, file size, metadata).
 
 Run with:
 
-    .venv/bin/python scripts/smoke_logits.py --output-dir /tmp/logits_test
+    .venv/bin/python scripts/smoke_logits.py
+    # default output:
+    #   /cache/caitianchi/data/minicpm-o-server-eval/outputs/logits/<timestamp>/
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import json
 import os
 import struct
@@ -28,6 +31,10 @@ from typing import Any, Dict, Tuple
 
 import httpx
 import numpy as np
+
+DEFAULT_OUTPUT_ROOT = Path(
+    "/cache/caitianchi/data/minicpm-o-server-eval/outputs/logits"
+)
 
 
 def banner(title: str) -> None:
@@ -242,7 +249,15 @@ def step_duplex_file(client: httpx.Client, out_dir: Path, audio_path: str) -> bo
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--endpoint", default="http://localhost:8080")
-    ap.add_argument("--output-dir", default="/tmp/logits_test")
+    ap.add_argument(
+        "--output-dir",
+        default=None,
+        help=(
+            "Where the server should write .safetensors. Default: a fresh "
+            "timestamped subdir under "
+            "/cache/caitianchi/data/minicpm-o-server-eval/outputs/logits/."
+        ),
+    )
     ap.add_argument(
         "--user-audio",
         default="assets/ref_audio/ref_minicpm_signature.wav",
@@ -251,7 +266,11 @@ def main():
     ap.add_argument("--skip-duplex", action="store_true")
     args = ap.parse_args()
 
-    out = Path(args.output_dir).expanduser().resolve()
+    if args.output_dir:
+        out = Path(args.output_dir).expanduser().resolve()
+    else:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        out = (DEFAULT_OUTPUT_ROOT / ts).resolve()
     out.mkdir(parents=True, exist_ok=True)
     # Wipe previous test artefacts so file-size assertions are meaningful.
     for p in out.glob("*.safetensors"):
@@ -277,6 +296,18 @@ def main():
     for name, v in results:
         print(f"  {'PASS' if v else 'FAIL'}  {name}", flush=True)
     print(f"\n{ok_count}/{len(results)} passed")
+    print(f"\nArtefacts saved under: {out}")
+
+    # Refresh the "latest" symlink for the default-output path.
+    if not args.output_dir:
+        latest = DEFAULT_OUTPUT_ROOT / "latest"
+        try:
+            if latest.is_symlink() or latest.exists():
+                latest.unlink()
+            latest.symlink_to(out.name)
+        except OSError:
+            pass
+
     sys.exit(0 if ok_count == len(results) else 1)
 
 
