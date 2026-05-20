@@ -31,6 +31,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <fstream>
 
 using json = nlohmann::ordered_json;
 
@@ -2871,10 +2872,12 @@ struct server_context {
 
         // if context shifting is disabled, make sure that we don't run out of context
         if (!params_base.ctx_shift && slot.n_past + 1 >= slot.n_ctx) {
+            slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
 
-            SLT_DBG(slot, "stopped due to running out of context, n_past = %d, n_ctx = %d\n", slot.n_past, slot.n_ctx);
+            SLT_DBG(slot, "stopped due to running out of context capacity, n_past = %d, n_prompt_tokens = %d, n_decoded = %d, n_ctx = %d\n",
+                    slot.n_decoded, slot.n_prompt_tokens(), slot.n_past, slot.n_ctx);
         }
 
         // check the limits
@@ -4594,7 +4597,8 @@ int main(int argc, char ** argv) {
 
     const auto handle_health = [&](const httplib::Request &, httplib::Response & res) {
         // error and loading states are handled by middleware
-        json health = {{"status", "ok"}};
+        json health = {{"status", "ok"}, {"engine", "comni"}};
+        res.set_header("X-Engine", "comni");
         res_ok(res, health);
     };
 
@@ -5992,6 +5996,33 @@ int main(int argc, char ** argv) {
         } else {
             // Metal (GPU) 模式：不设置 CoreML 路径
             params.vision_coreml_model_path = "";
+        }
+
+        // 在 omni_init 前校验关键文件，避免仅返回泛型 "omni_init failed"
+        {
+            auto check_model_file = [&](const char * role, const std::string & path) -> bool {
+                std::ifstream f(path, std::ios::binary);
+                if (!f.good()) {
+                    res_error(res, format_error_response(
+                        std::string("omni_init missing required model file (") + role + "): " + path,
+                        ERROR_TYPE_SERVER));
+                    return false;
+                }
+                return true;
+            };
+            if (!check_model_file("apm", params.apm_model)) {
+                return;
+            }
+            if (use_tts && !params.tts_model.empty()) {
+                if (!check_model_file("tts", params.tts_model)) {
+                    return;
+                }
+            }
+            if (media_type == 2) {
+                if (!check_model_file("vision", params.vpm_model)) {
+                    return;
+                }
+            }
         }
 
         {
