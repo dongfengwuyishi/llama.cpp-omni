@@ -99,6 +99,15 @@ from core.schemas.duplex_batch import (
     DuplexBatchResponse,
 )
 
+# Logits export (RL training)
+from core.schemas.logits import (
+    LogitsExportSpec,
+    LogitsPayload,
+    PLACEHOLDER_MODALITY,
+    PLACEHOLDER_AUDIO,
+    PLACEHOLDER_IMAGE,
+)
+
 __all__ = [
     # 通用 - 枚举
     "Role",
@@ -144,4 +153,11 @@ __all__ = [
     # 非流式双工（批量推理）
     "DuplexBatchRequest",
     "DuplexBatchResponse",
+
+    # Logits export (RL training)
+    "LogitsExportSpec",
+    "LogitsPayload",
+    "PLACEHOLDER_MODALITY",
+    "PLACEHOLDER_AUDIO",
+    "PLACEHOLDER_IMAGE",
 ]

@@ -330,11 +330,21 @@ bool prefill_with_emb(struct omni_context * ctx_omni, common_params * params, fl
             pos_vec[j] = *n_past + j;
         }
         batch.pos = pos_vec.data();
-        
+
+        // Logit capture: force LM head at every position for RL training.
+        // No-op (zero overhead) when capture is disabled.
+        omni_logit_capture_batch_handle _lc_handle;
+        omni_logit_capture_prepare_batch(ctx_omni, &batch, &_lc_handle);
+
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval\n", __func__);
             return false;
         }
+
+        omni_logit_capture_drain_batch(ctx_omni, &batch,
+                                       OMNI_LOGIT_PLACEHOLDER_MODALITY,
+                                       /*is_prefill=*/true);
+
         *n_past += n_eval;
     }
     return true;
@@ -379,6 +389,10 @@ bool prefill_emb_with_hidden(struct omni_context * ctx_omni, common_params * par
         // 启用 embeddings 输出
         llama_set_embeddings(ctx_omni->ctx_llama, true);
 
+        // Logit capture: force LM head at every position for RL training.
+        omni_logit_capture_batch_handle _lc_handle;
+        omni_logit_capture_prepare_batch(ctx_omni, &batch, &_lc_handle);
+
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval\n", __func__);
             llama_set_embeddings(ctx_omni->ctx_llama, false);
@@ -386,6 +400,10 @@ bool prefill_emb_with_hidden(struct omni_context * ctx_omni, common_params * par
             hidden_states = nullptr;
             return false;
         }
+
+        omni_logit_capture_drain_batch(ctx_omni, &batch,
+                                       OMNI_LOGIT_PLACEHOLDER_MODALITY,
+                                       /*is_prefill=*/true);
 
         // 获取当前 batch 的 embeddings 并复制到 hidden_states
         float * emb = llama_get_embeddings(ctx_omni->ctx_llama);
@@ -903,11 +921,21 @@ static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, st
         for (int j = 0; j < n_eval; j++) {
             batch.pos[j] = *n_past + j;  // 从当前 n_past 位置开始
         }
-        
+
+        // Logit capture: force LM head at every position for RL training.
+        omni_logit_capture_batch_handle _lc_handle;
+        omni_logit_capture_prepare_batch(ctx_omni, &batch, &_lc_handle);
+
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, N, n_batch, *n_past);
             return false;
         }
+
+        // batch.token != nullptr here (text path), real token ids are recorded.
+        omni_logit_capture_drain_batch(ctx_omni, &batch,
+                                       OMNI_LOGIT_PLACEHOLDER_MODALITY,
+                                       /*is_prefill=*/true);
+
         if (get_emb) {
             llama_set_embeddings(ctx_omni->ctx_llama, false);
         }
@@ -959,6 +987,10 @@ static bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params
             batch.pos[j] = *n_past + j;  // 从当前 n_past 位置开始
         }
 
+        // Logit capture: force LM head at every position for RL training.
+        omni_logit_capture_batch_handle _lc_handle;
+        omni_logit_capture_prepare_batch(ctx_omni, &batch, &_lc_handle);
+
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, N, n_batch, *n_past);
             llama_set_embeddings(ctx_omni->ctx_llama, false);
@@ -966,6 +998,10 @@ static bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params
             hidden_states = nullptr;
             return false;
         }
+
+        omni_logit_capture_drain_batch(ctx_omni, &batch,
+                                       OMNI_LOGIT_PLACEHOLDER_MODALITY,
+                                       /*is_prefill=*/true);
 
         // 获取当前 batch 的 embeddings 并复制到 hidden_states
         float * emb = llama_get_embeddings(ctx_omni->ctx_llama);
@@ -1009,6 +1045,17 @@ static bool eval_string_with_hidden(struct omni_context * ctx_omni, common_param
 static const char * sample(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past) {
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
     common_sampler_accept(smpl, id, true);
+
+    // Logit capture (RL training): the logits buffer in ctx_llama still holds
+    // the distribution that drove ``common_sampler_sample`` above; sniff it.
+    if (omni_logit_capture_is_enabled(ctx_omni)) {
+        const float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+        if (logits != nullptr) {
+            omni_logit_capture_append(ctx_omni, static_cast<int32_t>(id), logits,
+                                       /*is_prefill=*/false);
+        }
+    }
+
     static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
         ret = "</s>";
@@ -1022,6 +1069,16 @@ static const char * sample(struct common_sampler * smpl, struct omni_context * c
 static const char * sample_with_hidden(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past, float *& hidden_states) {
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
     common_sampler_accept(smpl, id, true);
+
+    // Logit capture (RL training): same idea as ``sample`` above.
+    if (omni_logit_capture_is_enabled(ctx_omni)) {
+        const float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+        if (logits != nullptr) {
+            omni_logit_capture_append(ctx_omni, static_cast<int32_t>(id), logits,
+                                       /*is_prefill=*/false);
+        }
+    }
+
     static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
         ret = "</s>";
@@ -1097,6 +1154,18 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
     token_id = id;  // 保存token ID
     common_sampler_accept(smpl, id, true);
+
+    // Logit capture (RL training): record the sampled token and the (already
+    // server-adjusted) logits distribution that actually drove sampling.
+    // ``logits`` may have been edited above for listen_prob_scale,
+    // length_penalty, forbidden tokens etc.; that's intentional — RL
+    // importance sampling needs the *effective* distribution, not the raw
+    // model output.
+    if (omni_logit_capture_is_enabled(ctx_omni) && logits != nullptr) {
+        omni_logit_capture_append(ctx_omni, static_cast<int32_t>(id), logits,
+                                   /*is_prefill=*/false);
+    }
+
     static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
         ret = "</s>";

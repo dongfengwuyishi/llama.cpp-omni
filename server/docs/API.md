@@ -472,7 +472,146 @@ PYTHONPATH=. .venv/bin/pytest tests/e2e --run-e2e -s
 
 ---
 
-## 8. 字段总览参考
+## 8. Logits export for RL training
+
+设置 `logits.enabled=true` 可以让 server 把 LLM **主干**在每个位置的 next-token
+分布捕获下来，配合 sampled token id 一起返回。**双工 / 单工都支持**。
+
+> 仅 LLM 主干，不含 TTS codec head。设计文档：
+> [`core/schemas/logits.py`](../core/schemas/logits.py) /
+> [`tools/omni/logit_capture.cpp`](../../tools/omni/logit_capture.cpp)。
+
+### 8.1 请求字段
+
+`/v1/chat` 和 `/v1/duplex_offline` 都接受新的 `logits` 字段
+（[`LogitsExportSpec`](../core/schemas/logits.py)）：
+
+```jsonc
+"logits": {
+  "enabled":    true,
+  "format":     "file",          // "file" (默认) 或 "inline"
+  "output_dir": "/data/logits",  // file 模式必填；server 写盘到这里
+  "include_prefill": true         // 保留字段，目前 prefill 都会被捕获
+}
+```
+
+- **`format="file"`**：server 写一个 `.safetensors`，响应里只返回路径
+- **`format="inline"`**：响应 JSON 里直接 base64 嵌入 token_ids + logits 字节
+
+### 8.2 响应字段
+
+`ChatResponse.logits` / `DuplexBatchResponse.logits`
+（[`LogitsPayload`](../core/schemas/logits.py)，捕获关闭时为 null）：
+
+```jsonc
+"logits": {
+  "success":           true,
+  "n_tokens":          289,
+  "n_prefill_tokens":  217,
+  "vocab_size":        151748,
+  "dtype":             "bf16",
+  "file":              "/data/logits/chat_round0.safetensors",  // file 模式
+  // inline 模式：
+  "token_ids_b64":     "<base64 int32 bytes>",
+  "logits_b64":        "<base64 bf16 bytes>",
+  "extra_metadata":    { "chunk_boundaries": [0, 207, 390, ..., 1139] }  // duplex 专有
+}
+```
+
+- `n_tokens = n_prefill_tokens + n_decode_tokens`，前 N 个属于 prefill
+- `dtype="bf16"`：每个 logit 占 2 bytes，按 `token_ids[i]` 的顺序对齐
+- modality（音频/图像 embedding）位置的 `token_id` 是占位符：
+  - `-1` 通用 modality（默认）
+  - `-2` 音频
+  - `-3` 图像
+
+### 8.3 落盘格式（safetensors v1）
+
+```
++--- Header ----------------------------------------------------+
+| u64 LE header_size                                            |
+| JSON header (UTF-8, padded to 8-byte alignment):              |
+|   {                                                           |
+|     "token_ids":  {dtype:"I32",  shape:[N],   data_offsets:[..]},
+|     "logits":     {dtype:"BF16", shape:[N,V], data_offsets:[..]},
+|     "__metadata__": {                                         |
+|       "format":            "minicpm-o-omni-logits/v1",        |
+|       "n_prefill_tokens":  "...",                             |
+|       "vocab_size":        "151748",                          |
+|       "n_tokens":          "...",                             |
+|       "chunk_boundaries":  "[0, 207, 390, ...]",  // duplex   |
+|       "chunk_prefill_counts": "[117, 105, 93, ...]",  // duplex
+|       "request_id":        "..."                              |
+|     }                                                         |
+|   }                                                           |
++--- Body ------------------------------------------------------+
+| raw int32 token_ids   (N * 4 bytes)                           |
+| raw bf16 logits       (N * V * 2 bytes)                       |
++---------------------------------------------------------------+
+```
+
+读回示例（Python，无依赖）：
+
+```python
+import struct, json
+import numpy as np
+
+with open("chat_round0.safetensors", "rb") as f:
+    header_size = struct.unpack("<Q", f.read(8))[0]
+    header = json.loads(f.read(header_size))
+    body_off = 8 + header_size
+
+    tspec = header["token_ids"]; lspec = header["logits"]
+    f.seek(body_off + tspec["data_offsets"][0])
+    token_ids = np.frombuffer(f.read(tspec["data_offsets"][1] - tspec["data_offsets"][0]), dtype=np.int32)
+    f.seek(body_off + lspec["data_offsets"][0])
+    raw = f.read(lspec["data_offsets"][1] - lspec["data_offsets"][0])
+    logits_bf16 = np.frombuffer(raw, dtype=np.uint16).reshape(lspec["shape"])
+
+# bf16 → fp32（位扩展）
+logits_fp32 = (logits_bf16.astype(np.uint32) << 16).view(np.float32)
+
+# 元信息（safetensors 规范：metadata 全是字符串，需要自行反序列化）
+n_prefill = int(header["__metadata__"]["n_prefill_tokens"])
+chunk_bounds = json.loads(header["__metadata__"].get("chunk_boundaries", "[]"))
+
+# 切回 prefill / decode
+prefill_tok = token_ids[:n_prefill]
+decode_tok  = token_ids[n_prefill:]
+prefill_logits = logits_fp32[:n_prefill]
+decode_logits  = logits_fp32[n_prefill:]
+```
+
+### 8.4 性能影响
+
+- **prefill** 慢约 30~50%（开了 logits 后每个位置都要跑 LM head matmul）
+- **decode** 几乎无影响（本来就要算 logits）
+- **响应体积**：~`N × 152K × 2 bytes`。30 tokens 大约 9 MB，建议默认走 `format="file"`
+- **磁盘 IO**：file 模式下，~330 MB/s 顺序写，瓶颈通常不在这里
+
+### 8.5 cURL 示例
+
+```bash
+curl -X POST http://localhost:8080/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages":   [{"role": "user", "content": "你好"}],
+    "generation": {"max_new_tokens": 32, "do_sample": false},
+    "tts":        {"enabled": false},
+    "logits":     {"enabled": true, "format": "file", "output_dir": "/data/logits"}
+  }'
+```
+
+返回的 `logits.file` 字段指向一个可读的 safetensors 文件。
+
+### 8.6 验证
+
+E2E 验证脚本：[`scripts/smoke_logits.py`](../scripts/smoke_logits.py)。
+跑通后会输出三种模式（chat-inline / chat-file / duplex-file）的 PASS/FAIL 表。
+
+---
+
+## 9. 字段总览参考
 
 | 文件 | 关键 schema |
 |---|---|

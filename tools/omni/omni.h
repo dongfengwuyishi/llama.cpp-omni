@@ -408,7 +408,41 @@ struct omni_context {
     llama_token tts_bos_token_id = -1;           // <|tts_bos|>: TTS 开始（用于双工强制继续说话）
     llama_token special_token_unit_end = -1;     // </unit>: unit 结束标记（双工 chunk 边界）
     llama_token special_token_tts_pad = -1;      // <|tts_pad|>: TTS 填充（双工模式下禁止采样）
+
+    // ==================== Logit Capture (RL 训练用) ====================
+    // 当 enabled=true 时，LLM 主干在 prefill + decode 每个 token 位置都
+    // 捕获 (token_id, next-token logits 向量[bf16]) 写入下面的 buffer。
+    //
+    // - prefill 阶段：默认 llama 只对最后一个 token 计算 logits（为了省 LM head
+    //   matmul）。capture 启用时会把 batch.logits[i]=true 强制对每个位置都算，
+    //   prefill 会慢 30~50%。
+    // - 模态位置（audio/image embedding，没有真实 token_id）会用占位 token id
+    //   OMNI_LOGIT_PLACEHOLDER_AUDIO / _IMAGE，但 logits 仍然是该位置的真实输出。
+    //
+    // 一个 round 一份数据：调用方通过 omni_logit_capture_reset() 在新 round
+    // 开始时清空，结束时通过 export_safetensors() 或 get() 取走。
+    struct logit_capture {
+        bool                  enabled            = false;
+        int32_t               vocab_size         = 0;
+        int32_t               n_prefill_tokens   = 0;    // 头部多少个 token 属于 prefill
+        std::vector<int32_t>  token_ids;                  // 长度 N
+        std::vector<uint16_t> logits_bf16;                // 长度 N * vocab_size
+    };
+    logit_capture logit_buf;
 };
+
+// Placeholder token ids used for modality (audio/image) positions in
+// ``logit_capture.token_ids``. Negative values so they never collide with
+// real vocabulary ids.
+//
+// ``MODALITY`` is the generic catch-all used by prefill helpers that have
+// no easy way to know whether the embedding they receive came from the
+// audio or vision encoder. Callers that *do* know can call
+// ``omni_logit_capture_drain_batch`` directly with the more specific
+// AUDIO / IMAGE constants.
+#define OMNI_LOGIT_PLACEHOLDER_MODALITY (-1)
+#define OMNI_LOGIT_PLACEHOLDER_AUDIO    (-2)
+#define OMNI_LOGIT_PLACEHOLDER_IMAGE    (-3)
 
 //
 // omni embed
@@ -432,6 +466,77 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 const std::string & base_output_dir = "./tools/omni/output");
 
 void omni_free(struct omni_context * ctx_omni);
+
+// ==================== Logit Capture API (RL training) ====================
+//
+// Lifecycle:
+//   1. omni_logit_capture_set_enabled(ctx, true, n_vocab)
+//   2. (optional) omni_logit_capture_reset(ctx)          // start of round
+//   3. stream_prefill(...) / stream_decode(...)          // capture happens
+//      automatically when enabled=true
+//   4. omni_logit_capture_get(ctx, ...)                  // zero-copy read
+//      OR omni_logit_capture_export_safetensors(ctx, path, metadata_json)
+//   5. omni_logit_capture_reset(ctx)                     // before next round
+//
+// Output format (safetensors v1):
+//   - tensor "token_ids":  I32  shape=[N]
+//   - tensor "logits":     BF16 shape=[N, vocab_size]
+//   - header.metadata:     {n_prefill_tokens, vocab_size, <extra fields>}
+
+void omni_logit_capture_set_enabled(struct omni_context * ctx_omni, bool enabled, int32_t vocab_size);
+bool omni_logit_capture_is_enabled(const struct omni_context * ctx_omni);
+void omni_logit_capture_reset(struct omni_context * ctx_omni);
+
+// Zero-copy accessor. Returned pointers stay valid until the next mutating
+// call (append / reset). Returns false if capture is disabled or empty.
+bool omni_logit_capture_get(const struct omni_context * ctx_omni,
+                            const int32_t  ** out_token_ids,
+                            int32_t         * out_n_tokens,
+                            const uint16_t ** out_logits_bf16,
+                            int32_t         * out_vocab_size,
+                            int32_t         * out_n_prefill_tokens);
+
+// Write current buffer to a single .safetensors file at ``path``.
+// ``extra_metadata_json`` (nullable) is merged into the safetensors header's
+// metadata object — pass e.g. R"({"round_idx":"0","model":"..."})".
+// Returns false on any IO error or if the buffer is empty.
+bool omni_logit_capture_export_safetensors(const struct omni_context * ctx_omni,
+                                           const char * path,
+                                           const char * extra_metadata_json);
+
+// Append one captured step to the buffer. Public so that
+// stream_prefill/stream_decode internals (defined in different
+// translation units) can write into the buffer with a stable ABI.
+// ``token_id`` may be a real vocab id or one of the OMNI_LOGIT_PLACEHOLDER_*
+// constants. ``logits_fp32`` must point to ``vocab_size`` floats.
+// No-op if capture is disabled.
+void omni_logit_capture_append(struct omni_context * ctx_omni,
+                               int32_t token_id, const float * logits_fp32,
+                               bool is_prefill);
+
+// ---------- batch-level helpers used inside stream_prefill / stream_decode ----------
+//
+// Before llama_decode: if capture is enabled, ensure batch.logits[i]=true for
+// every position so llama runs the LM head at every position (otherwise only
+// the last position has logits). Returns a backing buffer the caller MUST
+// keep alive until llama_decode returns; pass it through and ignore otherwise.
+struct omni_logit_capture_batch_handle {
+    std::vector<int8_t> mask;
+    int8_t *            prev_logits = nullptr;
+    bool                installed   = false;
+};
+void omni_logit_capture_prepare_batch(struct omni_context * ctx_omni,
+                                      struct llama_batch * batch,
+                                      omni_logit_capture_batch_handle * handle);
+
+// After llama_decode: drain per-position logits + token ids from ctx_llama
+// into the capture buffer. ``modality_placeholder`` is used when batch->token
+// is null (embedding-mode batches): pass OMNI_LOGIT_PLACEHOLDER_AUDIO /
+// OMNI_LOGIT_PLACEHOLDER_IMAGE depending on the modality.
+void omni_logit_capture_drain_batch(struct omni_context * ctx_omni,
+                                    const struct llama_batch * batch,
+                                    int32_t modality_placeholder,
+                                    bool is_prefill);
 
 // ANE/CoreML warmup — call once after omni_init to pre-load models into NPU
 void omni_warmup_ane(struct omni_context * ctx_omni);

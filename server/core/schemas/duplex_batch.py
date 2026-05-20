@@ -35,6 +35,7 @@ from core.schemas.duplex import (
     DuplexConfig,
     DuplexChunkResult,
 )
+from core.schemas.logits import LogitsExportSpec, LogitsPayload
 
 
 # =============================================================================
@@ -145,6 +146,19 @@ class DuplexBatchRequest(BaseModel):
         description="client 自定义 request id（用于日志关联）",
     )
 
+    # ---------- RL training: per-token logits export ----------
+    logits: LogitsExportSpec = Field(
+        default_factory=LogitsExportSpec,
+        description=(
+            "If logits.enabled=True the server captures per-token logits across "
+            "every chunk's prefill+decode and returns a SINGLE consolidated "
+            "safetensors (file mode) or inline payload (inline mode) in the "
+            "response. The safetensors header metadata includes a "
+            "'chunk_boundaries' field of shape [n_chunks+1] so callers can "
+            "split the buffer back into chunk granularity."
+        ),
+    )
+
 
 # =============================================================================
 # 输出
@@ -198,3 +212,14 @@ class DuplexBatchResponse(BaseModel):
     ticket_id: Optional[str] = Field(default=None, description="server FIFO 队列 ticket id")
     queue_wait_ms: float = Field(default=0.0, description="入队到分配 worker 的等待时间")
     worker_id: Optional[str] = Field(default=None, description="实际处理此请求的 worker id")
+
+    # RL training: consolidated logits across all chunks of this request.
+    logits: Optional[LogitsPayload] = Field(
+        default=None,
+        description=(
+            "Per-token logits aggregated across every chunk of this duplex "
+            "request (None if not requested). The safetensors header carries "
+            "a 'chunk_boundaries' metadata field so consumers can recover the "
+            "chunk-level slicing."
+        ),
+    )

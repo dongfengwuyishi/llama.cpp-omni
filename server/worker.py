@@ -559,6 +559,7 @@ class MiniCPMOWorker:
         system_content: Any = None,
         length_penalty: Optional[float] = None,
         sampling: Optional[Dict[str, Any]] = None,  # noqa: ARG002 — pytorch view 不消费
+        return_logits: bool = False,
     ) -> str:
         """Duplex 准备
 
@@ -577,19 +578,26 @@ class MiniCPMOWorker:
             "ref_audio_path": ref_audio_path or self.ref_audio_path,
             "prompt_wav_path": prompt_wav_path,
         }
-        # C++ backend supports media_type/lang/system_content, pytorch backend 不一定支持，逐级 fallback
+        # C++ backend supports media_type/lang/system_content/return_logits.
+        # PyTorch backend does not consume these — fall back gracefully.
         try:
             return duplex_view.prepare(
-                media_type=media_type, lang=lang, system_content=system_content, **kwargs
+                media_type=media_type, lang=lang, system_content=system_content,
+                return_logits=return_logits, **kwargs
             )
         except TypeError:
             try:
-                return duplex_view.prepare(media_type=media_type, lang=lang, **kwargs)
+                return duplex_view.prepare(
+                    media_type=media_type, lang=lang, system_content=system_content, **kwargs
+                )
             except TypeError:
                 try:
-                    return duplex_view.prepare(media_type=media_type, **kwargs)
+                    return duplex_view.prepare(media_type=media_type, lang=lang, **kwargs)
                 except TypeError:
-                    return duplex_view.prepare(**kwargs)
+                    try:
+                        return duplex_view.prepare(media_type=media_type, **kwargs)
+                    except TypeError:
+                        return duplex_view.prepare(**kwargs)
 
     def duplex_prefill(
         self,
@@ -2684,6 +2692,129 @@ async def clear_cache():
     return {"success": True, "message": "Cache cleared"}
 
 
+# ============ Logits consolidation (duplex_offline helper) ==========
+#
+# /v1/stream/decode in the C++ server returns one inline logits payload per
+# call (cheap: only one chunk's worth of data). The /duplex_offline endpoint
+# below collects all per-chunk payloads and stitches them into a SINGLE
+# response-level payload — either an inline base64 blob or a .safetensors
+# file on disk.
+#
+# The on-disk format mirrors what the C++ side writes for ``logit_format=file``
+# in chat: a tiny hand-rolled safetensors with two tensors plus metadata.
+
+def _build_consolidated_logits_payload(
+    *,
+    token_ids: List[int],
+    raw_rows_bf16: List[bytes],
+    chunk_boundaries: List[int],
+    chunk_prefill_counts: List[int],
+    vocab_size: int,
+    spec: Any,
+    request_id: Optional[str],
+):
+    """Stitch per-chunk inline logits into a single LogitsPayload."""
+    from core.schemas.logits import LogitsPayload
+
+    n_tokens = len(token_ids)
+    n_prefill = sum(chunk_prefill_counts)
+    if n_tokens == 0 or vocab_size == 0:
+        return None
+
+    expected_bytes = n_tokens * vocab_size * 2  # bf16 = 2 bytes
+    body_bytes = b"".join(raw_rows_bf16)
+    if len(body_bytes) != expected_bytes:
+        raise RuntimeError(
+            f"logits byte mismatch: got {len(body_bytes)} expected {expected_bytes}"
+            f" (n_tokens={n_tokens}, vocab_size={vocab_size})"
+        )
+
+    if spec.format == "file":
+        out_dir = spec.output_dir or "/tmp/minicpm_logits"
+        os.makedirs(out_dir, exist_ok=True)
+        fname = f"duplex_{request_id or uuid.uuid4().hex[:12]}.safetensors"
+        path = os.path.join(out_dir, fname)
+        extra = {
+            "n_prefill_tokens": str(n_prefill),
+            "vocab_size": str(vocab_size),
+            "n_tokens": str(n_tokens),
+            "chunk_boundaries": json.dumps(chunk_boundaries),
+            "chunk_prefill_counts": json.dumps(chunk_prefill_counts),
+            "format": "minicpm-o-omni-logits/v1",
+            "source": "duplex_offline_consolidator",
+        }
+        if request_id:
+            extra["request_id"] = str(request_id)
+        _write_safetensors_logits(
+            path=path,
+            token_ids=np.asarray(token_ids, dtype=np.int32),
+            logits_body_bf16=body_bytes,
+            vocab_size=vocab_size,
+            metadata=extra,
+        )
+        return LogitsPayload(
+            n_tokens=n_tokens,
+            n_prefill_tokens=n_prefill,
+            vocab_size=vocab_size,
+            dtype="bf16",
+            file=path,
+            extra_metadata={"chunk_boundaries": chunk_boundaries},
+        )
+
+    # inline
+    tok_b64 = base64.b64encode(
+        np.asarray(token_ids, dtype=np.int32).tobytes()
+    ).decode("ascii")
+    logit_b64 = base64.b64encode(body_bytes).decode("ascii")
+    return LogitsPayload(
+        n_tokens=n_tokens,
+        n_prefill_tokens=n_prefill,
+        vocab_size=vocab_size,
+        dtype="bf16",
+        token_ids_b64=tok_b64,
+        logits_b64=logit_b64,
+        extra_metadata={"chunk_boundaries": chunk_boundaries},
+    )
+
+
+def _write_safetensors_logits(
+    *, path: str, token_ids: "np.ndarray", logits_body_bf16: bytes,
+    vocab_size: int, metadata: Dict[str, str],
+) -> None:
+    """Minimal safetensors writer matching the C++ side's on-disk format.
+
+    Two tensors:
+        - "token_ids":  I32  [N]
+        - "logits":     BF16 [N, vocab_size]
+
+    Plus a ``__metadata__`` block with all-string values (safetensors spec).
+    """
+    n = int(token_ids.shape[0])
+    tok_bytes = token_ids.astype(np.int32, copy=False).tobytes()
+    if len(tok_bytes) != n * 4:
+        raise RuntimeError(f"token_ids bytes mismatch: {len(tok_bytes)} vs {n*4}")
+
+    tokens_off = (0, n * 4)
+    logits_off = (n * 4, n * 4 + n * vocab_size * 2)
+
+    header_obj = {
+        "token_ids": {"dtype": "I32",  "shape": [n], "data_offsets": list(tokens_off)},
+        "logits":    {"dtype": "BF16", "shape": [n, vocab_size], "data_offsets": list(logits_off)},
+        "__metadata__": {str(k): str(v) for k, v in metadata.items()},
+    }
+    header_bytes = json.dumps(header_obj, separators=(",", ":")).encode("utf-8")
+    # Pad header to 8-byte alignment so the body starts aligned (matches the
+    # C++ writer's behaviour and makes downstream mmap consumers happy).
+    while (8 + len(header_bytes)) % 8 != 0:
+        header_bytes += b" "
+
+    with open(path, "wb") as f:
+        f.write(len(header_bytes).to_bytes(8, byteorder="little", signed=False))
+        f.write(header_bytes)
+        f.write(tok_bytes)
+        f.write(logits_body_bf16)
+
+
 # ============ Duplex Offline / Batch API ==========
 #
 # 非流式双工接口。把整段音视频送进来，server 内部按 chunk_ms 切片，
@@ -2703,6 +2834,7 @@ async def duplex_offline(request_body: Dict[str, Any]):
     """非流式双工批量推理"""
     from core.schemas.duplex_batch import DuplexBatchRequest, DuplexBatchResponse
     from core.schemas.duplex import DuplexChunkResult
+    from core.schemas.logits import LogitsPayload
 
     if not _worker_ready():
         raise HTTPException(status_code=503, detail="Worker not ready")
@@ -2844,7 +2976,20 @@ async def duplex_offline(request_body: Dict[str, Any]):
             system_content=req.system_prompt,
             length_penalty=req.config.length_penalty,
             sampling=sampling or None,
+            return_logits=req.logits.enabled,
         )
+
+        # ---------- Per-chunk logits accumulators (only used when capture is on)
+        # The C++ side returns one inline payload per /v1/stream/decode call.
+        # We concatenate them and dump a SINGLE safetensors at the end so the
+        # caller gets request-level granularity (matching the agreed format
+        # spec: one .safetensors per duplex_offline request, with
+        # ``chunk_boundaries`` metadata describing chunk slices).
+        logits_token_ids: List[int] = []
+        logits_rows_bf16: List[bytes] = []
+        chunk_boundaries: List[int] = [0]
+        chunk_prefill_counts: List[int] = []
+        logits_vocab_size: int = 0
         logger.info(
             f"[duplex_offline] prepared: n_chunks={n_chunks}, "
             f"audio={len(full_audio)/16000:.1f}s, media_type={media_type}, "
@@ -2953,6 +3098,18 @@ async def duplex_offline(request_body: Dict[str, Any]):
                     )
                 )
 
+            # Append this chunk's logits to the request-level accumulator.
+            if req.logits.enabled and result.logits is not None and result.logits.success:
+                lp = result.logits
+                if lp.token_ids_b64 and lp.logits_b64:
+                    tok_arr = np.frombuffer(base64.b64decode(lp.token_ids_b64), dtype=np.int32)
+                    logits_token_ids.extend(tok_arr.tolist())
+                    logits_rows_bf16.append(base64.b64decode(lp.logits_b64))
+                    chunk_boundaries.append(chunk_boundaries[-1] + int(lp.n_tokens))
+                    chunk_prefill_counts.append(int(lp.n_prefill_tokens))
+                    if logits_vocab_size == 0:
+                        logits_vocab_size = int(lp.vocab_size)
+
             if req.stop_on_end_of_turn and result.end_of_turn:
                 stopped_reason = "end_of_turn"
                 break
@@ -2983,6 +3140,31 @@ async def duplex_offline(request_body: Dict[str, Any]):
             merged = np.concatenate(audio_pieces)
             merged_b64 = base64.b64encode(merged.tobytes()).decode("utf-8")
 
+        # ---------- Consolidate logits across all chunks into ONE payload.
+        # If logits.format == "file" we write a single .safetensors locally
+        # and return its path; otherwise we return one big inline payload.
+        logits_resp: Optional[LogitsPayload] = None
+        if req.logits.enabled and logits_token_ids:
+            try:
+                logits_resp = _build_consolidated_logits_payload(
+                    token_ids=logits_token_ids,
+                    raw_rows_bf16=logits_rows_bf16,
+                    chunk_boundaries=chunk_boundaries,
+                    chunk_prefill_counts=chunk_prefill_counts,
+                    vocab_size=logits_vocab_size,
+                    spec=req.logits,
+                    request_id=req.request_id,
+                )
+            except Exception as e:
+                logger.error(f"[duplex_offline] logits consolidation failed: {e}", exc_info=True)
+                logits_resp = LogitsPayload(
+                    success=False,
+                    error=f"consolidation failed: {e}",
+                    n_tokens=len(logits_token_ids),
+                    n_prefill_tokens=sum(chunk_prefill_counts),
+                    vocab_size=logits_vocab_size,
+                )
+
         total_dur_ms = (time.perf_counter() - t0_total) * 1000
         audio_dur_s = sum(len(a) for a in audio_pieces) / 24000.0
 
@@ -2999,6 +3181,7 @@ async def duplex_offline(request_body: Dict[str, Any]):
             total_duration_ms=total_dur_ms,
             stopped_reason=stopped_reason,
             request_id=req.request_id,
+            logits=logits_resp,
         ).model_dump()
 
     finally:

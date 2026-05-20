@@ -26,6 +26,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <signal.h>
 #include <thread>
 #include <unordered_map>
@@ -5656,7 +5657,28 @@ int main(int argc, char ** argv) {
     };
 
     // impl: decode
-    const auto handle_stream_decode_impl = [&ctx_server, &read_stream_kv_cache_length, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
+    // Helper: base64-encode arbitrary bytes (cpp-httplib provides a std::string
+    // overload only). Local definition keeps us out of httplib::detail.
+    auto base64_encode = [](const unsigned char * data, std::size_t len) -> std::string {
+        static const char lookup[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        out.reserve(((len + 2) / 3) * 4);
+        int val = 0, valb = -6;
+        for (std::size_t i = 0; i < len; ++i) {
+            val = (val << 8) | data[i];
+            valb += 8;
+            while (valb >= 0) {
+                out.push_back(lookup[(val >> valb) & 0x3F]);
+                valb -= 6;
+            }
+        }
+        if (valb > -6) out.push_back(lookup[((val << 8) >> (valb + 8)) & 0x3F]);
+        while (out.size() % 4) out.push_back('=');
+        return out;
+    };
+
+    const auto handle_stream_decode_impl = [&ctx_server, &read_stream_kv_cache_length, &res_ok, &res_error, base64_encode](const json & data, httplib::Response & res) -> void {
         // Expected body fields:
         // optional: debug_dir: string (default "./")
         // optional: stream: bool (default true)
@@ -5686,6 +5708,74 @@ int main(int argc, char ** argv) {
             SRV_INF("%s: length_penalty set to %.3f\n", __func__, lp);
         }
 
+        // 🔧 [Logit Capture] 从请求体读取本次 decode 输出 logit 的方式：
+        //   - "inline" (default): SSE event 携带 base64 token_ids + bf16 logits
+        //   - "file":              落盘 safetensors，event 仅返回路径 + sha256
+        // file 模式需要 logit_output_dir + logit_filename 字段。
+        // logit_extra_metadata 可选，是个 JSON 对象的字符串，会原样合并到
+        // safetensors 文件 header 的 __metadata__ 块里（用于带 ticket_id /
+        // chunk_boundaries 等业务侧元信息）。
+        const std::string logit_format = data.contains("logit_format") && data.at("logit_format").is_string()
+            ? data.at("logit_format").get<std::string>() : std::string("inline");
+        const std::string logit_output_dir = data.contains("logit_output_dir") && data.at("logit_output_dir").is_string()
+            ? data.at("logit_output_dir").get<std::string>() : std::string();
+        const std::string logit_filename = data.contains("logit_filename") && data.at("logit_filename").is_string()
+            ? data.at("logit_filename").get<std::string>() : std::string();
+        const std::string logit_extra_metadata = data.contains("logit_extra_metadata") && data.at("logit_extra_metadata").is_string()
+            ? data.at("logit_extra_metadata").get<std::string>() : std::string();
+
+        // Build the SSE/JSON "logits" payload (if logit capture is enabled).
+        // Returns nullopt when capture is disabled or the buffer is empty.
+        // The buffer is RESET after a successful read so subsequent rounds
+        // start with an empty buffer.
+        auto build_logits_payload = [&]() -> std::optional<json> {
+            std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
+            if (ctx_server.octx == nullptr || !omni_logit_capture_is_enabled(ctx_server.octx)) {
+                return std::nullopt;
+            }
+            const int32_t * token_ids = nullptr;
+            const uint16_t * logits_bf16 = nullptr;
+            int32_t n_tokens = 0, vocab_size = 0, n_prefill = 0;
+            if (!omni_logit_capture_get(ctx_server.octx,
+                                         &token_ids, &n_tokens,
+                                         &logits_bf16, &vocab_size, &n_prefill)) {
+                return std::nullopt;
+            }
+            json ev;
+            ev["type"]               = "logits";
+            ev["n_tokens"]           = n_tokens;
+            ev["n_prefill_tokens"]   = n_prefill;
+            ev["vocab_size"]         = vocab_size;
+            ev["dtype"]              = "bf16";
+
+            if (logit_format == "file") {
+                if (logit_output_dir.empty() || logit_filename.empty()) {
+                    ev["success"] = false;
+                    ev["error"]   = "logit_format=file requires logit_output_dir and logit_filename";
+                    omni_logit_capture_reset(ctx_server.octx);
+                    return ev;
+                }
+                std::string path = logit_output_dir;
+                if (!path.empty() && path.back() != '/' && path.back() != '\\') path.push_back('/');
+                path += logit_filename;
+                const char * extra = logit_extra_metadata.empty() ? nullptr : logit_extra_metadata.c_str();
+                bool ok = omni_logit_capture_export_safetensors(ctx_server.octx, path.c_str(), extra);
+                ev["file"]    = path;
+                ev["success"] = ok;
+                if (!ok) ev["error"] = "safetensors write failed";
+            } else {
+                // inline base64
+                const size_t bytes = static_cast<size_t>(n_tokens) * sizeof(int32_t);
+                ev["token_ids_b64"] = base64_encode(reinterpret_cast<const unsigned char *>(token_ids), bytes);
+                const size_t lb = static_cast<size_t>(n_tokens) * static_cast<size_t>(vocab_size) * sizeof(uint16_t);
+                ev["logits_b64"]    = base64_encode(reinterpret_cast<const unsigned char *>(logits_bf16), lb);
+                ev["success"]       = true;
+            }
+
+            omni_logit_capture_reset(ctx_server.octx);
+            return ev;
+        };
+
         if (!stream) {
             bool ok = false;
             {
@@ -5703,12 +5793,18 @@ int main(int argc, char ** argv) {
                 {"debug_dir", debug_dir},
                 {"kv_cache_length", read_stream_kv_cache_length()},
             };
+            if (auto logits_ev = build_logits_payload(); logits_ev.has_value()) {
+                ack["logits"] = std::move(*logits_ev);
+            }
             res_ok(res, ack);
             return;
         }
 
         // SSE streaming mode: start decode, then read text_queue and stream to client
-        const auto chunked_content_provider = [&ctx_server, debug_dir, round_idx, &read_stream_kv_cache_length](size_t, httplib::DataSink & sink) {
+        const auto chunked_content_provider = [&ctx_server, debug_dir, round_idx, &read_stream_kv_cache_length,
+                                                logit_format, logit_output_dir, logit_filename, logit_extra_metadata,
+                                                base64_encode
+                                                ](size_t, httplib::DataSink & sink) {
             // 🔧 [修复多轮对话] 在启动worker之前先重置状态，避免竞态条件
             {
                 std::lock_guard<std::mutex> lock(ctx_server.octx->text_mtx);
@@ -5777,6 +5873,54 @@ int main(int argc, char ** argv) {
             })) {
                 return false;
             }
+
+            // 🔧 [Logit Capture] After the decode body is fully streamed,
+            // emit a final ``logits`` SSE event (inline base64 or file path)
+            // before [DONE]. No-op when capture is disabled.
+            {
+                std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
+                if (ctx_server.octx != nullptr && omni_logit_capture_is_enabled(ctx_server.octx)) {
+                    const int32_t  * token_ids   = nullptr;
+                    const uint16_t * logits_bf16 = nullptr;
+                    int32_t n_tokens = 0, vocab_size = 0, n_prefill = 0;
+                    if (omni_logit_capture_get(ctx_server.octx,
+                                                &token_ids, &n_tokens,
+                                                &logits_bf16, &vocab_size, &n_prefill)) {
+                        json ev;
+                        ev["type"]             = "logits";
+                        ev["n_tokens"]         = n_tokens;
+                        ev["n_prefill_tokens"] = n_prefill;
+                        ev["vocab_size"]       = vocab_size;
+                        ev["dtype"]            = "bf16";
+                        if (logit_format == "file") {
+                            if (logit_output_dir.empty() || logit_filename.empty()) {
+                                ev["success"] = false;
+                                ev["error"]   = "logit_format=file requires logit_output_dir and logit_filename";
+                            } else {
+                                std::string path = logit_output_dir;
+                                if (!path.empty() && path.back() != '/' && path.back() != '\\') path.push_back('/');
+                                path += logit_filename;
+                                const char * extra = logit_extra_metadata.empty() ? nullptr : logit_extra_metadata.c_str();
+                                bool ok = omni_logit_capture_export_safetensors(ctx_server.octx, path.c_str(), extra);
+                                ev["file"]    = path;
+                                ev["success"] = ok;
+                                if (!ok) ev["error"] = "safetensors write failed";
+                            }
+                        } else {
+                            const size_t tb = static_cast<size_t>(n_tokens) * sizeof(int32_t);
+                            ev["token_ids_b64"] = base64_encode(reinterpret_cast<const unsigned char *>(token_ids), tb);
+                            const size_t lb = static_cast<size_t>(n_tokens) * static_cast<size_t>(vocab_size) * sizeof(uint16_t);
+                            ev["logits_b64"]    = base64_encode(reinterpret_cast<const unsigned char *>(logits_bf16), lb);
+                            ev["success"]       = true;
+                        }
+                        omni_logit_capture_reset(ctx_server.octx);
+                        if (!server_sent_event(sink, ev)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+
             // send done
             static const std::string ev_done = "data: [DONE]\n\n";
             sink.write(ev_done.data(), ev_done.size());
@@ -6076,9 +6220,37 @@ int main(int argc, char ** argv) {
                 res_error(res, format_error_response("omni context not initialized. call /v1/stream/omni_init first", ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
-            
+
+            // 🔧 [Logit Capture] 必须在 update_session_config 主流程之前处理，
+            // 因为下面的 media_type/duplex_mode 变化会触发 omni_init / KV clear，
+            // 而 cpp_backend.duplex_prepare 故意 *跳过* 这个 endpoint（怕清 KV）。
+            // 调用者要在 duplex 流程下开启 logits 时，可以只发 ``{"return_logits": true}``
+            // 这一个字段；本块会立即处理并提前返回，不触碰 KV cache。
+            if (data.contains("return_logits")) {
+                bool enable_logits = data.at("return_logits").get<bool>();
+                int32_t n_vocab = 0;
+                if (ctx_server.octx->model != nullptr) {
+                    const llama_vocab * vocab = llama_model_get_vocab(ctx_server.octx->model);
+                    if (vocab != nullptr) n_vocab = llama_vocab_n_tokens(vocab);
+                }
+                omni_logit_capture_set_enabled(ctx_server.octx, enable_logits, n_vocab);
+                omni_logit_capture_reset(ctx_server.octx);
+                SRV_INF("%s: return_logits=%d, vocab_size=%d (capture buffer reset)\n",
+                        __func__, (int) enable_logits, (int) n_vocab);
+                // Early return when this is the ONLY field — avoids touching KV cache.
+                if (data.size() == 1) {
+                    json ack = {
+                        {"success", true},
+                        {"return_logits", enable_logits},
+                        {"vocab_size", n_vocab},
+                    };
+                    res_ok(res, ack);
+                    return;
+                }
+            }
+
             SRV_INF("%s: update_session_config requested\n", __func__);
-            
+
             // 1. 更新 media_type（如果提供）
             bool media_type_changed = false;
             int old_media_type = ctx_server.octx->media_type;

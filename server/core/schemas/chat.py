@@ -98,6 +98,7 @@ from core.schemas.common import (
     ImageConfig,
     TTSSamplingParams,
 )
+from core.schemas.logits import LogitsExportSpec, LogitsPayload
 
 
 # =============================================================================
@@ -199,6 +200,17 @@ class ChatRequest(BaseModel):
     return_prompt: bool = Field(
         False,
         description="是否返回完整 prompt（调试用）"
+    )
+
+    # ---- RL training: per-token logits export ----
+    logits: LogitsExportSpec = Field(
+        default_factory=LogitsExportSpec,
+        description=(
+            "If logits.enabled=True the server captures (token_id, logits[bf16]) "
+            "for every LLM main-backbone position (prefill + decode) and returns "
+            "them in the response under the matching 'logits' field. See "
+            "core/schemas/logits.py:LogitsExportSpec for details."
+        ),
     )
 
 
@@ -310,4 +322,13 @@ class ChatResponse(BaseModel):
     success: bool = Field(
         True, 
         description="是否成功"
+    )
+
+    # RL training: per-token logits (populated iff request.logits.enabled=True)
+    logits: Optional[LogitsPayload] = Field(
+        None,
+        description=(
+            "Captured logits payload. None if not requested or capture failed. "
+            "See core/schemas/logits.py:LogitsPayload."
+        ),
     )

@@ -13,6 +13,7 @@ add_library(omni
             vision.cpp
             vision.h
             omni-impl.h
+            logit_capture.cpp
             token2wav/token2wav-impl.cpp
             token2wav/token2wav-impl.h
             token2wav/token2wav.cpp

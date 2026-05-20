@@ -137,6 +137,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 from core.schemas.common import TTSSamplingParams
+from core.schemas.logits import LogitsPayload
 
 
 # =============================================================================
@@ -516,6 +517,18 @@ class DuplexGenerateResult(BaseModel):
     server_send_ts: Optional[float] = Field(
         None,
         description="服务端发送此 result 的时间戳（time.time()），用于全链路时延分析"
+    )
+
+    # RL training: per-chunk logits payload (only filled when capture is on)
+    logits: Optional[LogitsPayload] = Field(
+        None,
+        description=(
+            "Per-chunk LLM logits if capture was requested via "
+            "DuplexBatchRequest.logits.enabled. Otherwise None. The Python "
+            "/duplex_offline endpoint typically consumes these chunk-level "
+            "payloads and consolidates them into a single safetensors at the "
+            "request level."
+        ),
     )
 
 

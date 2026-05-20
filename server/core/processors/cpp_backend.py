@@ -283,11 +283,16 @@ class CppBackendWorker:
         system_content: Any = None,
         length_penalty: float = 1.1,
         sampling: Optional[Dict[str, Any]] = None,
+        return_logits: bool = False,
     ) -> str:
         """Duplex 准备 → update_session_config
 
         sampling: 上层从 DuplexConfig 抽出的 session-level sampling 旋钮
                   （见 _call_update_session_config 文档）。
+        return_logits: True 时打开 LLM 主干 logit 录制（C++ 内部 capture buffer
+                       会累积所有 prefill/decode 位置的 (token_id, bf16 logits)，
+                       每个 chunk 的 stream/decode 返回的 SSE 末尾会带回本 chunk
+                       的 inline payload）。
         """
         self._reset_output_dir()
         self._duplex_chunk_counter = 0
@@ -304,6 +309,18 @@ class CppBackendWorker:
         self._last_media_type = media_type
         if lang:
             self._last_lang = lang
+
+        # [RL training] Toggle the LLM logits capture buffer for this duplex
+        # session. C++ side handles this in isolation (no KV touch) when the
+        # request body contains ONLY return_logits.
+        try:
+            self._http_client.post(
+                f"{self._cpp_server_url}/v1/stream/update_session_config",
+                json={"return_logits": bool(return_logits)},
+                timeout=10.0,
+            )
+        except Exception as e:
+            logger.warning(f"duplex_prepare: failed to toggle return_logits={return_logits}: {e}")
 
         os.makedirs(os.path.join(self._output_dir, "tts_wav"), exist_ok=True)
         os.makedirs(os.path.join(self._output_dir, "tts_txt"), exist_ok=True)
@@ -352,6 +369,11 @@ class CppBackendWorker:
             json={
                 "stream": True,
                 "length_penalty": float(self._duplex_length_penalty),
+                # logit_format/output_dir/filename are intentionally omitted —
+                # in duplex mode we always pull logits back inline (small per
+                # chunk) and let the Python layer consolidate across chunks
+                # into one safetensors at the request level.
+                "logit_format": "inline",
             },
             timeout=600.0,
         )
@@ -359,6 +381,7 @@ class CppBackendWorker:
         is_listen = True
         end_of_turn = False
         texts = []
+        logits_payload = self._extract_logits_from_sse(resp.text) if resp.status_code == 200 else None
 
         if resp.status_code == 200:
             for line in resp.text.splitlines():
@@ -396,6 +419,7 @@ class CppBackendWorker:
             end_of_turn=end_of_turn,
             current_time=self._duplex_chunk_counter,
             cost_all_ms=round(cost_all_ms, 1),
+            logits=logits_payload,
         )
 
     def duplex_finalize(self) -> None:
@@ -556,6 +580,50 @@ class CppBackendWorker:
             if content:
                 pieces.append(content)
         return "".join(pieces)
+
+    def _extract_logits_from_sse(self, resp_text: str):
+        """Scan a /v1/stream/decode SSE body and pull out the final
+        ``event: logits`` payload (if any) into a LogitsPayload pydantic obj.
+
+        The C++ server emits exactly one such event right before ``[DONE]``
+        when ``return_logits=true`` was set on update_session_config. The
+        event shape matches LogitsPayload fields (n_tokens, n_prefill_tokens,
+        vocab_size, dtype, plus either token_ids_b64+logits_b64 or file).
+        """
+        from core.schemas.logits import LogitsPayload
+
+        last: Optional[Dict[str, Any]] = None
+        for line in resp_text.splitlines():
+            line = line.strip()
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                event = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and event.get("type") == "logits":
+                last = event
+        if last is None:
+            return None
+        try:
+            return LogitsPayload(
+                success=bool(last.get("success", True)),
+                error=last.get("error"),
+                n_tokens=int(last["n_tokens"]),
+                n_prefill_tokens=int(last["n_prefill_tokens"]),
+                vocab_size=int(last["vocab_size"]),
+                dtype=str(last.get("dtype", "bf16")),
+                token_ids_b64=last.get("token_ids_b64"),
+                logits_b64=last.get("logits_b64"),
+                file=last.get("file"),
+                sha256=last.get("sha256"),
+            )
+        except Exception as e:
+            logger.warning(f"failed to parse logits event: {e}; raw keys={list(last.keys())}")
+            return None
 
     def half_duplex_generate(
         self,
@@ -782,6 +850,7 @@ class CppBackendWorker:
         """Chat 推理"""
         from core.schemas.chat import ChatResponse
         from core.processors.base import MiniCPMOProcessorMixin
+        from core.schemas.logits import LogitsExportSpec, LogitsPayload
 
         generation = getattr(request, "generation", None)
         length_penalty = float(getattr(generation, "length_penalty", 1.1) or 1.1)
@@ -798,12 +867,15 @@ class CppBackendWorker:
                 system_content = getattr(m, "content", None)
                 break
 
+        logits_spec: LogitsExportSpec = getattr(request, "logits", None) or LogitsExportSpec()
+
         self._call_update_session_config(
             media_type=2,
             duplex_mode=False,
             voice_audio=self.ref_audio_path or "",
             system_content=system_content,
             sampling=sampling,
+            return_logits=logits_spec.enabled,
         )
         self._reset_output_dir()
         self._round_number = 0
@@ -838,18 +910,40 @@ class CppBackendWorker:
                     self._cleanup_temp_files("", temp_img)
                     cnt += 1
 
+        decode_body: Dict[str, Any] = {
+            "stream": True,
+            "round_idx": self._round_number,
+            "length_penalty": length_penalty,
+        }
+        if logits_spec.enabled:
+            decode_body["logit_format"] = logits_spec.format
+            if logits_spec.format == "file":
+                # Use the caller-provided output_dir (worker layer is in charge
+                # of picking one; we never invent paths here).
+                if logits_spec.output_dir:
+                    decode_body["logit_output_dir"] = logits_spec.output_dir
+                # Default filename: <round>.safetensors. Worker layer can
+                # override by patching ``logits_spec`` before calling chat().
+                fname = getattr(request, "_logit_filename", None) or f"chat_round{self._round_number}.safetensors"
+                decode_body["logit_filename"] = fname
+                extra = getattr(request, "_logit_extra_metadata", None)
+                if extra:
+                    decode_body["logit_extra_metadata"] = extra
+
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/decode",
-            json={
-                "stream": True,
-                "round_idx": self._round_number,
-                "length_penalty": length_penalty,
-            },
+            json=decode_body,
             timeout=600.0,
         )
         self._round_number += 1
 
-        sse_text = self._parse_sse_text(resp.text) if resp.status_code == 200 else ""
+        sse_text = ""
+        logits_payload: Optional["LogitsPayload"] = None
+        if resp.status_code == 200:
+            sse_text = self._parse_sse_text(resp.text)
+            if logits_spec.enabled:
+                logits_payload = self._extract_logits_from_sse(resp.text)
+
         wav_b64, _ = self._collect_wav_output(sse_text=sse_text)
 
         return ChatResponse(
@@ -857,6 +951,7 @@ class CppBackendWorker:
             audio_data=wav_b64,
             audio_sample_rate=_AUDIO_OUTPUT_SR if wav_b64 else None,
             success=True,
+            logits=logits_payload,
         )
 
     def chat_prefill(self, session_id, msgs, omni_mode=False, max_slice_nums=None,
@@ -1112,6 +1207,7 @@ class CppBackendWorker:
         lang: Optional[str] = None,
         system_content: Any = None,
         sampling: Optional[Dict[str, Any]] = None,
+        return_logits: Optional[bool] = None,
     ) -> None:
         """sampling: 可选 dict，会原样下推到 /v1/stream/update_session_config，
         当前 C++ 侧识别的字段：
@@ -1119,7 +1215,13 @@ class CppBackendWorker:
           - force_listen_count (int)
           - max_new_speak_tokens_per_chunk (int)
           - tts_temperature (float)
-        其它字段会被 C++ 端忽略，便于将来增量扩展。"""
+        其它字段会被 C++ 端忽略，便于将来增量扩展。
+
+        return_logits: 当为 True 时打开 LLM 主干 logit 录制（C++ 内部分配
+        capture buffer 并在每个 prefill/decode 位置累积 (token_id, bf16-logits)
+        对，后续 /v1/stream/decode 完成时通过 SSE event ``logits`` 返回）；
+        为 False 关闭并释放缓冲。为 None 时保持现有状态。
+        """
         duplex_mode_changed = (
             self._last_duplex_mode is not None and
             self._last_duplex_mode != duplex_mode
@@ -1189,6 +1291,11 @@ class CppBackendWorker:
             ):
                 if key in sampling and sampling[key] is not None:
                     req_body[key] = sampling[key]
+
+        # [RL training] Toggle LLM logits capture for the next prefill+decode
+        # cycle. C++ side allocates / frees the bf16 buffer.
+        if return_logits is not None:
+            req_body["return_logits"] = bool(return_logits)
 
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/update_session_config",
