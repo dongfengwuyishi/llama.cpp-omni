@@ -1,0 +1,20 @@
+## Local-only configs (one per deployment)
+config.json
+
+## Runtime artifacts
+tmp/
+data/
+logs/
+*.log
+.venv/
+
+## Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+## OS / IDE
+.DS_Store
+.idea/
+.vscode/

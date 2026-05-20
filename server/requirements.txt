@@ -1,0 +1,35 @@
+# Dependencies for the non-streaming batch inference server.
+#
+# Install with:
+#     python -m venv .venv && source .venv/bin/activate
+#     pip install -r requirements.txt
+#
+# Notes:
+#   - PyTorch + transformers are only needed when backend="pytorch".
+#     The C++ backend (default) calls llama-server via HTTP and does not
+#     need torch at runtime, but we keep it here for the optional path.
+
+# Web service
+fastapi>=0.110.0
+uvicorn>=0.30.0
+httpx>=0.27.0
+requests>=2.30.0
+python-multipart
+
+# Schema
+pydantic>=2.6.0
+
+# Numerics / IO
+numpy>=1.24.0
+soundfile>=0.12.0
+scipy>=1.10.0
+pillow>=10.0.0
+
+# ML backends (PyTorch path; safe to skip when backend=cpp)
+# Pin transformers to match MiniCPM-o-4_5 modeling code.
+transformers==4.51.0
+accelerate>=1.0.0
+safetensors>=0.4.0
+
+# Utility
+tqdm>=4.66.0
