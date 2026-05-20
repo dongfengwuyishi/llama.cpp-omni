@@ -10414,7 +10414,13 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     // 问题：break_event 只在 T2W 线程中被重置，但 T2W 可能还在等待数据
     //       导致新的 decode 检测到 break_event=true 后立即退出，不生成任何 token
     // 解决：在 decode 开始时立即重置 break_event，确保新一轮生成可以正常进行
-    if (ctx_omni->duplex_mode && ctx_omni->break_event.load()) {
+    //
+    // [BUGFIX use_tts=false] 此处原本只在 duplex_mode 下 reset，导致 simplex 路径
+    // 在 update_session_config (内部会 POST /v1/stream/break) 之后启动 decode 时
+    // 立刻看到 break_event=true，sampling loop 一次都不进入，sse_text 为空。
+    // T2W 线程在 use_tts=true 时会清掉 break_event，所以 with TTS 偶然没 bug；
+    // use_tts=false 没有 T2W 线程兜底，必须在这里显式 reset。无论双工/单工都做。
+    if (ctx_omni->break_event.load()) {
         ctx_omni->break_event.store(false);
         print_with_timestamp("📍 stream_decode: reset break_event from true to false\n");
     }

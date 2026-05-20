@@ -699,6 +699,7 @@ async def lifespan(app: FastAPI):
             cpp_server_port=config.get("cpp_server_port"),
             ctx_size=config.get("ctx_size", 32768),
             n_gpu_layers=config.get("n_gpu_layers", 99),
+            use_tts=config.get("use_tts", True),
         )
     else:
         worker = MiniCPMOWorker(
@@ -3230,6 +3231,17 @@ def main():
     parser.add_argument("--gpu-id", type=int, default=None, help="GPU ID (inferred from port if not set)")
     parser.add_argument("--worker-index", type=int, default=0, help="Worker index (0, 1, 2, ...)")
     parser.add_argument("--duplex-pause-timeout", type=float, default=None, help="Duplex pause timeout (s)")
+    parser.add_argument(
+        "--no-tts",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable TTS / Token2Wav entirely. The C++ worker is started with "
+            "use_tts=False — no TTS / T2W weights are loaded and no TTS threads "
+            "are spawned. Use this for RL training rollouts / text-only eval, "
+            "where audio synthesis is dead weight."
+        ),
+    )
     args = parser.parse_args()
 
     port = args.port or cfg.worker_port(args.worker_index)
@@ -3239,6 +3251,9 @@ def main():
 
     if backend == "cpp":
         cpp_cfg = cfg.cpp_backend
+        # use_tts precedence: CLI --no-tts wins over config.cpp_backend.use_tts.
+        cfg_use_tts = getattr(cpp_cfg, "use_tts", True)
+        effective_use_tts = bool(cfg_use_tts) and not args.no_tts
         WORKER_CONFIG.update({
             "backend": "cpp",
             "llamacpp_root": cpp_cfg.llamacpp_root,
@@ -3250,8 +3265,12 @@ def main():
             "cpp_server_port": cpp_cfg.cpp_server_port,
             "ctx_size": cpp_cfg.ctx_size,
             "n_gpu_layers": cpp_cfg.n_gpu_layers,
+            "use_tts": effective_use_tts,
         })
-        logger.info(f"Starting Worker (C++ backend) on port {port}, GPU {gpu_id}")
+        logger.info(
+            f"Starting Worker (C++ backend) on port {port}, GPU {gpu_id}, "
+            f"use_tts={effective_use_tts}"
+        )
     else:
         WORKER_CONFIG.update({
             "backend": "pytorch",

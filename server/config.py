@@ -197,6 +197,16 @@ class CppBackendConfig(BaseModel):
         default=99,
         description="GPU offload 层数",
     )
+    use_tts: bool = Field(
+        default=True,
+        description=(
+            "Whether the C++ worker should load TTS / Token2Wav weights and "
+            "spawn TTS / T2W threads. Set to false for RL training rollouts / "
+            "text-only eval to save model-load time and GPU memory and to keep "
+            "the LLM main backbone free of TTS contention. "
+            "CLI --no-tts overrides this."
+        ),
+    )
 
 
 class DuplexSectionConfig(BaseModel):

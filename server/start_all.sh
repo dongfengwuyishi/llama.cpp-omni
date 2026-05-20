@@ -2,8 +2,9 @@
 # Launch the non-streaming batch inference server.
 #
 # Usage:
-#     bash start_all.sh                 # use all visible GPUs
+#     bash start_all.sh                       # use all visible GPUs
 #     CUDA_VISIBLE_DEVICES=0,1 bash start_all.sh
+#     NO_TTS=1 bash start_all.sh              # text-only (skip TTS/T2W) — RL rollout mode
 #
 # Notes:
 #   - This script spawns one worker per GPU + a single batch_server on the
@@ -13,6 +14,12 @@
 #         pkill -f "batch_server.py|worker.py|llama-server"
 
 set -e
+
+# Optional: skip TTS / Token2Wav entirely (text-only mode).
+WORKER_EXTRA_ARGS=""
+if [[ -n "$NO_TTS" && "$NO_TTS" != "0" ]]; then
+    WORKER_EXTRA_ARGS="--no-tts"
+fi
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
@@ -61,6 +68,7 @@ for GPU_ID in $(echo "$GPU_LIST" | tr ',' ' '); do
             --port "$WORKER_PORT" \
             --gpu-id "$GPU_ID" \
             --worker-index "$GPU_IDX" \
+            $WORKER_EXTRA_ARGS \
         > "tmp/worker_${GPU_IDX}.log" 2>&1 &
     echo $! > "tmp/worker_${GPU_IDX}.pid"
 

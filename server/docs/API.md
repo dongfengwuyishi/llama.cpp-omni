@@ -472,7 +472,54 @@ PYTHONPATH=. .venv/bin/pytest tests/e2e --run-e2e -s
 
 ---
 
-## 8. Logits export for RL training
+## 8. Text-only mode (skip TTS / Token2Wav)
+
+For RL training rollouts / text-only eval where audio synthesis is dead
+weight, start the worker with `--no-tts` (or `NO_TTS=1 bash start_all.sh`).
+The C++ worker is then booted with `use_tts=False`:
+
+- TTS / Token2Wav weights are **not** loaded (model boot drops from ~30-60s
+  to ~7s)
+- TTS / T2W threads are **not** spawned
+- LLM main backbone runs without TTS contention
+
+### Performance (1× RTX 4090, MiniCPM-o-4_5 Q8_0, 7-chunk duplex_offline)
+
+| | with TTS | `NO_TTS=1` | Δ |
+|---|---|---|---|
+| `total_duration_ms` (server) | 31.3 s | **14.0 s** | **−55%** |
+| client wall-clock | 49.5 s | **30.3 s** | **−39%** |
+| model load time | ~30 s | ~7 s | −77% |
+
+### Config
+
+```jsonc
+"cpp_backend": {
+  ...
+  "use_tts": false        // optional; default true. Overridden by CLI --no-tts.
+}
+```
+
+### Known limitations (text-only mode)
+
+1. `POST /v1/chat` **does not work** in text-only mode (returns empty `text`).
+   The simplex chat path in the C++ engine still wires through TTS-side state
+   machines and short-circuits when `use_tts=False`. Workaround: route all
+   text-only inference through `/v1/duplex_offline`, which works.
+2. `logits` capture under `NO_TTS=1` is **incomplete**: only ~5% of expected
+   token positions are captured (the new opt/perf-round4 duplex pipeline
+   bypasses most of the existing capture hooks when `use_tts=False`). If you
+   need full logits for RL training, **keep TTS enabled**.
+3. Audio output fields (`audio_data`, `merged_audio_data`) are always `null`
+   in `NO_TTS=1` mode; setting `tts.enabled=true` in the request has no
+   effect.
+
+Both limitations 1 and 2 are open items; see commit log on `feat/web-server`
+for the latest investigation status.
+
+---
+
+## 9. Logits export for RL training
 
 设置 `logits.enabled=true` 可以让 server 把 LLM **主干**在每个位置的 next-token
 分布捕获下来，配合 sampled token id 一起返回。**双工 / 单工都支持**。
@@ -611,7 +658,7 @@ E2E 验证脚本：[`scripts/smoke_logits.py`](../scripts/smoke_logits.py)。
 
 ---
 
-## 9. 字段总览参考
+## 10. 字段总览参考
 
 | 文件 | 关键 schema |
 |---|---|

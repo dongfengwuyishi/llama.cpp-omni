@@ -201,6 +201,7 @@ class CppBackendWorker:
         cpp_server_port: Optional[int] = None,
         ctx_size: int = 32768,
         n_gpu_layers: int = 99,
+        use_tts: bool = True,
         **kwargs,
     ):
         self.llamacpp_root = llamacpp_root
@@ -211,6 +212,11 @@ class CppBackendWorker:
         self.llm_model = llm_model or self._auto_detect_llm_model(model_dir)
         self.ctx_size = ctx_size
         self.n_gpu_layers = n_gpu_layers
+        # When False, omni_init is called with use_tts=False so the C++ side
+        # skips loading TTS/Token2Wav weights and never spawns the TTS / T2W
+        # threads. Used for RL-training rollouts that only care about the
+        # LLM token stream + logits (no audio synthesis).
+        self.use_tts = bool(use_tts)
 
         from worker import WorkerState, WorkerStatus
         self.state = WorkerState()
@@ -944,7 +950,15 @@ class CppBackendWorker:
             if logits_spec.enabled:
                 logits_payload = self._extract_logits_from_sse(resp.text)
 
-        wav_b64, _ = self._collect_wav_output(sse_text=sse_text)
+        # Only scrape TTS WAV output if the caller actually asked for audio,
+        # AND the worker has TTS enabled at all. ``_collect_wav_output`` does
+        # a polling wait (~6s) for the WAV dir to appear, which is pure
+        # overhead for text-only RL/eval requests.
+        want_audio = bool(getattr(request, "tts", None) and request.tts.enabled)
+        if want_audio and self.use_tts:
+            wav_b64, _ = self._collect_wav_output(sse_text=sse_text)
+        else:
+            wav_b64 = None
 
         return ChatResponse(
             text=sse_text,
@@ -1157,7 +1171,7 @@ class CppBackendWorker:
 
         req_body = {
             "media_type": media_type,
-            "use_tts": True,
+            "use_tts": bool(self.use_tts),
             "duplex_mode": duplex_mode,
             "model_dir": self.model_dir,
             "tts_bin_dir": tts_bin_dir,
