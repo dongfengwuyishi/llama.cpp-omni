@@ -1112,7 +1112,7 @@ class CppBackendWorker:
             try:
                 for line in self._cpp_process.stdout:
                     stripped = line.rstrip()
-                    if any(kw in stripped for kw in ("TTS", "T2W", "LLM->TTS", "wav_", "tts_thread", "generate_audio", "speek_done", "break_event", "lang", "language", "omni_set_language", "prefill", "change")):
+                    if any(kw in stripped for kw in ("TTS", "T2W", "LLM->TTS", "wav_", "tts_thread", "generate_audio", "speek_done", "break_event", "lang", "language", "omni_set_language", "prefill", "change", "stream_decode", "LLM thread", "LLM Duplex", "force_listen", "LLM decode", "EOS", "EOG", "sample", "is_listen", "duplex_decode")):
                         logger.info(f"[CPP] {stripped}")
                     else:
                         logger.debug(f"[CPP] {stripped}")
