@@ -63,6 +63,9 @@ class CallResult:
     speak_chunks: int = 0
     audio_duration_s: float = 0.0
     logits_file: Optional[str] = None     # if logits.format='file' succeeded
+    request_id: Optional[str] = None
+    user_audio_path: Optional[str] = None
+    system_prompt: str = ""
 
 
 def make_body(*, user_audio: str, request_id: str, with_logits_file: bool,
@@ -80,6 +83,19 @@ def make_body(*, user_audio: str, request_id: str, with_logits_file: bool,
     请求**有上限**，避免某个测试 case 触发 attractor 导致跑几分钟才返回。
     real prod 默认更大，但这里我们只是做服务侧故障注入。
     """
+    # ⚠️ 关键参数说明（曾经踩过两个互相打架的坑）：
+    #
+    #   1. ``max_chunks`` 是 ``DuplexBatchRequest`` 的**顶层字段**，不是
+    #      ``config`` 内的字段。把它放 config 里等于白填，server 会用
+    #      None=不限来跑；当 audio 跑完后 LLM 偶尔会陷入 attractor，KV
+    #      cache 一路涨到 32K，单条请求十几分钟不返回。
+    #
+    #   2. ``stop_on_end_of_turn=True`` 反而**有害**：duplex 模型在
+    #      chunk 1 几乎一定会 emit ``end_of_turn=True``（因为还在 listen
+    #      phase 时 EOT bit 总是 True），server 就立刻 short-circuit 退出
+    #      ``stopped_reason=end_of_turn``，total_chunks=1, speak_chunks=0,
+    #      full_text=""。所以这里固定用 False，让 audio_exhausted 或
+    #      max_chunks 兜底退出。
     body: Dict[str, Any] = {
         "system_prompt": "请简短回应用户。",
         "user_audio_path": user_audio,
@@ -87,10 +103,10 @@ def make_body(*, user_audio: str, request_id: str, with_logits_file: bool,
             "force_listen_count": 3,
             "chunk_ms": 1000,
             "max_new_speak_tokens_per_chunk": 24,
-            "max_chunks": 8,
             "temperature": 0.7,
         },
         "stop_on_end_of_turn": False,
+        "max_chunks": 16,
         "return_per_chunk_audio": False,
         "return_merged_audio": False,
         "include_text_timeline": False,
@@ -115,6 +131,7 @@ async def call_duplex(
 ) -> CallResult:
     body = make_body(user_audio=user_audio, request_id=request_id,
                      with_logits_file=True, logits_dir=logits_dir)
+    sysp = str(body.get("system_prompt") or "")
     t0 = time.perf_counter()
     try:
         r = await client.post("/v1/duplex_offline", json=body,
@@ -122,20 +139,28 @@ async def call_duplex(
     except httpx.TimeoutException as e:
         return CallResult(ok=False, status=-1,
                           latency_ms=(time.perf_counter() - t0) * 1000,
-                          err=f"timeout: {e!s}")
+                          err=f"timeout: {e!s}",
+                          request_id=request_id, user_audio_path=user_audio,
+                          system_prompt=sysp)
     except httpx.RequestError as e:
         return CallResult(ok=False, status=-1,
                           latency_ms=(time.perf_counter() - t0) * 1000,
-                          err=f"network: {type(e).__name__}: {e!s}")
+                          err=f"network: {type(e).__name__}: {e!s}",
+                          request_id=request_id, user_audio_path=user_audio,
+                          system_prompt=sysp)
     lat = (time.perf_counter() - t0) * 1000
     if r.status_code != 200:
         return CallResult(ok=False, status=r.status_code, latency_ms=lat,
-                          err=r.text[:300])
+                          err=r.text[:300],
+                          request_id=request_id, user_audio_path=user_audio,
+                          system_prompt=sysp)
     try:
         p = r.json()
     except Exception as e:
         return CallResult(ok=False, status=r.status_code, latency_ms=lat,
-                          err=f"json-decode: {e!s}")
+                          err=f"json-decode: {e!s}",
+                          request_id=request_id, user_audio_path=user_audio,
+                          system_prompt=sysp)
     success = bool(p.get("success"))
     err = None if success else (p.get("error") or "success=false")
     logits_blob = p.get("logits") or {}
@@ -150,6 +175,9 @@ async def call_duplex(
         speak_chunks=int(p.get("speak_chunks") or 0),
         audio_duration_s=float(p.get("audio_duration_s") or 0.0),
         logits_file=logits_file,
+        request_id=p.get("request_id") or request_id,
+        user_audio_path=user_audio,
+        system_prompt=sysp,
     )
 
 
@@ -249,10 +277,44 @@ _FILENAME_RE = re.compile(
 
 
 async def main_async(args: argparse.Namespace) -> int:
-    user_audio = os.path.abspath(args.user_audio)
-    if not os.path.exists(user_audio):
-        print(f"[!] user audio not found: {user_audio}", file=sys.stderr)
+    # ``--user-audio`` 既可以是单个 wav，也可以是 manifest.json（由
+    # ``synth_questions_voxcpm.py`` 生成）。manifest 模式下我们会带上
+    # 每条 wav 的"已知文本（即合成时的 prompt）"作为 ``ref_question_text``
+    # 写进 dump，方便人审"听不懂音频"时也能直接看文本判断模型回答得对不对。
+    user_audio_pool: List[Tuple[str, str]] = []  # (wav_path, ref_text)
+    user_audio_arg = os.path.abspath(args.user_audio)
+    if not os.path.exists(user_audio_arg):
+        print(f"[!] user audio not found: {user_audio_arg}", file=sys.stderr)
         return 2
+    if user_audio_arg.endswith(".json"):
+        with open(user_audio_arg, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        if not isinstance(manifest, list) or not manifest:
+            print(f"[!] manifest empty/malformed: {user_audio_arg}",
+                  file=sys.stderr)
+            return 2
+        for rec in manifest:
+            wav = rec.get("wav")
+            txt = rec.get("text", "")
+            if wav and os.path.exists(wav):
+                user_audio_pool.append((wav, txt))
+        if not user_audio_pool:
+            print(f"[!] no valid wav in manifest", file=sys.stderr)
+            return 2
+        print(f"[+] loaded {len(user_audio_pool)} wavs from manifest "
+              f"{user_audio_arg}")
+    elif os.path.isdir(user_audio_arg):
+        for f in sorted(os.listdir(user_audio_arg)):
+            if f.endswith(".wav"):
+                user_audio_pool.append((os.path.join(user_audio_arg, f), ""))
+        if not user_audio_pool:
+            print(f"[!] no .wav under dir {user_audio_arg}", file=sys.stderr)
+            return 2
+        print(f"[+] loaded {len(user_audio_pool)} wavs from dir "
+              f"{user_audio_arg}")
+    else:
+        user_audio_pool.append((user_audio_arg, ""))
+    user_audio = user_audio_pool[0][0]  # back-compat: 老 print 用
 
     gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip()] \
         if args.gpu_ids else []
@@ -288,6 +350,17 @@ async def main_async(args: argparse.Namespace) -> int:
 
         os.makedirs(args.logits_dir, exist_ok=True)
 
+        # ``--dump-conversations`` 把每条 (system_prompt, user_audio_path,
+        # full_text) 写到 JSONL，方便事后人工审听音频 + 对照模型回复文本。
+        # 注意 duplex 请求的"输入"是音频不是文本，所以人审时通常需要播
+        # ``user_audio_path`` 听一遍才能判断 ``full_text`` 回答得对不对。
+        dump_fp = None
+        if args.dump_conversations:
+            dump_path = os.path.abspath(args.dump_conversations)
+            os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
+            dump_fp = open(dump_path, "w", encoding="utf-8")
+            print(f"[+] dumping conversations to {dump_path}")
+
         snapshots: List[Snapshot] = []
         stop_evt = asyncio.Event()
         mon_task = asyncio.create_task(
@@ -299,26 +372,65 @@ async def main_async(args: argparse.Namespace) -> int:
         progress = [0]
         total_target = args.concurrency * args.total_per_worker
 
+        # 把当前请求用的"已知问句文本"传给 _dump（CallResult 里没有这一
+        # 项；我们在闭包里另存一份）。这样 JSONL 每行就有 ``user_question``
+        # = 我们合成 wav 时的 prompt，人审能直接对照。
+        cur_ref: Dict[str, str] = {}
+
+        def _dump_with_ref(res: CallResult) -> None:
+            if dump_fp is None:
+                return
+            rec = {
+                "request_id":          res.request_id,
+                "ok":                  res.ok,
+                "status":              res.status,
+                "latency_ms":          round(res.latency_ms, 1),
+                "worker_id":           res.worker_id,
+                "system_prompt":       res.system_prompt,
+                "user_audio_path":     res.user_audio_path,
+                # 注意：``user_question`` 是我们合成 wav 用的 prompt，
+                # 不是 server 端 ASR 出来的实际识别文本——server 端没暴露
+                # 中间识别。但只要 VoxCPM2 没明显合成失误，二者基本一致。
+                "user_question":       cur_ref.get(res.request_id or "", ""),
+                "full_text":           res.full_text,
+                "total_chunks":        res.total_chunks,
+                "speak_chunks":        res.speak_chunks,
+                "audio_duration_s":    res.audio_duration_s,
+                "logits_file":         res.logits_file,
+                "err":                 res.err,
+            }
+            dump_fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            dump_fp.flush()
+
         async def worker_task(wid: int):
             for k in range(args.total_per_worker):
+                # 轮询问句池 —— 每个并发任务从不同偏移开始，避免所有 worker
+                # 第一发都打同一段 wav 导致 server 端 cache 命中假装变快。
+                wav_path, ref_text = user_audio_pool[
+                    (wid * args.total_per_worker + k) % len(user_audio_pool)]
                 rid = f"stress_dup_{wid}_{k}"
+                cur_ref[rid] = ref_text
                 res = await call_duplex(
                     client,
-                    user_audio=user_audio,
+                    user_audio=wav_path,
                     request_id=rid,
                     timeout_s=args.timeout_s,
                     logits_dir=args.logits_dir,
                 )
                 async with results_lock:
                     results.append(res)
+                    _dump_with_ref(res)
                     progress[0] += 1
+                    text_preview = (res.full_text or "")[:60].replace("\n", " ")
                     print(f"    [progress {progress[0]}/{total_target}] "
                           f"wid={wid} k={k} ok={res.ok} status={res.status} "
                           f"lat={res.latency_ms/1000:.1f}s "
                           f"chunks={res.total_chunks} "
                           f"speak={res.speak_chunks} "
                           f"worker={res.worker_id} "
-                          f"file={Path(res.logits_file).name if res.logits_file else '-'}")
+                          f"file={Path(res.logits_file).name if res.logits_file else '-'} "
+                          f"q={ref_text!r} "
+                          f"text={text_preview!r}")
                     if not res.ok:
                         print(f"      err: {res.err}")
 
@@ -468,6 +580,8 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"  GPU{g['gpu_idx']}: first={g['first']}MB last={g['last']}MB "
                   f"drift={g['drift_mb']}MB")
         print("-" * 70)
+        if dump_fp is not None:
+            dump_fp.close()
         if passed:
             print("RESULT: PASS")
             for w in report["reasons"]:
@@ -484,7 +598,9 @@ def parse_args() -> argparse.Namespace:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", default="http://localhost:8080")
     ap.add_argument("--user-audio", required=True,
-                    help="path to a 16kHz mono wav (≤10s recommended)")
+                    help=("16kHz mono wav 路径；也可为 manifest.json（由 "
+                          "synth_questions_voxcpm.py 生成，每条含 wav+text）"
+                          "或目录（其下所有 .wav 轮询）"))
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--total-per-worker", type=int, default=3,
                     help="N requests serially per concurrent task")
@@ -495,6 +611,9 @@ def parse_args() -> argparse.Namespace:
                     help="comma-separated host GPU indices for nvidia-smi sampling")
     ap.add_argument("--logits-dir", default="/tmp/minicpm_logits_duplex_stress")
     ap.add_argument("--report", default="")
+    ap.add_argument("--dump-conversations", default="",
+                    help=("dump per-request {system_prompt, user_audio_path, "
+                          "full_text, ...} as JSONL for human review"))
     return ap.parse_args()
 
 

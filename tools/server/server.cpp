@@ -5607,7 +5607,11 @@ int main(int argc, char ** argv) {
         // -1 (默认) = 使用全局设置, 1 = 不切片, 2 = 高清模式切片
         const int max_slice_nums             = data.value("max_slice_nums", -1);
 
-        if (audio_path_prefix.empty() && img_path_prefix.empty() && text.empty()) {
+        // cnt==0 是 system-prompt-init 占位调用（omni.cpp:10096 契约：在 update_session_config
+        // 清空 KV 后，第一发 stream_prefill(cnt=0) 触发 system prompt + ref_audio embedding 的
+        // 重建，C++ 内部会从 ctx_omni->ref_audio_path 读取 ref 音色，因此本调用允许三个内容字段
+        // 全空。cnt>0 仍要求至少一个非空内容（user audio/image/text）。
+        if (cnt != 0 && audio_path_prefix.empty() && img_path_prefix.empty() && text.empty()) {
             res_error(res, format_error_response(
                 "at least one of \"audio_path_prefix\", \"img_path_prefix\", \"text\" must be non-empty",
                 ERROR_TYPE_INVALID_REQUEST));

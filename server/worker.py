@@ -24,6 +24,7 @@ import logging
 import base64
 import threading
 from enum import Enum
+from functools import wraps
 from typing import Optional, List, Dict, Any, Iterator
 from datetime import datetime
 
@@ -797,6 +798,37 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MiniCPMO45 Worker", lifespan=lifespan)
 
 
+# ========== Inference 串行化 ==========
+# 单 cpp 子进程一次只能处理一个 inference 请求；fastapi/uvicorn 默认接收并发
+# 连接，必须显式串行化所有进入 cpp 的 endpoint，避免在前一请求 cleanup（含
+# full_reinit 重启 llama-server）期间被新请求命中导致 ReadTimeout/500。
+# 在 lifespan 中初始化（loop 已就绪），endpoint 通过 @serialize_inference
+# 装饰器获取此 lock。
+_INFERENCE_LOCK: Optional[asyncio.Lock] = None
+
+
+def _get_inference_lock() -> asyncio.Lock:
+    global _INFERENCE_LOCK
+    if _INFERENCE_LOCK is None:
+        _INFERENCE_LOCK = asyncio.Lock()
+    return _INFERENCE_LOCK
+
+
+def serialize_inference(fn):
+    """装饰器：让 inference endpoint 在 worker 内部串行执行。
+
+    保证一次只有一个请求进入 cpp 处理流水线（含 cleanup 阶段的 full_reinit），
+    第二个请求会在 acquire 阶段阻塞直到前者完整释放。
+    """
+
+    @wraps(fn)
+    async def wrapper(*args, **kwargs):
+        async with _get_inference_lock():
+            return await fn(*args, **kwargs)
+
+    return wrapper
+
+
 # ========== 健康检查 ==========
 
 @app.get("/health", response_model=WorkerHealthResponse)
@@ -848,6 +880,7 @@ async def health():
 # ========== Chat API ==========
 
 @app.post("/chat", response_model=ChatResponse)
+@serialize_inference
 async def chat(request: ChatRequest):
     """Chat 推理（无状态）"""
     if not _worker_ready():
@@ -1097,6 +1130,7 @@ def _extract_ref_audio_from_content(
 
 
 @app.websocket("/ws/chat")
+@serialize_inference
 async def chat_ws(ws: WebSocket):
     """Chat WebSocket — 统一流式/非流式
 
@@ -1507,6 +1541,7 @@ async def half_duplex_stop():
 # ========== Half-Duplex WebSocket ==========
 
 @app.websocket("/ws/half_duplex")
+@serialize_inference
 async def half_duplex_ws(ws: WebSocket):
     """Half-Duplex Audio WebSocket
 
@@ -1844,6 +1879,7 @@ async def half_duplex_ws(ws: WebSocket):
 # ========== Half-Duplex Omni WebSocket ==========
 
 @app.websocket("/ws/half_duplex_omni")
+@serialize_inference
 async def half_duplex_omni_ws(ws: WebSocket):
     """Half-Duplex Omni WebSocket — 音频+视频帧输入，VAD 触发后一次性 prefill + decode
 
@@ -2131,6 +2167,7 @@ async def half_duplex_omni_ws(ws: WebSocket):
 # ========== Duplex WebSocket ==========
 
 @app.websocket("/ws/duplex")
+@serialize_inference
 async def duplex_ws(ws: WebSocket):
     """Duplex WebSocket
 
@@ -2871,6 +2908,7 @@ def _write_safetensors_logits(
 
 
 @app.post("/duplex_offline")
+@serialize_inference
 async def duplex_offline(request_body: Dict[str, Any]):
     """非流式双工批量推理"""
     from core.schemas.duplex_batch import DuplexBatchRequest, DuplexBatchResponse

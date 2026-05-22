@@ -138,8 +138,16 @@ async def _proxy_to_worker(
     payload: Dict[str, Any],
     dispatch_status: GatewayWorkerStatus,
     timeout: Optional[float] = None,
+    release_with_loading: bool = False,
 ) -> Dict[str, Any]:
-    """通用代理：入队 → 等 worker → 发请求 → 释放 worker"""
+    """通用代理：入队 → 等 worker → 发请求 → 释放 worker
+
+    Args:
+        release_with_loading: 释放 worker 时是否标记为 LOADING 而非 IDLE。
+            duplex 路径开启此项，让 worker_pool 通过周期性 health 探测
+            等 worker 自报 idle 后再 dispatch 下一个请求，避免 worker 内
+            cleanup（如 full_reinit 重启 cpp 子进程）期间被新请求命中。
+    """
     if worker_pool is None:
         raise HTTPException(status_code=503, detail="Service not ready")
 
@@ -198,8 +206,16 @@ async def _proxy_to_worker(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         duration = (datetime.now() - task_start).total_seconds()
+        post_status = (
+            GatewayWorkerStatus.LOADING
+            if release_with_loading
+            else GatewayWorkerStatus.IDLE
+        )
         worker_pool.release_worker(
-            worker, request_type=request_type, duration_s=duration
+            worker,
+            request_type=request_type,
+            duration_s=duration,
+            post_release_status=post_status,
         )
 
 
@@ -304,6 +320,8 @@ async def duplex_offline(request: Request):
     body = await request.json()
     timeout = SERVER_CONFIG.get("duplex_offline_timeout", 600.0)
     # FIFO 队列里用 "audio_duplex" 类型（worker_pool 已有此请求类型与 ETA）
+    # release_with_loading=True：worker.py finally 中含 full_reinit（重启 llama-server，
+    # 50–90s），response 发出后 worker_pool 应在 health 自报 idle 后才 dispatch 下一个
     return await _proxy_to_worker(
         request=request,
         request_type="audio_duplex",
@@ -311,6 +329,7 @@ async def duplex_offline(request: Request):
         payload=body,
         dispatch_status=GatewayWorkerStatus.DUPLEX_ACTIVE,
         timeout=timeout,
+        release_with_loading=True,
     )
 
 

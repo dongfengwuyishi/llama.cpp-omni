@@ -143,6 +143,17 @@ class CallResult:
     worker_id: Optional[str] = None
     queue_wait_ms: Optional[float] = None
     tokens_generated: Optional[int] = None
+    # ---- 人工审阅：保存请求 prompt 和模型回复文本，用于事后看回答质量 ----
+    # 单工 chat 的 ChatResponse.text 字段，是 detokenize 后的可读字符串。
+    # 注意：use_tts=true 路径下，LLM 在 ``<|tts_bos|>`` 后会继续吐 token；
+    # 这些 token 大多数是 audio embedding 编号（id < 0 的占位符或 codec
+    # token），detokenize 出来可能是 garbage —— 这是**预期行为**，因为
+    # ``<|tts_bos|>`` 把模型推向了语音通道。RL rollout 真正应消费 token_ids
+    # + logits（走 ``logits_export``），而不是 ``text``。这里 dump 出来纯粹
+    # 为了"人工大致看一眼回答方向对不对"，不是质量打分依据。
+    prompt: str = ""
+    response_text: str = ""
+    request_id: Optional[str] = None
 
 
 # ============================================================
@@ -157,6 +168,14 @@ async def call_chat(
     timeout_s: float,
 ) -> CallResult:
     body = make_chat_body(case, idx)
+    # 抽出 user prompt 用于后续 dump（即使请求失败，也能让人知道是什么 prompt）
+    prompt = ""
+    msgs = body.get("messages", [])
+    if msgs:
+        c = msgs[0].get("content", "")
+        prompt = c if isinstance(c, str) else str(c)
+    rid = body.get("request_id")
+
     t0 = time.perf_counter()
     try:
         r = await client.post("/v1/chat", json=body, timeout=timeout_s)
@@ -165,18 +184,21 @@ async def call_chat(
             case=case, ok=False, status=-1,
             latency_ms=(time.perf_counter() - t0) * 1000,
             err=f"timeout: {e!s}",
+            prompt=prompt, request_id=rid,
         )
     except httpx.RequestError as e:
         return CallResult(
             case=case, ok=False, status=-1,
             latency_ms=(time.perf_counter() - t0) * 1000,
             err=f"network: {type(e).__name__}: {e!s}",
+            prompt=prompt, request_id=rid,
         )
     lat = (time.perf_counter() - t0) * 1000
     if r.status_code != 200:
         return CallResult(
             case=case, ok=False, status=r.status_code, latency_ms=lat,
             err=r.text[:300],
+            prompt=prompt, request_id=rid,
         )
     try:
         p = r.json()
@@ -184,6 +206,7 @@ async def call_chat(
         return CallResult(
             case=case, ok=False, status=r.status_code, latency_ms=lat,
             err=f"json-decode: {e!s}",
+            prompt=prompt, request_id=rid,
         )
     success = bool(p.get("success"))
     err = None if success else (p.get("error") or "success=false")
@@ -193,6 +216,9 @@ async def call_chat(
         worker_id=p.get("worker_id"),
         queue_wait_ms=p.get("queue_wait_ms"),
         tokens_generated=p.get("tokens_generated"),
+        prompt=prompt,
+        response_text=p.get("text") or "",
+        request_id=p.get("request_id") or rid,
     )
 
 
@@ -217,8 +243,14 @@ async def run_phase(
     rng: random.Random,
     timeout_s: float,
     on_progress=None,
+    dump_writer=None,
 ) -> None:
-    """跑 N 个 worker task，每个 task 串行打 /v1/chat 直到时间到。"""
+    """跑 N 个 worker task，每个 task 串行打 /v1/chat 直到时间到。
+
+    ``dump_writer`` 可选，签名 ``(phase_name, CallResult) -> None``，每条
+    请求完成后被调用一次（用于 ``--dump-conversations`` 把 prompt+response
+    实时落盘到 JSONL，避免脚本被 ctrl-c 后丢数据）。
+    """
 
     phase.started_at = time.perf_counter()
     deadline = phase.started_at + phase.duration_s
@@ -230,6 +262,11 @@ async def run_phase(
             case = pick_case(rng)
             res = await call_chat(client, case, local_idx, timeout_s)
             phase.results.append(res)
+            if dump_writer is not None:
+                try:
+                    dump_writer(phase.name, res)
+                except Exception:
+                    pass  # dump 失败不打断压测
             counter[0] += 1
             if on_progress is not None and counter[0] % 20 == 0:
                 on_progress(counter[0], len(phase.results))
@@ -459,6 +496,38 @@ async def main_async(args: argparse.Namespace) -> int:
     gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip()] \
         if args.gpu_ids else []
 
+    # ``--dump-conversations`` 把每条 (prompt, response) 对实时落到 JSONL，
+    # 这样 1) 中途 ctrl-c 不丢数据，2) 可以另开 shell ``tail -f`` 看进度，
+    # 3) 跑完后给人审阅"模型回答得对不对"。我们故意不在内存里 buffer 整批
+    # ——压测可能成千上万条，buffer 起来 RAM 撑爆，反而干扰服务侧测量。
+    dump_fp = None
+    dump_lock_obj = None
+    if args.dump_conversations:
+        dump_path = os.path.abspath(args.dump_conversations)
+        os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
+        dump_fp = open(dump_path, "w", encoding="utf-8")
+        dump_lock_obj = asyncio.Lock()  # noqa: F841 (kept for future use)
+        print(f"[+] dumping conversations to {dump_path}")
+
+    def _dump(phase_name: str, res: CallResult) -> None:
+        if dump_fp is None:
+            return
+        rec = {
+            "phase":          phase_name,
+            "case":           res.case,
+            "request_id":     res.request_id,
+            "ok":             res.ok,
+            "status":         res.status,
+            "latency_ms":     round(res.latency_ms, 1),
+            "worker_id":      res.worker_id,
+            "tokens":         res.tokens_generated,
+            "prompt":         res.prompt,
+            "response_text":  res.response_text,
+            "err":            res.err,
+        }
+        dump_fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        dump_fp.flush()
+
     transport_limits = httpx.Limits(
         max_connections=args.max_concurrency * 2,
         max_keepalive_connections=args.max_concurrency,
@@ -488,8 +557,9 @@ async def main_async(args: argparse.Namespace) -> int:
         warmup = PhaseStats(name="warmup", concurrency=1, duration_s=0)
         warmup.started_at = time.perf_counter()
         for i in range(4):
-            warmup.results.append(
-                await call_chat(client, "greedy", i, args.timeout_s))
+            wres = await call_chat(client, "greedy", i, args.timeout_s)
+            warmup.results.append(wres)
+            _dump("warmup", wres)
         warmup.ended_at = time.perf_counter()
         print(f"    warmup done in "
               f"{warmup.ended_at - warmup.started_at:.1f}s, "
@@ -529,7 +599,8 @@ async def main_async(args: argparse.Namespace) -> int:
                             on_progress=lambda total, n_results, name=ph.name:
                                 print(f"    [{name}] +{total} done "
                                       f"({n_results} results so far)",
-                                      flush=True))
+                                      flush=True),
+                            dump_writer=_dump)
             done_summary = summarize_phase(ph)
             print(f"    [{ph.name}] n={done_summary['total']} "
                   f"ok={done_summary['ok']} "
@@ -592,6 +663,8 @@ async def main_async(args: argparse.Namespace) -> int:
                   f"first={g['first']}MB last={g['last']}MB "
                   f"drift={g['drift_mb']}MB")
         print("-" * 70)
+        if dump_fp is not None:
+            dump_fp.close()
         if passed:
             print("RESULT: PASS")
             for w in reasons:
@@ -620,6 +693,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=20260521)
     ap.add_argument("--report", default="",
                     help="把 JSON 报告写到此路径")
+    ap.add_argument("--dump-conversations", default="",
+                    help=("把每条 (prompt, response_text) 实时落到 JSONL 文件。"
+                          "每行 1 条，schema：{phase, case, request_id, ok, status, "
+                          "latency_ms, worker_id, tokens, prompt, response_text, err}。"
+                          "便于人工审阅模型回答质量。"))
     return ap.parse_args()
 
 

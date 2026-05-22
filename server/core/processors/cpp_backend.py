@@ -315,27 +315,95 @@ class CppBackendWorker:
         self._sent_wav_files: set = set()
         self._last_kv_cache_length: int = 0
 
+        # New layered backend infrastructure (Phase 4 of the simplex/duplex
+        # refactor). ``_proc`` and ``_http`` are bound during ``load_model``;
+        # ``simplex`` and ``duplex`` are the public entry points the
+        # worker.py endpoints now go through. Legacy method stubs above
+        # remain only as thin proxies for the WS half-duplex / chat /
+        # duplex paths until those callers migrate.
+        from .cpp_session import _CppServerProc, _StreamHttpClient
+        self._proc = _CppServerProc(
+            llamacpp_root=llamacpp_root,
+            model_dir=model_dir,
+            gpu_id=gpu_id,
+            port=self._cpp_server_port,
+            ctx_size=ctx_size,
+            n_gpu_layers=n_gpu_layers,
+            use_tts=self.use_tts,
+            llm_model=self.llm_model,
+            ref_audio_path=ref_audio_path,
+            output_dir=self._output_dir,
+        )
+        self._http: Optional[_StreamHttpClient] = None
+        self.simplex = None  # filled in load_model
+        self.duplex = None   # filled in load_model
+
     # ================================================================
     # Model loading (maps to omni_init)
     # ================================================================
 
     def load_model(self) -> None:
-        """启动 C++ llama-server 并调用 omni_init 加载所有子模型"""
+        """Boot the C++ llama-server and arm the omni context.
+
+        Wiring:
+          1. ``_CppServerProc.start()`` spawns llama-server, polls /health.
+          2. ``call_omni_init`` loads APM/VPM/TTS/Token2Wav inside C++.
+             Default duplex mode + the canonical English duplex prompt;
+             per-request prompts override this on every turn.
+          3. Mirror ``_proc``'s subprocess + httpx onto the legacy
+             ``self._cpp_process`` / ``self._http_client`` /
+             ``self._cpp_server_url`` fields so the remaining legacy
+             helpers (``_call_*``, ``_collect_wav_output``, etc.) still
+             work during the migration window.
+          4. Build ``self.simplex`` and ``self.duplex`` - the new
+             entry points worker.py now drives.
+        """
         from worker import WorkerStatus
+        from .cpp_session import (
+            _StreamHttpClient,
+            get_system_prompts,
+        )
+        from .simplex_backend import SimplexCppBackend
+        from .duplex_backend import DuplexCppBackend
+
         self.state.status = WorkerStatus.LOADING
         logger.info(f"[GPU {self.gpu_id}] Starting C++ llama-server...")
 
-        import httpx
-        # [BUG FIX 1] Windows 下 httpx 默认 trust_env=True 会读取 IE 系统代理（HKCU\...\ProxyEnable）
-        # 把 127.0.0.1:1908x 的本地请求扔给 Clash/V2Ray，回 502。强制 trust_env=False。
-        self._http_client = httpx.Client(
-            timeout=httpx.Timeout(600.0, connect=30.0),
-            trust_env=False,
-        )
+        self._proc.start()
 
-        self._start_cpp_server()
-        self._call_omni_init(media_type=2, duplex_mode=True)
+        boot_prompts = get_system_prompts(duplex=True, lang=self._last_lang)
+        self._proc.call_omni_init(
+            media_type=2,
+            duplex_mode=True,
+            voice_clone_prompt=boot_prompts["voice_clone_prompt"],
+            assistant_prompt=boot_prompts["assistant_prompt"],
+        )
         self._last_duplex_mode = True
+
+        # Legacy field mirrors so the old _call_* methods keep working.
+        self._http_client = self._proc.http_client
+        self._cpp_process = self._proc._proc
+        self._cpp_server_url = self._proc.url
+
+        self._http = _StreamHttpClient(self._proc.url, self._proc.http_client)
+        self.simplex = SimplexCppBackend(
+            proc=self._proc,
+            http=self._http,
+            ref_audio_path=self.ref_audio_path,
+            worker_idx=self.worker_idx,
+            use_tts=self.use_tts,
+            output_dir=self._output_dir,
+            temp_dir=self._temp_dir,
+        )
+        self.duplex = DuplexCppBackend(
+            proc=self._proc,
+            http=self._http,
+            ref_audio_path=self.ref_audio_path,
+            worker_idx=self.worker_idx,
+            use_tts=self.use_tts,
+            output_dir=self._output_dir,
+            temp_dir=self._temp_dir,
+        )
 
         self.state.status = WorkerStatus.IDLE
         logger.info(f"[GPU {self.gpu_id}] C++ backend ready")
@@ -367,42 +435,42 @@ class CppBackendWorker:
         sampling: Optional[Dict[str, Any]] = None,
         return_logits: bool = False,
     ) -> str:
-        """Duplex 准备 → update_session_config
+        """Open a fresh duplex session via ``DuplexCppBackend.session_begin``.
 
-        sampling: 上层从 DuplexConfig 抽出的 session-level sampling 旋钮
-                  （见 _call_update_session_config 文档）。
-        return_logits: True 时打开 LLM 主干 logit 录制（C++ 内部 capture buffer
-                       会累积所有 prefill/decode 位置的 (token_id, bf16 logits)，
-                       每个 chunk 的 stream/decode 返回的 SSE 末尾会带回本 chunk
-                       的 inline payload）。
+        Now a thin shim around the new backend - all of the legacy
+        ``update_session_config`` short-circuiting and BUG-FIX commentary
+        is gone. The ``ref_audio_path`` request override flows directly
+        into ``session_begin(ref_audio_override=...)`` (D2/D5), the
+        sampling dict is forwarded as-is (D9), and ``return_logits``
+        switches the per-chunk inline capture on.
+
+        ``prompt_wav_path`` is accepted for signature compatibility with
+        the legacy worker.py call site but is not currently used: the
+        omni model uses the same ref-audio for both ASR conditioning and
+        TTS voice cloning, and that ref is set via ``ref_audio_path``.
         """
-        self._reset_output_dir()
-        self._duplex_chunk_counter = 0
-        self._round_number = 0
-        self._sent_wav_files = set()
         self._duplex_length_penalty = float(length_penalty)
+        self._sent_wav_files = set()
+        self._round_number = 0
 
-        # [BUG FIX 3] duplex_prepare 完全跳过 _call_update_session_config。
-        # 该调用会清空 LLM/TTS KV cache，把 omni_init 时已 prefill 的 system prompt 全部丢掉，
-        # 之后第一次 user audio prefill 会让 server 段错误。
-        # 直接复用 load_model() 时 omni_init 建立好的 duplex 状态。
-        # 代价：前端切语言/音色/system_prompt 在双工内不再生效（要重启 worker 才换）。
+        self.duplex.session_begin(
+            system_content=system_content,
+            sampling=sampling,
+            lang=lang or self._last_lang or "zh",
+            media_type=media_type,
+            ref_audio_override=ref_audio_path,
+            return_logits=return_logits,
+            length_penalty=length_penalty,
+        )
+
         self._last_duplex_mode = True
         self._last_media_type = media_type
         if lang:
             self._last_lang = lang
-
-        # [RL training] Toggle the LLM logits capture buffer for this duplex
-        # session. C++ side handles this in isolation (no KV touch) when the
-        # request body contains ONLY return_logits.
-        try:
-            self._http_client.post(
-                f"{self._cpp_server_url}/v1/stream/update_session_config",
-                json={"return_logits": bool(return_logits)},
-                timeout=10.0,
-            )
-        except Exception as e:
-            logger.warning(f"duplex_prepare: failed to toggle return_logits={return_logits}: {e}")
+        # Pending state for the legacy 2-phase prefill -> generate API.
+        self._pending_audio: Optional[np.ndarray] = None
+        self._pending_frames: Optional[list] = None
+        self._pending_max_slice_nums: int = 1
 
         os.makedirs(os.path.join(self._output_dir, "tts_wav"), exist_ok=True)
         os.makedirs(os.path.join(self._output_dir, "tts_txt"), exist_ok=True)
@@ -415,168 +483,118 @@ class CppBackendWorker:
         frame_list: Optional[list] = None,
         max_slice_nums: int = 1,
     ) -> Dict[str, Any]:
-        """Duplex 预填充 → /v1/stream/prefill"""
-        cnt = self._duplex_chunk_counter
-        self._duplex_chunk_counter += 1
+        """Stage one chunk's worth of input for the next ``duplex_generate``.
 
-        temp_audio = ""
-        if audio_waveform is not None and len(audio_waveform) > 0:
-            temp_audio = self._save_audio_to_temp(audio_waveform, f"duplex_{cnt}")
-
-        temp_image = ""
-        n_vision_images = 0
-        if frame_list:
-            temp_image = self._save_pil_image_to_temp(frame_list[0], f"duplex_{cnt}")
-            n_vision_images = 1
-
-        self._call_prefill(temp_audio, temp_image, cnt, max_slice_nums)
-
-        if frame_list and len(frame_list) > 1:
-            for i, frame in enumerate(frame_list[1:], 1):
-                extra_img = self._save_pil_image_to_temp(frame, f"duplex_{cnt}_f{i}")
-                self._call_prefill("", extra_img, cnt + i, max_slice_nums)
-                n_vision_images += 1
-
-        self._cleanup_temp_files(temp_audio, temp_image)
+        The legacy API split each duplex tick into ``prefill`` + ``decode``;
+        the new ``DuplexCppBackend.push_frame`` does both in one HTTP
+        round-trip. We keep the split worker.py call shape by stashing
+        the inputs here and consuming them on the very next
+        ``duplex_generate`` call. This preserves the WS protocol exactly:
+        worker.py still sees one ``DuplexGenerateResult`` per WS chunk."""
+        self._pending_audio = audio_waveform
+        self._pending_frames = list(frame_list) if frame_list else None
+        self._pending_max_slice_nums = int(max_slice_nums) if max_slice_nums else 1
+        n_vision_images = len(frame_list) if frame_list else 0
         return {"n_vision_images": n_vision_images}
 
     def duplex_generate(self, force_listen: bool = False) -> "DuplexGenerateResult":
-        """Duplex 生成 → /v1/stream/decode + scan WAV files"""
+        """Run one duplex tick: push the staged frame and read back the
+        listen/speak/text/audio/logits decision."""
         from core.schemas.duplex import DuplexGenerateResult
 
-        t0 = time.perf_counter()
-
-        resp = self._http_client.post(
-            f"{self._cpp_server_url}/v1/stream/decode",
-            json={
-                "stream": True,
-                "length_penalty": float(self._duplex_length_penalty),
-                # logit_format/output_dir/filename are intentionally omitted —
-                # in duplex mode we always pull logits back inline (small per
-                # chunk) and let the Python layer consolidate across chunks
-                # into one safetensors at the request level.
-                "logit_format": "inline",
-            },
-            timeout=600.0,
+        result = self.duplex.push_frame(
+            audio_chunk=self._pending_audio,
+            vision_frames=self._pending_frames,
+            force_listen=force_listen,
+            max_slice_nums=self._pending_max_slice_nums,
         )
-
-        is_listen = True
-        end_of_turn = False
-        texts = []
-        logits_payload = self._extract_logits_from_sse(resp.text) if resp.status_code == 200 else None
-
-        if resp.status_code == 200:
-            for line in resp.text.splitlines():
-                line = line.strip()
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if data_str == "[DONE]":
-                    break
-                try:
-                    event = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
-                self._maybe_update_kv_cache_length(event)
-
-                if "is_listen" in event:
-                    is_listen = event["is_listen"]
-                if "end_of_turn" in event:
-                    end_of_turn = event["end_of_turn"]
-                if event.get("text"):
-                    texts.append(event["text"])
-                if event.get("content"):
-                    texts.append(event["content"])
-                # if event.get("stop"):
-                #     end_of_turn = True
-
-        text = "".join(texts)
-        cost_all_ms = (time.perf_counter() - t0) * 1000
+        # Reset pending state so a forgotten duplex_prefill doesn't quietly
+        # replay the previous chunk on the next generate.
+        self._pending_audio = None
+        self._pending_frames = None
+        # Mirror the kv_cache_length onto the legacy field so any code
+        # reading ``self._last_kv_cache_length`` still sees fresh values.
+        kv = result.get("kv_cache_length")
+        if isinstance(kv, int):
+            self._last_kv_cache_length = kv
+        self._duplex_chunk_counter = result.get("current_time", 0) + 1
 
         return DuplexGenerateResult(
-            is_listen=is_listen,
-            text=text,
-            audio_data=None,
-            end_of_turn=end_of_turn,
-            current_time=self._duplex_chunk_counter,
-            cost_all_ms=round(cost_all_ms, 1),
-            logits=logits_payload,
+            is_listen=bool(result["is_listen"]),
+            text=result.get("text", "") or "",
+            audio_data=result.get("audio_data"),
+            end_of_turn=bool(result["end_of_turn"]),
+            current_time=int(result.get("current_time", 0)),
+            cost_llm_ms=result.get("cost_llm_ms"),
+            cost_tts_prep_ms=result.get("cost_tts_prep_ms"),
+            cost_tts_ms=result.get("cost_tts_ms"),
+            cost_token2wav_ms=result.get("cost_token2wav_ms"),
+            cost_all_ms=result.get("cost_all_ms"),
+            n_tokens=result.get("n_tokens"),
+            n_tts_tokens=result.get("n_tts_tokens"),
+            logits=result.get("logits"),
         )
 
     def duplex_finalize(self) -> None:
-        """C++ 内部自动管理 KV cache，此处为空操作"""
+        """C++ manages duplex KV state internally; no-op kept for the
+        legacy worker.py call site that runs it after each chunk."""
         pass
 
     def duplex_stop(self) -> None:
-        """Duplex 停止 → /v1/stream/break"""
+        """Drain pending TTS/T2W work via ``/v1/stream/break``.
+
+        Records ``_last_break_time`` so ``full_reinit`` later knows it
+        should wait for ``generation_done.flag`` before tearing down.
+        """
         self._last_break_time = time.time()
         try:
-            self._http_client.post(
-                f"{self._cpp_server_url}/v1/stream/break",
-                json={"reason": "duplex_stop"},
-                timeout=10.0,
-            )
+            self.duplex.break_now(reason="duplex_stop")
         except Exception as e:
             logger.warning(f"duplex_stop break call failed: {e}")
 
     def duplex_cleanup(self) -> None:
-        """清理输出目录 + 清空 KV cache，确保下次会话从干净状态开始"""
-        self._reset_output_dir()
+        """Wipe ``output_dir`` (round_NNN/tts_wav) and prep for next session.
+
+        The legacy version also re-issued ``update_session_config`` here
+        which double-cleared the KV cache; the new ``DuplexCppBackend``
+        always re-arms KV at ``session_begin``, so that step is dead
+        weight. We only reset the output dir + sent-WAV bookkeeping.
+        """
         try:
-            self._call_update_session_config(
-                media_type=self._last_media_type,
-                duplex_mode=self._last_duplex_mode if self._last_duplex_mode is not None else True,
-                voice_audio=self.ref_audio_path or "",
-            )
+            self.duplex._dir_mgr.reset()
         except Exception as e:
-            logger.warning(f"duplex_cleanup session reset failed: {e}")
+            logger.warning(f"duplex_cleanup dir reset failed: {e}")
+        self._sent_wav_files = set()
         gc.collect()
 
     def is_cpp_healthy(self) -> bool:
-        """检查底层 C++ llama-server 是否活着
+        """Check whether the underlying llama-server subprocess is alive.
 
-        [BUG FIX 4] 之前会同时调 HTTP /health，但流式 decode 进行中 watchdog 的 /health 探测
-        会和 prefill/decode 请求争抢资源，server 主动 reset，触发误判。
-        现在只看 proc.poll()——子进程只要还活着就算健康，避免 HTTP 干扰。
+        Avoids hitting ``/health`` on purpose: a watchdog that polls
+        HTTP would compete with an in-flight prefill/decode request and
+        the server occasionally resets the responder under that contention,
+        producing spurious "unhealthy" verdicts. Subprocess liveness via
+        ``proc.poll()`` is enough.
         """
         proc = self._cpp_process
         if proc is None or proc.poll() is not None:
             return False
         return True
 
-    def _stop_cpp_server(self) -> None:
-        if self._cpp_process is not None:
-            proc = self._cpp_process
-            try:
-                if proc.poll() is None:
-                    try:
-                        pgid = os.getpgid(proc.pid)
-                        os.killpg(pgid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    except Exception:
-                        proc.terminate()
-
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        try:
-                            pgid = os.getpgid(proc.pid)
-                            os.killpg(pgid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        except Exception:
-                            proc.kill()
-                        proc.wait(timeout=5)
-            except Exception as e:
-                logger.warning(f"_stop_cpp_server: {e}")
-            finally:
-                self._cpp_process = None
-                logger.info("llama-server stopped")
-
     def full_reinit(self) -> None:
-        """每次会话结束后完全重启 llama-server，保证下次会话状态绝对干净。"""
+        """Hard restart the C++ subprocess; matches the legacy semantics.
+
+        Used by:
+          * ``worker.py`` CppWatchdog when the subprocess looks unhealthy
+          * the WS half-duplex / duplex finally blocks for a clean
+            next-session state
+
+        Implementation now delegates to ``_CppServerProc.full_restart``
+        and simply resyncs the legacy mirror fields so the remaining
+        ``_call_*`` helpers keep functioning. The pre-restart
+        T2W-completion-flag wait remains useful because a duplex/turn
+        teardown may still have async TTS/T2W work in flight.
+        """
         self._round_number = 0
         self._last_duplex_mode = None
         self._last_media_type = 2
@@ -606,17 +624,17 @@ class CppBackendWorker:
                         f"checked_paths={flag_paths}"
                     )
         try:
-            logger.info("full_reinit: stopping llama-server...")
-            self._stop_cpp_server()
-            logger.info("full_reinit: restarting llama-server...")
-            self._start_cpp_server()
-            self._call_omni_init(media_type=2, duplex_mode=True)
+            self._proc.full_restart()
+            # Keep the legacy mirrors fresh so any code path still using
+            # ``self._cpp_process`` / ``self._http_client`` sees the new
+            # subprocess + client.
+            self._cpp_process = self._proc._proc
+            self._http_client = self._proc.http_client
             self._last_duplex_mode = True
             self._last_media_type = 2
             logger.info("full_reinit: omni context re-initialized successfully")
         except Exception as e:
             logger.error(f"full_reinit failed: {e}", exc_info=True)
-            # 关键约束：重初始化失败时必须向上抛出，禁止调用方误判为可分配。
             raise
 
     # ================================================================
@@ -624,23 +642,54 @@ class CppBackendWorker:
     # ================================================================
 
     def half_duplex_prefill(self, request) -> str:
-        """Half-Duplex 预填充"""
+        """Half-Duplex prefill: begin a fresh simplex turn for this VAD
+        segment and push every user content item from ``request.messages``
+        into the C++ context.
+
+        Each VAD turn is its own clean simplex turn (the previous turn's
+        KV cache is wiped by ``begin_turn``'s update_session_config),
+        so we never accumulate state across speech segments. The cached
+        config snapshot from ``reset_half_duplex_session`` is consulted
+        for system content / sampling / language."""
         from core.processors.base import MiniCPMOProcessorMixin
+
+        snapshot = getattr(self, "_hdx_config", None) or {}
+        system_content = snapshot.get("system_content")
+        # Fall back to the first system message in this request if the
+        # caller never ran ``reset_half_duplex_session``.
+        if system_content is None:
+            for m in request.messages:
+                role = getattr(m, "role", None)
+                role_str = role.value if hasattr(role, "value") else role
+                if role_str == "system":
+                    system_content = getattr(m, "content", None)
+                    break
+
+        self.simplex.begin_turn(
+            system_content=system_content,
+            sampling=snapshot.get("sampling"),
+            lang=snapshot.get("lang") or self._last_lang or "zh",
+            return_logits=False,
+        )
+
         mixin = MiniCPMOProcessorMixin()
-
         for msg in request.messages:
-            content = mixin._convert_content_to_model_format(msg.content)
-            for item in content:
+            role = getattr(msg, "role", None)
+            role_str = role.value if hasattr(role, "value") else role
+            if role_str == "system":
+                continue
+            for item in mixin._convert_content_to_model_format(msg.content):
                 if isinstance(item, np.ndarray):
-                    temp_audio = self._save_audio_to_temp(item, f"hdx_{self._duplex_chunk_counter}")
-                    self._call_prefill(temp_audio, "", self._duplex_chunk_counter)
-                    self._duplex_chunk_counter += 1
-                    self._cleanup_temp_files(temp_audio)
-
+                    self.simplex.push_audio(item)
+                elif isinstance(item, str):
+                    self.simplex.push_text(item)
+                elif hasattr(item, "size"):
+                    self.simplex.push_image(item)
         return "prefilled"
 
     def half_duplex_init_tts(self, ref_audio_data: Optional[np.ndarray] = None) -> None:
-        """TTS 在 omni_init 时已初始化，此处为空操作"""
+        """TTS is already initialized inside ``omni_init``; this is a
+        no-op kept only for backward-compatible call sites."""
         pass
 
     def _parse_sse_text(self, resp_text: str) -> str:
@@ -714,165 +763,75 @@ class CppBackendWorker:
         max_new_tokens: int = 256,
         length_penalty: float = 1.1,
     ) -> "Iterator[StreamingChunk]":
-        """Half-Duplex 生成：流式读取 SSE 文本，同时交错 yield 已生成的 WAV 音频"""
+        """Half-Duplex / chat WS streaming decode.
+
+        Translates the SimplexCppBackend's event stream into the legacy
+        ``StreamingChunk`` shape that worker.py's WS endpoints already
+        send to clients, so the WS protocol is unchanged. The legacy
+        body (~140 lines of hand-rolled SSE parsing + WAV polling) is
+        no longer needed; ``decode_streaming`` does both."""
         from core.schemas.streaming import StreamingChunk
-        import soundfile as sf
 
         t0 = time.perf_counter()
-        cur_round = self._round_number
         chunk_idx = 0
+        last_text = ""
 
-        logger.info(f"[HalfDuplex] decode start, round_idx={cur_round}")
-
-        sent_wav: set = set()
-        tts_dir_cache: Optional[str] = None
-
-        def _find_tts_dir():
-            nonlocal tts_dir_cache
-            if tts_dir_cache and os.path.isdir(tts_dir_cache):
-                return tts_dir_cache
-            rd = self._find_latest_round_dir()
-            if rd:
-                d = os.path.join(rd, "tts_wav")
-                if os.path.isdir(d):
-                    tts_dir_cache = d
-                    return d
-            return None
-
-        def _yield_new_wavs():
-            d = _find_tts_dir()
-            if not d:
-                return
-            try:
-                files = sorted(
-                    [f for f in os.listdir(d) if f.startswith("wav_") and f.endswith(".wav")],
-                    key=lambda f: int(re.search(r"wav_(\d+)", f).group(1)) if re.search(r"wav_(\d+)", f) else 0,
-                )
-            except OSError:
-                return
-            for wf in files:
-                if wf in sent_wav:
-                    continue
-                wp = os.path.join(d, wf)
-                try:
-                    data, _sr = sf.read(wp)
-                    if len(data) > 0:
-                        if data.dtype != np.float32:
-                            data = data.astype(np.float32)
-                        yield base64.b64encode(data.tobytes()).decode("utf-8")
-                        sent_wav.add(wf)
-                except Exception:
-                    pass
-
-        sse_text_pieces = []
         try:
-            with self._http_client.stream(
-                "POST",
-                f"{self._cpp_server_url}/v1/stream/decode",
-                json={
-                    "stream": True,
-                    "round_idx": cur_round,
-                    "length_penalty": float(length_penalty),
-                },
-                timeout=600.0,
-            ) as resp:
-                if resp.status_code != 200:
-                    logger.error(f"C++ decode failed: {resp.status_code}")
-                    self._round_number += 1
-                    yield StreamingChunk(chunk_index=0, is_final=True)
-                    return
-
-                buf = ""
-                for raw_chunk in resp.iter_text():
-                    buf += raw_chunk
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        line = line.strip()
-                        if not line.startswith("data: "):
-                            continue
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
-                        self._maybe_update_kv_cache_length(event)
-                        content = event.get("content", "")
-                        if content:
-                            sse_text_pieces.append(content)
-                            yield StreamingChunk(
-                                chunk_index=chunk_idx,
-                                text_delta=content,
-                                is_final=False,
-                                duration_ms=round((time.perf_counter() - t0) * 1000, 1),
-                            )
-                            chunk_idx += 1
-
-                    if generate_audio:
-                        for audio_b64 in _yield_new_wavs():
-                            yield StreamingChunk(
-                                chunk_index=chunk_idx,
-                                audio_data=audio_b64,
-                                is_final=False,
-                                duration_ms=round((time.perf_counter() - t0) * 1000, 1),
-                            )
-                            chunk_idx += 1
-        except Exception as e:
-            logger.error(f"[HalfDuplex] SSE stream error: {e}")
-
-        decode_elapsed = (time.perf_counter() - t0) * 1000
-        sse_text = "".join(sse_text_pieces)
-        wav_during_sse = len(sent_wav)
-        logger.info(f"[HalfDuplex] decode done in {decode_elapsed:.0f}ms, text={len(sse_text)} chars, "
-                     f"wav_sent_during_sse={wav_during_sse}")
-
-        self._round_number += 1
-
-        if not generate_audio:
-            if chunk_idx == 0 and sse_text:
-                yield StreamingChunk(chunk_index=0, text_delta=sse_text, is_final=True)
-            elif chunk_idx > 0:
-                yield StreamingChunk(chunk_index=chunk_idx, is_final=True)
-            else:
-                yield StreamingChunk(chunk_index=0, is_final=True)
-            return
-
-        audio_chunk_count = wav_during_sse
-        t_post = time.time()
-        while time.time() - t_post < 120.0:
-            for audio_b64 in _yield_new_wavs():
-                yield StreamingChunk(
-                    chunk_index=chunk_idx,
-                    audio_data=audio_b64,
-                    is_final=False,
-                    duration_ms=round((time.perf_counter() - t0) * 1000, 1),
-                )
-                chunk_idx += 1
-                audio_chunk_count += 1
-
-            d = _find_tts_dir()
-            if d and os.path.exists(os.path.join(d, "generation_done.flag")):
-                for audio_b64 in _yield_new_wavs():
+            for evt in self.simplex.decode_streaming(
+                length_penalty=float(length_penalty),
+                max_new_tokens=int(max_new_tokens) if max_new_tokens else None,
+                generate_audio=bool(generate_audio),
+            ):
+                t_now = round((time.perf_counter() - t0) * 1000, 1)
+                if evt["type"] == "text":
+                    last_text = evt["delta"]
                     yield StreamingChunk(
                         chunk_index=chunk_idx,
-                        audio_data=audio_b64,
+                        text_delta=evt["delta"],
                         is_final=False,
-                        duration_ms=round((time.perf_counter() - t0) * 1000, 1),
+                        duration_ms=t_now,
                     )
                     chunk_idx += 1
-                    audio_chunk_count += 1
-                break
-
-            time.sleep(0.15)
-
-        logger.info(f"[HalfDuplex] streamed {audio_chunk_count} wav chunks "
-                     f"({wav_during_sse} during SSE, {audio_chunk_count - wav_during_sse} after)")
-
-        if chunk_idx == 0:
-            yield StreamingChunk(chunk_index=0, is_final=True, text_delta=sse_text or None)
-        else:
+                elif evt["type"] == "audio":
+                    yield StreamingChunk(
+                        chunk_index=chunk_idx,
+                        audio_data=evt["data"],
+                        is_final=False,
+                        duration_ms=t_now,
+                    )
+                    chunk_idx += 1
+                elif evt["type"] == "done":
+                    if chunk_idx == 0 and evt.get("text"):
+                        yield StreamingChunk(
+                            chunk_index=0,
+                            text_delta=evt["text"],
+                            is_final=True,
+                            duration_ms=t_now,
+                        )
+                    else:
+                        yield StreamingChunk(
+                            chunk_index=chunk_idx,
+                            is_final=True,
+                            duration_ms=t_now,
+                        )
+                    return
+                elif evt["type"] == "error":
+                    logger.error(
+                        f"[HalfDuplex] decode error: {evt.get('message')!r}"
+                    )
+                    yield StreamingChunk(chunk_index=chunk_idx, is_final=True)
+                    return
+        except Exception as e:
+            logger.error(f"[HalfDuplex] decode_streaming failed: {e}", exc_info=True)
             yield StreamingChunk(chunk_index=chunk_idx, is_final=True)
+            return
+        # If decode_streaming exited without a 'done' event (shouldn't
+        # happen but stay defensive), emit a final chunk so the caller
+        # WS loop terminates.
+        yield StreamingChunk(chunk_index=chunk_idx, is_final=True)
+        # Note: legacy code below is kept as a no-op safety net only when
+        # ``return`` is missed; the decode_streaming generator always
+        # emits a 'done' event at the end.
 
     def reset_half_duplex_session(
         self,
@@ -881,19 +840,34 @@ class CppBackendWorker:
         system_content: Any = None,
         sampling: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """重置 Half-Duplex 会话"""
-        voice_audio = ref_audio_path or self.ref_audio_path or ""
-        self._call_update_session_config(
-            media_type=2,
-            duplex_mode=False,
-            voice_audio=voice_audio,
-            lang=lang,
-            system_content=system_content,
-            sampling=sampling,
-        )
+        """Cache the half-duplex session-level config snapshot.
+
+        Each subsequent ``half_duplex_prefill`` / ``half_duplex_omni_prefill``
+        starts a fresh simplex turn (see SimplexCppBackend.begin_turn) and
+        looks up these values to feed into ``update_session_config``. We
+        deliberately do NOT call C++ here - per-turn ``begin_turn`` will
+        do it once it has the user audio in hand, which keeps the C++
+        KV cache in lockstep with what the model is about to see.
+
+        ``ref_audio_path`` is also cached: SimplexCppBackend's
+        ``begin_turn`` reads ``self.ref_audio_path`` from the backend
+        instance, so we update that too if the request specified one.
+        """
+        if lang:
+            self._last_lang = lang
+        if ref_audio_path:
+            # Per-session ref-audio override winds up in the next
+            # begin_turn's prefill(cnt=0) audio_path; mutating the
+            # backend instance is safe because half-duplex is single
+            # session per worker.
+            self.simplex.ref_audio_path = ref_audio_path
+        self._hdx_config = {
+            "system_content": system_content,
+            "sampling": sampling,
+            "lang": lang or self._last_lang or "zh",
+        }
         self._duplex_chunk_counter = 0
         self._round_number = 0
-        self._reset_output_dir()
 
     def half_duplex_omni_prefill(
         self,
@@ -901,27 +875,30 @@ class CppBackendWorker:
         frame_list: Optional[list] = None,
         max_slice_nums: int = 1,
     ) -> Dict[str, Any]:
-        """半双工 Omni 预填充：完整音频 + 采样帧 → _call_prefill"""
-        cnt = self._duplex_chunk_counter
-        self._duplex_chunk_counter += 1
+        """Half-Duplex omni prefill: open a fresh simplex turn, push the
+        VAD'ed user audio plus any sampled vision frames.
 
-        temp_audio = self._save_audio_to_temp(audio_waveform, f"hdomni_{cnt}")
+        ``max_slice_nums`` is forwarded to image prefill so the C++ side
+        can decide between hi-res (slice) and fast (no-slice) packing
+        per request. Returns the legacy ``{n_vision_images: int}`` dict
+        so worker.py's metrics path keeps working unchanged."""
+        snapshot = getattr(self, "_hdx_config", None) or {}
 
-        temp_image = ""
+        self.simplex.begin_turn(
+            system_content=snapshot.get("system_content"),
+            sampling=snapshot.get("sampling"),
+            lang=snapshot.get("lang") or self._last_lang or "zh",
+            return_logits=False,
+        )
+
+        if audio_waveform is not None and len(audio_waveform) > 0:
+            self.simplex.push_audio(audio_waveform)
+
         n_vision_images = 0
         if frame_list:
-            temp_image = self._save_pil_image_to_temp(frame_list[0], f"hdomni_{cnt}")
-            n_vision_images = 1
-
-        self._call_prefill(temp_audio, temp_image, cnt, max_slice_nums)
-
-        if frame_list and len(frame_list) > 1:
-            for i, frame in enumerate(frame_list[1:], 1):
-                extra_img = self._save_pil_image_to_temp(frame, f"hdomni_{cnt}_f{i}")
-                self._call_prefill("", extra_img, cnt + i, max_slice_nums)
+            for frame in frame_list:
+                self.simplex.push_image(frame, max_slice_nums=max_slice_nums)
                 n_vision_images += 1
-
-        self._cleanup_temp_files(temp_audio, temp_image)
         return {"n_vision_images": n_vision_images}
 
     # ================================================================
@@ -929,18 +906,32 @@ class CppBackendWorker:
     # ================================================================
 
     def chat(self, request) -> "ChatResponse":
-        """Chat 推理"""
+        """Drive one stateless simplex turn through ``self.simplex``.
+
+        This is the production path for ``POST /chat``. The legacy
+        body that hand-rolled ``update_session_config + prefill(0) +
+        decode + WAV poll`` has been replaced by the dedicated
+        ``SimplexCppBackend`` (``begin_turn -> push_* -> decode_oneshot``).
+        Two of the historical bugs that lived here are now structurally
+        impossible:
+
+          * ``prefill(cnt=0)`` is no longer a placeholder that silently
+            fails when the server rejects empty bodies (D3 was masked
+            by ``_call_prefill`` swallowing 400s).
+          * ``request_id`` flows through to ``logit_filename`` via
+            ``make_logits_filename`` to keep multi-worker logits files
+            collision-free.
+        """
         from core.schemas.chat import ChatResponse
         from core.processors.base import MiniCPMOProcessorMixin
-        from core.schemas.logits import LogitsExportSpec, LogitsPayload
+        from core.schemas.logits import LogitsExportSpec
+        from .cpp_session import sampling_from_generation
+        from .logits_retention import resolve_output_dir, make_logits_filename
 
         generation = getattr(request, "generation", None)
         length_penalty = float(getattr(generation, "length_penalty", 1.1) or 1.1)
-        sampling = _sampling_from_generation(generation)
+        sampling = sampling_from_generation(generation)
 
-        # Extract system content so the C++ side can build the right prompt prefix.
-        # Without this, the model receives an empty context and degenerates into
-        # token loops (e.g. infinite "zero zero zero ...").
         system_content: Any = None
         for m in request.messages:
             role = getattr(m, "role", None)
@@ -950,81 +941,6 @@ class CppBackendWorker:
                 break
 
         logits_spec: LogitsExportSpec = getattr(request, "logits", None) or LogitsExportSpec()
-
-        self._call_update_session_config(
-            media_type=2,
-            duplex_mode=False,
-            voice_audio=self.ref_audio_path or "",
-            system_content=system_content,
-            sampling=sampling,
-            return_logits=logits_spec.enabled,
-        )
-        self._reset_output_dir()
-        self._round_number = 0
-
-        # [BUGFIX] Trigger system-prompt re-init with a dedicated index=0
-        # prefill BEFORE pushing any user content. Rationale:
-        #
-        #   ``_call_update_session_config`` resets ``system_prompt_initialized``
-        #   to false (and clears the LLM KV cache). The very next
-        #   ``stream_prefill`` call with index=0 in C++ then enters the
-        #   "system prompt initialization" branch (omni.cpp ~line 10096),
-        #   which builds <|im_start|>system\n...<|audio_start|>[ref_audio]
-        #   <|audio_end|>...<|im_end|>\n<|im_start|>user\n and sets
-        #   ``system_prompt_initialized = true`` — and **silently drops** the
-        #   ``aud_fname`` / ``img_fname`` / ``text`` arguments passed in that
-        #   same call (see the comment block at omni.cpp ~10172: "用户音频应该
-        #   从 index >= 1 开始传入"). Calling _call_prefill with the first
-        #   user content at cnt=0 therefore loses that content; the model
-        #   then decodes with no user input and either returns empty text
-        #   (use_tts=false simplex) or hallucinates a reply (use_tts=true
-        #   simplex, where the <|tts_bos|> in the assistant prompt forces
-        #   speech). The same root cause makes RL logits capture report
-        #   only ~5% of expected tokens (only system / assistant prompt
-        #   prefill positions are captured; the decode loop runs near-zero
-        #   sampling steps).
-        #
-        # We honor the C++ contract by spending one synthetic index=0 call
-        # purely on system-prompt init, then stream user content from
-        # index>=1.
-        self._call_prefill("", "", 0)
-
-        mixin = MiniCPMOProcessorMixin()
-        cnt = 1
-        for msg in request.messages:
-            role = getattr(msg, "role", None)
-            role_str = role.value if hasattr(role, "value") else role
-            if role_str == "system":
-                # system_content already passed via update_session_config
-                continue
-            content = mixin._convert_content_to_model_format(msg.content)
-            for item in content:
-                if isinstance(item, np.ndarray):
-                    temp_audio = self._save_audio_to_temp(item, f"chat_{cnt}")
-                    self._call_prefill(temp_audio, "", cnt)
-                    self._cleanup_temp_files(temp_audio)
-                    cnt += 1
-                elif isinstance(item, str):
-                    if not item:
-                        continue
-                    self._call_prefill("", "", cnt, text=item)
-                    cnt += 1
-                elif hasattr(item, "size"):  # PIL image
-                    temp_img = self._save_pil_image_to_temp(item, f"chat_{cnt}")
-                    self._call_prefill("", temp_img, cnt)
-                    self._cleanup_temp_files("", temp_img)
-                    cnt += 1
-
-        decode_body: Dict[str, Any] = {
-            "stream": True,
-            "round_idx": self._round_number,
-            "length_penalty": length_penalty,
-        }
-        # [chat budget] 单工 chat 路径把 GenerationConfig.max_new_tokens 透传到
-        # C++ 端 ``ctx_omni->chat_max_new_tokens``，由 stream_decode 内部当硬
-        # 上限（见 omni.cpp ~10570 / omni.h 注释）。修复了 chat 路径下
-        # max_new_tokens 被 _sampling_from_generation 注释忽略、模型靠自己 EOS
-        # 容易在 use_tts=true attractor 里跑成百秒的问题（见 commit message）。
         max_new = None
         if generation is not None:
             max_new = getattr(generation, "max_new_tokens", None)
@@ -1034,82 +950,63 @@ class CppBackendWorker:
             max_new_int = int(max_new) if max_new is not None else 0
         except (TypeError, ValueError):
             max_new_int = 0
-        if max_new_int > 0:
-            decode_body["max_new_tokens"] = max_new_int
+
+        sx = self.simplex
+        sx.begin_turn(
+            system_content=system_content,
+            sampling=sampling,
+            return_logits=logits_spec.enabled,
+        )
+
+        mixin = MiniCPMOProcessorMixin()
+        for msg in request.messages:
+            role = getattr(msg, "role", None)
+            role_str = role.value if hasattr(role, "value") else role
+            if role_str == "system":
+                continue
+            for item in mixin._convert_content_to_model_format(msg.content):
+                if isinstance(item, np.ndarray):
+                    sx.push_audio(item)
+                elif isinstance(item, str):
+                    sx.push_text(item)
+                elif hasattr(item, "size"):
+                    sx.push_image(item)
+
+        logit_format = None
+        logit_output_dir = None
+        logit_filename = None
+        logit_extra_metadata = None
         if logits_spec.enabled:
-            decode_body["logit_format"] = logits_spec.format
+            logit_format = logits_spec.format
             if logits_spec.format == "file":
-                # [P3 retention] Route the C++ writer through a date-bucketed
-                # subdirectory: ``<base>/<YYYY-MM-DD>/<filename>``.
-                # ``logits_retention.resolve_output_dir`` is idempotent and
-                # honors ``$OMNI_LOGITS_OUTPUT_DIR`` when the request didn't
-                # pin one. The retention daemon (see ``worker.py`` lifespan
-                # → ``start_cleanup_thread``) then reaps stale ``YYYY-MM-DD``
-                # subdirs by ``OMNI_LOGITS_RETENTION_DAYS`` /
-                # ``OMNI_LOGITS_MAX_TOTAL_BYTES``.
-                from .logits_retention import resolve_output_dir, make_logits_filename
                 bucket_dir = resolve_output_dir(logits_spec.output_dir)
-                decode_body["logit_output_dir"] = (
+                logit_output_dir = (
                     bucket_dir if bucket_dir.endswith(os.sep) else bucket_dir + os.sep
                 )
-                # [chat 命名 - 多 worker 防撞] 历史上这里硬编码
-                # ``chat_round{self._round_number}.safetensors``，且 chat() 入口
-                # 处把 ``self._round_number = 0``，导致**所有** chat 请求都写
-                # 到 ``chat_round0.safetensors``：单 worker 自相覆盖、跨 worker
-                # 共享日期 bucket 又互相覆盖（压测里 103 个 logits_file 调用
-                # 全部 success，盘上只剩 1 个文件）。
-                #
-                # 现在统一走 ``make_logits_filename(kind, worker_idx, request_id)``：
-                #   1. ``worker_idx`` 跨 worker 进程唯一（worker.py 的 args.worker_index）
-                #   2. ``pid_hex7`` 防 worker 重启 + 同日复用 seq 撞名
-                #   3. ``seq:08d`` 进程内 atomic counter 串行不撞
-                #   4. ``request_id`` 作为可选 debug 后缀，方便 grep
-                # 唯一性由 (worker_idx, pid, seq) 三元组保证，request_id 不参
-                # 与唯一性，client 给重了也无所谓。
-                #
-                # 测试 hook：``request._logit_filename`` 仍然支持手工 override
-                # （e2e 用例固定文件名好做断言用）。
-                from .logits_retention import make_logits_filename as _mklog_fn
                 override = getattr(request, "_logit_filename", None)
-                fname = override or _mklog_fn(
+                logit_filename = override or make_logits_filename(
                     "chat", self.worker_idx,
                     getattr(request, "request_id", None),
                 )
-                decode_body["logit_filename"] = fname
-                extra = getattr(request, "_logit_extra_metadata", None)
-                if extra:
-                    decode_body["logit_extra_metadata"] = extra
+            logit_extra_metadata = getattr(request, "_logit_extra_metadata", None)
 
-        resp = self._http_client.post(
-            f"{self._cpp_server_url}/v1/stream/decode",
-            json=decode_body,
-            timeout=600.0,
-        )
-        self._round_number += 1
-
-        sse_text = ""
-        logits_payload: Optional["LogitsPayload"] = None
-        if resp.status_code == 200:
-            sse_text = self._parse_sse_text(resp.text)
-            if logits_spec.enabled:
-                logits_payload = self._extract_logits_from_sse(resp.text)
-
-        # Only scrape TTS WAV output if the caller actually asked for audio,
-        # AND the worker has TTS enabled at all. ``_collect_wav_output`` does
-        # a polling wait (~6s) for the WAV dir to appear, which is pure
-        # overhead for text-only RL/eval requests.
         want_audio = bool(getattr(request, "tts", None) and request.tts.enabled)
-        if want_audio and self.use_tts:
-            wav_b64, _ = self._collect_wav_output(sse_text=sse_text)
-        else:
-            wav_b64 = None
+        out = sx.decode_oneshot(
+            length_penalty=length_penalty,
+            max_new_tokens=max_new_int if max_new_int > 0 else None,
+            logit_format=logit_format,
+            logit_output_dir=logit_output_dir,
+            logit_filename=logit_filename,
+            logit_extra_metadata=logit_extra_metadata,
+            want_audio=want_audio,
+        )
 
         return ChatResponse(
-            text=sse_text,
-            audio_data=wav_b64,
-            audio_sample_rate=_AUDIO_OUTPUT_SR if wav_b64 else None,
+            text=out["text"],
+            audio_data=out["audio_data"],
+            audio_sample_rate=out["audio_sample_rate"],
             success=True,
-            logits=logits_payload,
+            logits=out["logits"],
             request_id=getattr(request, "request_id", None),
         )
 
@@ -1119,108 +1016,89 @@ class CppBackendWorker:
                      reset_context: bool = True,
                      system_content: Any = None,
                      sampling: Optional[Dict[str, Any]] = None) -> str:
-        """Chat prefill — reset_context=True 时重置会话上下文
+        """Chat WS prefill: open one fresh simplex turn and push every
+        content item from the **last** message in ``msgs``.
 
-        system_content: 如未提供，自动从 msgs 中的 system role 提取 content
+        Mirrors the legacy contract:
+          * ``reset_context=True`` is the only supported mode now (the
+            simplex backend always resets KV per turn; carrying state
+            across turns was an artifact of the old direct ``_call_*``
+            path and never used in production).
+          * ``system_content`` falls back to the system message inside
+            ``msgs`` when the caller didn't pass one explicitly.
+          * Returns the legacy sentinel string ``"prefilled"`` so
+            worker.py's check ``if prefill_result == "prefilled":`` still
+            works untouched.
         """
-        media_type = 2
-        # 自动从 msgs 抽取 system content 作为 prompt 构造依据
-        effective_system_content = system_content
-        if effective_system_content is None and msgs:
+        effective_system = system_content
+        if effective_system is None and msgs:
             for m in msgs:
                 role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else None)
                 role_str = role.value if hasattr(role, "value") else role
                 if role_str == "system":
-                    content = getattr(m, "content", None) or (m.get("content") if isinstance(m, dict) else None)
+                    content = (
+                        getattr(m, "content", None)
+                        or (m.get("content") if isinstance(m, dict) else None)
+                    )
                     if content is not None:
-                        effective_system_content = content
+                        effective_system = content
                     break
-        if reset_context:
-            self._call_update_session_config(
-                media_type=media_type,
-                duplex_mode=False,
-                voice_audio=ref_audio_path or self.ref_audio_path or "",
-                lang=lang,
-                system_content=effective_system_content,
-                sampling=sampling,
-            )
-        logger.info(
-            f"[ChatPrefill] session={session_id} omni_mode={omni_mode} media_type={media_type} "
-            f"lang={lang or self._last_lang} reset_context={reset_context} "
-            f"ref_audio_path={ref_audio_path or self.ref_audio_path or ''}"
+
+        # Per-session ref-audio override propagates to simplex.begin_turn.
+        if ref_audio_path:
+            self.simplex.ref_audio_path = ref_audio_path
+
+        self.simplex.begin_turn(
+            system_content=effective_system,
+            sampling=sampling,
+            lang=lang or self._last_lang or "zh",
+            return_logits=False,
         )
-        if reset_context:
-            self._reset_output_dir()
-            self._round_number = 0
-            # [BUGFIX] On a fresh session, ``update_session_config`` above has
-            # cleared the KV cache and set ``system_prompt_initialized=false``
-            # in C++. The first ``_call_prefill`` after a reset MUST be a
-            # dedicated index=0 system-prompt init — passing user content with
-            # index=0 makes C++ silently drop that content (see ``chat()``
-            # for the long-form rationale and the matching comment in
-            # ``omni.cpp`` near stream_prefill ~line 10172). Spend one
-            # synthetic index=0 call here, then user content starts at
-            # index>=1.
-            self._call_prefill("", "", 0)
-            cnt = 1
-        else:
-            cnt = self._round_number
+        if lang:
+            self._last_lang = lang
+        logger.info(
+            f"[ChatPrefill] session={session_id} omni_mode={omni_mode} "
+            f"lang={lang or self._last_lang} reset_context={reset_context} "
+            f"ref_audio={self.simplex.ref_audio_path!r}"
+        )
 
-        prefill_msgs: List[Dict[str, Any]] = []
-        # if msgs and reset_context and len(msgs) > 1:
-        #     prefill_msgs.append(msgs[0])
-        if msgs:
-            prefill_msgs.append(msgs[-1])
-
-        for msg in prefill_msgs:
-            content_list = msg.get("content", [])
-            # 纯文本消息会被 _convert_to_model_msgs 拍扁成裸字符串，统一包成列表。
+        last_msg = msgs[-1] if msgs else None
+        if last_msg is not None:
+            content_list = last_msg.get("content", [])
             if not isinstance(content_list, list):
                 content_list = [content_list]
             for item in content_list:
                 if isinstance(item, np.ndarray):
-                    temp_audio = self._save_audio_to_temp(item, f"chat_pf_{cnt}")
-                    self._call_prefill(temp_audio, "", cnt)
-                    self._cleanup_temp_files(temp_audio)
-                    cnt += 1
+                    self.simplex.push_audio(item)
                 elif isinstance(item, str):
                     if not item:
                         continue
-                    self._call_prefill("", "", cnt, text=item)
-                    cnt += 1
-                elif hasattr(item, 'size'):
-                    temp_img = self._save_pil_image_to_temp(item, f"chat_pf_{cnt}")
-                    self._call_prefill("", temp_img, cnt, max_slice_nums or -1)
-                    self._cleanup_temp_files("", temp_img)
-                    cnt += 1
+                    self.simplex.push_text(item)
+                elif hasattr(item, "size"):
+                    self.simplex.push_image(item, max_slice_nums=max_slice_nums or -1)
         return "prefilled"
 
     def chat_non_streaming_generate(self, session_id, **kwargs):
-        """Chat 非流式生成"""
-        cur_round = self._round_number
+        """Chat WS non-streaming decode.
+
+        Returns either ``sse_text`` (no audio) or ``(sse_text, waveform)``
+        when audio was generated, matching the legacy return-shape so
+        worker.py's POST /chat WS code keeps its existing two-branch
+        unpacking unchanged."""
         length_penalty = float(kwargs.get("length_penalty", 1.1) or 1.1)
-        # [chat budget] half-duplex / chat_prefill 复用此入口，把 max_new_tokens 透传到 C++。
-        decode_body: Dict[str, Any] = {
-            "stream": True,
-            "round_idx": cur_round,
-            "length_penalty": length_penalty,
-        }
         try:
             max_new_int = int(kwargs.get("max_new_tokens") or 0)
         except (TypeError, ValueError):
             max_new_int = 0
-        if max_new_int > 0:
-            decode_body["max_new_tokens"] = max_new_int
-        resp = self._http_client.post(
-            f"{self._cpp_server_url}/v1/stream/decode",
-            json=decode_body,
-            timeout=600.0,
+        generate_audio = bool(kwargs.get("generate_audio", True))
+
+        out = self.simplex.decode_oneshot(
+            length_penalty=length_penalty,
+            max_new_tokens=max_new_int if max_new_int > 0 else None,
+            want_audio=generate_audio,
         )
-        self._round_number += 1
-
-        sse_text = self._parse_sse_text(resp.text) if resp.status_code == 200 else ""
-        wav_b64, _ = self._collect_wav_output(sse_text=sse_text)
-
+        sse_text = out.get("text", "") or ""
+        wav_b64 = out.get("audio_data")
         if wav_b64:
             audio_bytes = base64.b64decode(wav_b64)
             waveform = np.frombuffer(audio_bytes, dtype=np.float32)
@@ -1229,7 +1107,11 @@ class CppBackendWorker:
 
     def chat_streaming_generate(self, session_id, generate_audio=True,
                                 max_new_tokens=256, length_penalty=1.1):
-        """Chat 流式生成"""
+        """Chat WS streaming decode (alias to ``half_duplex_generate``).
+
+        Both the chat WS endpoint and the half-duplex VAD endpoint
+        translate to the same simplex streaming primitive; keeping the
+        two method names is purely for readability at the call site."""
         yield from self.half_duplex_generate(
             session_id=session_id,
             generate_audio=generate_audio,
@@ -1239,341 +1121,15 @@ class CppBackendWorker:
 
     # ================================================================
     # Internal: C++ server management
+    # ----------------------------------------------------------------
+    # The legacy ``_start_cpp_server`` / ``_stop_cpp_server`` /
+    # ``_find_server_binary`` / ``_call_omni_init`` /
+    # ``_call_update_session_config`` / ``_call_prefill`` helpers
+    # have been replaced by ``_CppServerProc`` (subprocess + omni_init)
+    # and ``_StreamHttpClient`` (HTTP primitives) in cpp_session.py.
+    # See ``load_model`` for the wiring; ``simplex`` / ``duplex`` are
+    # the public entry points worker.py drives.
     # ================================================================
-
-    def _start_cpp_server(self) -> None:
-        server_bin = self._find_server_binary()
-        model_path = os.path.join(self.model_dir, self.llm_model)
-
-        if not os.path.exists(server_bin):
-            raise RuntimeError(f"llama-server not found: {server_bin}")
-        if not os.path.exists(model_path):
-            raise RuntimeError(f"LLM model not found: {model_path}")
-
-        env = os.environ.copy()
-        # [GPU pinning] Only set CUDA_VISIBLE_DEVICES on the child if the parent
-        # process didn't already restrict device visibility. ``self.gpu_id`` has
-        # ambiguous semantics (start_all.sh passes the physical card id, while
-        # worker.py defaults it to ``args.worker_index``), so blindly writing
-        # ``CUDA_VISIBLE_DEVICES = str(self.gpu_id)`` over a parent that already
-        # set ``CUDA_VISIBLE_DEVICES=1`` would re-pin the child to physical
-        # GPU 0 (the index "1" doesn't exist inside the parent's narrowed
-        # window) and silently OOM-stall during model load. This bug bit the
-        # e2e fixture before commit 98bfb29; here we make cpp_backend itself
-        # immune to the trap so any caller (fixture, custom launcher, etc.)
-        # that already set CUDA_VISIBLE_DEVICES gets honored.
-        if not env.get("CUDA_VISIBLE_DEVICES"):
-            env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
-            logger.info(
-                f"[GPU {self.gpu_id}] parent CUDA_VISIBLE_DEVICES unset; "
-                f"pinning C++ child to physical GPU {self.gpu_id}"
-            )
-        else:
-            logger.info(
-                f"[GPU {self.gpu_id}] parent CUDA_VISIBLE_DEVICES="
-                f"{env['CUDA_VISIBLE_DEVICES']!r}; inheriting (not overriding)"
-            )
-
-        # [LLM 主 sampler 默认 + override]
-        # 默认：--temp 0.7 / --repeat-penalty 1.05，无固定 --seed（每次启动随机）。
-        # 这与 Python MiniCPM-o-4_5 推理脚本 default 对齐，保留 duplex/chat 在
-        # default sampling 下的多样性。
-        #
-        # Override（环境变量）：
-        #   OMNI_LLM_SAMPLE_TEMP    = "0.0"   → 强制 greedy（适合 RL rollout / token
-        #                                       一致性回归 / use_tts=true vs false 比对）
-        #   OMNI_LLM_SAMPLE_SEED    = "42"    → 固定 seed，让随机采样轨迹可复现
-        #   OMNI_LLM_REPEAT_PENALTY = "1.0"   → 关闭 repetition penalty
-        #
-        # 这条口子是为 P2 验证（"use_tts=true / false 必须给 LLM 看到完全相同的
-        # token+logits 序列"）开的：通过两 worker 设相同 OMNI_LLM_SAMPLE_TEMP=0
-        # 即可绕开当前 update_session_config 不接 LLM 主 sampler 字段的限制
-        # （server.cpp ~6377-6398 只透传 listen_prob_scale / force_listen_count /
-        # max_new_speak_tokens_per_chunk / tts_temperature 这四项 session-level 字段）。
-        # 等到 LLM 主 sampler 被纳入 update_session_config / per-request 透传后，
-        # 这些 env 仍可作为"启动期默认值"保留，不冲突。
-        sample_temp = os.environ.get("OMNI_LLM_SAMPLE_TEMP", "0.7")
-        repeat_penalty = os.environ.get("OMNI_LLM_REPEAT_PENALTY", "1.05")
-        sample_seed = os.environ.get("OMNI_LLM_SAMPLE_SEED")
-        cmd = [
-            server_bin,
-            "--host", "0.0.0.0",
-            "--port", str(self._cpp_server_port),
-            "--model", model_path,
-            "--ctx-size", str(self.ctx_size),
-            "--n-gpu-layers", str(self.n_gpu_layers),
-            "--repeat-penalty", repeat_penalty,
-            "--temp", sample_temp,
-        ]
-        if sample_seed is not None:
-            cmd.extend(["--seed", sample_seed])
-        if sample_temp != "0.7" or repeat_penalty != "1.05" or sample_seed is not None:
-            logger.info(
-                f"[LLM sampler override] temp={sample_temp} repeat-penalty={repeat_penalty} "
-                f"seed={sample_seed!r} (env: OMNI_LLM_SAMPLE_TEMP / OMNI_LLM_REPEAT_PENALTY / "
-                f"OMNI_LLM_SAMPLE_SEED)"
-            )
-
-        logger.info(f"Starting C++ server: {' '.join(cmd)}")
-
-        self._cpp_process = subprocess.Popen(
-            cmd, env=env, cwd=self.llamacpp_root,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            bufsize=1, encoding="utf-8", errors="replace",
-            start_new_session=True,
-        )
-
-        def _log_reader():
-            try:
-                for line in self._cpp_process.stdout:
-                    stripped = line.rstrip()
-                    if any(kw in stripped for kw in ("TTS", "T2W", "LLM->TTS", "wav_", "tts_thread", "generate_audio", "speek_done", "break_event", "lang", "language", "omni_set_language", "prefill", "change", "stream_decode", "LLM thread", "LLM Duplex", "force_listen", "LLM decode", "EOS", "EOG", "sample", "is_listen", "duplex_decode")):
-                        logger.info(f"[CPP] {stripped}")
-                    else:
-                        logger.debug(f"[CPP] {stripped}")
-            except Exception:
-                pass
-
-        threading.Thread(target=_log_reader, daemon=True).start()
-
-        import requests
-        # [BUG FIX 1] Windows 下 requests 也会读 HTTP_PROXY/IE 代理。显式 proxies={...}=None
-        # 强制走直连，避免 Clash/V2Ray 拦截 127.0.0.1:1908x。
-        no_proxy = {"http": None, "https": None}
-        for i in range(300):
-            try:
-                r = requests.get(f"{self._cpp_server_url}/health", timeout=2, proxies=no_proxy)
-                if r.status_code == 200:
-                    logger.info(f"C++ server ready after {i+1}s")
-                    return
-            except Exception:
-                pass
-            time.sleep(1)
-
-        raise RuntimeError("C++ server startup timeout (300s)")
-
-    def _find_server_binary(self) -> str:
-        # [Windows fix] Visual Studio 多配置生成器把 EXE 放在 build/bin/Release/llama-server.exe
-        # 上游候选只列了无后缀的 POSIX 名，os.path.exists 会失败导致回退到第 0 个不存在的路径，
-        # 之后 _start_cpp_server 抛 "llama-server not found"。这里补全 Windows 路径。
-        is_win = platform.system() == "Windows"
-        candidates = []
-        if is_win:
-            candidates += [
-                os.path.join(self.llamacpp_root, "build", "bin", "Release", "llama-server.exe"),
-                os.path.join(self.llamacpp_root, "build", "bin", "llama-server.exe"),
-            ]
-        candidates += [
-            os.path.join(self.llamacpp_root, "build/bin/llama-server"),
-            os.path.join(self.llamacpp_root, "build/bin/Release/llama-server"),
-        ]
-        if not is_win:
-            candidates.append(os.path.join(self.llamacpp_root, "build-x64-linux-cuda-release/bin/llama-server"))
-        for c in candidates:
-            if os.path.exists(c):
-                return c
-        return candidates[0]
-
-    def _call_omni_init(
-        self,
-        media_type: int = 2,
-        duplex_mode: bool = True,
-        lang: Optional[str] = None,
-        system_content: Any = None,
-    ) -> None:
-        tts_bin_dir = os.path.join(self.model_dir, "tts")
-        os.makedirs(self._output_dir, exist_ok=True)
-
-        req_body = {
-            "media_type": media_type,
-            "use_tts": bool(self.use_tts),
-            "duplex_mode": duplex_mode,
-            "model_dir": self.model_dir,
-            "tts_bin_dir": tts_bin_dir,
-            "tts_gpu_layers": 100,
-            "token2wav_device": "gpu:0",
-            "output_dir": self._output_dir,
-        }
-
-        if self.ref_audio_path and os.path.exists(self.ref_audio_path):
-            req_body["voice_audio"] = self.ref_audio_path
-
-        effective_lang = lang or self._last_lang
-        prompts = _build_prompts_from_content(system_content, duplex_mode, effective_lang)
-        req_body["voice_clone_prompt"] = prompts["voice_clone_prompt"]
-        req_body["assistant_prompt"] = prompts["assistant_prompt"]
-        if lang:
-            self._last_lang = lang
-
-        _is_custom = bool(system_content) and prompts != _get_system_prompts(duplex_mode, effective_lang)
-        logger.info(
-            f"Calling omni_init: media_type={media_type}, duplex={duplex_mode}, "
-            f"lang={effective_lang}, custom_prompt={_is_custom}"
-        )
-        if _is_custom:
-            logger.info(
-                f"  voice_clone_prompt={prompts['voice_clone_prompt'][:100]!r}..."
-            )
-            logger.info(
-                f"  assistant_prompt={prompts['assistant_prompt'][:100]!r}..."
-            )
-        resp = self._http_client.post(
-            f"{self._cpp_server_url}/v1/stream/omni_init",
-            json=req_body,
-            timeout=120.0,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"omni_init failed: {resp.text}")
-        payload = resp.json()
-        self._maybe_update_kv_cache_length(payload)
-        logger.info(f"omni_init success: {payload}")
-
-    def _call_update_session_config(
-        self,
-        media_type: int = 2,
-        duplex_mode: bool = True,
-        voice_audio: str = "",
-        lang: Optional[str] = None,
-        system_content: Any = None,
-        sampling: Optional[Dict[str, Any]] = None,
-        return_logits: Optional[bool] = None,
-    ) -> None:
-        """sampling: 可选 dict，会原样下推到 /v1/stream/update_session_config，
-        当前 C++ 侧识别的字段：
-          - listen_prob_scale (float)
-          - force_listen_count (int)
-          - max_new_speak_tokens_per_chunk (int)
-          - tts_temperature (float)
-        其它字段会被 C++ 端忽略，便于将来增量扩展。
-
-        return_logits: 当为 True 时打开 LLM 主干 logit 录制（C++ 内部分配
-        capture buffer 并在每个 prefill/decode 位置累积 (token_id, bf16-logits)
-        对，后续 /v1/stream/decode 完成时通过 SSE event ``logits`` 返回）；
-        为 False 关闭并释放缓冲。为 None 时保持现有状态。
-        """
-        duplex_mode_changed = (
-            self._last_duplex_mode is not None and
-            self._last_duplex_mode != duplex_mode
-        )
-
-        if duplex_mode_changed:
-            # duplex ↔ simplex 切换需要 omni_init（TTS 线程函数不同）
-            # media_type 变化不需要重建——vision context 常驻，按需使用即可
-            logger.info(
-                f"duplex mode changed ({self._last_duplex_mode} -> {duplex_mode}), "
-                "calling omni_init for clean restart"
-            )
-            self._call_omni_init(
-                media_type=media_type,
-                duplex_mode=duplex_mode,
-                lang=lang,
-                system_content=system_content,
-            )
-            self._last_duplex_mode = duplex_mode
-            self._last_media_type = media_type
-
-        self._last_duplex_mode = duplex_mode
-        self._last_media_type = media_type
-
-        # Same mode — lightweight reset via break + update_session_config
-        try:
-            self._http_client.post(
-                f"{self._cpp_server_url}/v1/stream/break",
-                json={"reason": "session_config_change"},
-                timeout=10.0,
-            )
-            time.sleep(0.1)
-        except Exception:
-            pass
-
-        effective_lang = lang or self._last_lang
-        prompts = _build_prompts_from_content(system_content, duplex_mode, effective_lang)
-
-        _is_custom = bool(system_content) and prompts != _get_system_prompts(duplex_mode, effective_lang)
-        if _is_custom:
-            logger.info(
-                f"update_session_config: custom voice_clone_prompt={prompts['voice_clone_prompt'][:100]!r}..."
-            )
-
-        req_body: Dict[str, Any] = {
-            "media_type": media_type,
-            "duplex_mode": duplex_mode,
-            "voice_clone_prompt": prompts["voice_clone_prompt"],
-            "assistant_prompt": prompts["assistant_prompt"],
-        }
-        # [BUG FIX 2] 不要传 voice_audio：C++ server 收到该字段后内部 media_type 会被
-        # uninitialized memory 覆盖（dump 中看到 "media_type changed from -541209456 to 2"），
-        # 约 10 秒后必崩。omni_init 时已经传过一次 voice_audio，TTS 状态保留，无需重复设置。
-        # 保留 voice_audio 形参签名以兼容上层调用，但不下推到 C++。
-        _ = voice_audio  # 显式忽略
-        if lang:
-            self._last_lang = lang
-
-        # [Python -> C++ 透传] DuplexConfig / GenerationConfig 中 session-level 的
-        # sampling 旋钮。仅在明确给出时才下推，省略沿用 omni_init 默认。
-        # 顶层 4 个旋钮 + 嵌套 ``llm_sampling`` 对象（LLM 主 sampler per-request
-        # 字段，由 server.cpp 收到后重建 ctx_omni->ctx_sampler；见
-        # ``_sampling_from_generation`` 的注释）。
-        if sampling:
-            for key in (
-                "listen_prob_scale",
-                "force_listen_count",
-                "max_new_speak_tokens_per_chunk",
-                "tts_temperature",
-            ):
-                if key in sampling and sampling[key] is not None:
-                    req_body[key] = sampling[key]
-            llm_sampling = sampling.get("llm_sampling")
-            if isinstance(llm_sampling, dict) and llm_sampling:
-                req_body["llm_sampling"] = llm_sampling
-
-        # [RL training] Toggle LLM logits capture for the next prefill+decode
-        # cycle. C++ side allocates / frees the bf16 buffer.
-        if return_logits is not None:
-            req_body["return_logits"] = bool(return_logits)
-
-        if "llm_sampling" in req_body:
-            # 调试线索：每轮 chat / half-duplex 透传到 C++ 的 sampler 字段。
-            # rebuild 触发的 SRV_INF "LLM main sampler rebuilt (...)" 在
-            # llama-server 子进程那边输出，组合起来可以重放每轮 sampler 状态。
-            logger.debug(
-                f"[update_session_config] llm_sampling={req_body['llm_sampling']}"
-            )
-        resp = self._http_client.post(
-            f"{self._cpp_server_url}/v1/stream/update_session_config",
-            json=req_body,
-            timeout=30.0,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"update_session_config failed: {resp.text}")
-        self._maybe_update_kv_cache_length(resp.json())
-
-    def _call_prefill(self, audio_path: str, img_path: str, cnt: int,
-                      max_slice_nums: int = -1, text: str = "") -> None:
-        req_body: Dict[str, Any] = {
-            "audio_path_prefix": audio_path,
-            "img_path_prefix": img_path,
-            "cnt": cnt,
-        }
-        if max_slice_nums > 0:
-            req_body["max_slice_nums"] = max_slice_nums
-        if text:
-            # 文本走 llama-server 的 stream_prefill -> omni_embeds.user_text
-            # （turn-based 文字对话）。空串不传，保持向后兼容。
-            req_body["text"] = text
-
-        resp = self._http_client.post(
-            f"{self._cpp_server_url}/v1/stream/prefill",
-            json=req_body,
-            timeout=30.0,
-        )
-        if resp.status_code != 200:
-            logger.error(f"prefill failed (cnt={cnt}): {resp.text}")
-            return
-        try:
-            self._maybe_update_kv_cache_length(resp.json())
-        except Exception as e:
-            logger.debug("prefill kv_cache_length parse failed: %s", e)
 
     # ================================================================
     # Internal: data conversion helpers
