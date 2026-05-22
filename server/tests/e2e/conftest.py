@@ -70,6 +70,13 @@ def real_stack(tmp_path_factory):
     """
     env = _require_env("LLAMA_CPP_OMNI_ROOT", "MODEL_DIR")
     cuda = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    # cpp_backend re-exports CUDA_VISIBLE_DEVICES to ``str(self.gpu_id)`` when
+    # spawning ``llama-server``. If we leave ``--gpu-id 0`` while the parent
+    # has e.g. CUDA_VISIBLE_DEVICES=1, llama-server gets pinned to physical
+    # GPU 0 (often the busy one) and silently OOM-stalls during model load.
+    # Mirror ``start_all.sh``: pass the *physical* device id to ``--gpu-id``
+    # so the override is a no-op.
+    primary_gpu = cuda.split(",")[0].strip() or "0"
 
     worker_port = _pick_free_port()
     gateway_port = _pick_free_port()
@@ -104,17 +111,22 @@ def real_stack(tmp_path_factory):
         "MINICPMO_CONFIG_PATH": str(cfg_path),
     }
 
+    log_dir = cfg_dir / "logs"
+    log_dir.mkdir(exist_ok=True)
+    worker_log = (log_dir / "worker_0.log").open("w")
+    server_log = (log_dir / "batch_server.log").open("w")
+
     worker = subprocess.Popen(
         [
             sys.executable, "worker.py",
             "--port", str(worker_port),
-            "--gpu-id", "0",
+            "--gpu-id", primary_gpu,
             "--worker-index", "0",
         ],
         cwd=str(SERVER_ROOT),
         env=proc_env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=worker_log,
+        stderr=subprocess.STDOUT,
     )
     server = subprocess.Popen(
         [
@@ -124,9 +136,12 @@ def real_stack(tmp_path_factory):
         ],
         cwd=str(SERVER_ROOT),
         env=proc_env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
     )
+
+    print(f"\n[real_stack] worker pid={worker.pid} log={log_dir/'worker_0.log'}")
+    print(f"[real_stack] server pid={server.pid} log={log_dir/'batch_server.log'}")
 
     try:
         _wait_url(
@@ -150,3 +165,5 @@ def real_stack(tmp_path_factory):
                 p.wait(timeout=10)
             except Exception:
                 p.kill()
+        worker_log.close()
+        server_log.close()
