@@ -886,12 +886,35 @@ class CppBackendWorker:
         self._reset_output_dir()
         self._round_number = 0
 
-        # Prefill all non-system messages (audio / image / text), mirroring the
-        # behaviour of ``chat_prefill`` and the duplex path. The original
-        # implementation silently dropped string content (`elif isinstance(item, str): pass`),
-        # leaving the C++ KV cache empty and causing the decode below to free-run.
+        # [BUGFIX] Trigger system-prompt re-init with a dedicated index=0
+        # prefill BEFORE pushing any user content. Rationale:
+        #
+        #   ``_call_update_session_config`` resets ``system_prompt_initialized``
+        #   to false (and clears the LLM KV cache). The very next
+        #   ``stream_prefill`` call with index=0 in C++ then enters the
+        #   "system prompt initialization" branch (omni.cpp ~line 10096),
+        #   which builds <|im_start|>system\n...<|audio_start|>[ref_audio]
+        #   <|audio_end|>...<|im_end|>\n<|im_start|>user\n and sets
+        #   ``system_prompt_initialized = true`` — and **silently drops** the
+        #   ``aud_fname`` / ``img_fname`` / ``text`` arguments passed in that
+        #   same call (see the comment block at omni.cpp ~10172: "用户音频应该
+        #   从 index >= 1 开始传入"). Calling _call_prefill with the first
+        #   user content at cnt=0 therefore loses that content; the model
+        #   then decodes with no user input and either returns empty text
+        #   (use_tts=false simplex) or hallucinates a reply (use_tts=true
+        #   simplex, where the <|tts_bos|> in the assistant prompt forces
+        #   speech). The same root cause makes RL logits capture report
+        #   only ~5% of expected tokens (only system / assistant prompt
+        #   prefill positions are captured; the decode loop runs near-zero
+        #   sampling steps).
+        #
+        # We honor the C++ contract by spending one synthetic index=0 call
+        # purely on system-prompt init, then stream user content from
+        # index>=1.
+        self._call_prefill("", "", 0)
+
         mixin = MiniCPMOProcessorMixin()
-        cnt = 0
+        cnt = 1
         for msg in request.messages:
             role = getattr(msg, "role", None)
             role_str = role.value if hasattr(role, "value") else role
@@ -1007,8 +1030,20 @@ class CppBackendWorker:
         if reset_context:
             self._reset_output_dir()
             self._round_number = 0
+            # [BUGFIX] On a fresh session, ``update_session_config`` above has
+            # cleared the KV cache and set ``system_prompt_initialized=false``
+            # in C++. The first ``_call_prefill`` after a reset MUST be a
+            # dedicated index=0 system-prompt init — passing user content with
+            # index=0 makes C++ silently drop that content (see ``chat()``
+            # for the long-form rationale and the matching comment in
+            # ``omni.cpp`` near stream_prefill ~line 10172). Spend one
+            # synthetic index=0 call here, then user content starts at
+            # index>=1.
+            self._call_prefill("", "", 0)
+            cnt = 1
+        else:
+            cnt = self._round_number
 
-        cnt = self._round_number
         prefill_msgs: List[Dict[str, Any]] = []
         # if msgs and reset_context and len(msgs) > 1:
         #     prefill_msgs.append(msgs[0])

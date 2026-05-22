@@ -502,20 +502,22 @@ The C++ worker is then booted with `use_tts=False`:
 
 ### Known limitations (text-only mode)
 
-1. `POST /v1/chat` **does not work** in text-only mode (returns empty `text`).
-   The simplex chat path in the C++ engine still wires through TTS-side state
-   machines and short-circuits when `use_tts=False`. Workaround: route all
-   text-only inference through `/v1/duplex_offline`, which works.
-2. `logits` capture under `NO_TTS=1` is **incomplete**: only ~5% of expected
-   token positions are captured (the new opt/perf-round4 duplex pipeline
-   bypasses most of the existing capture hooks when `use_tts=False`). If you
-   need full logits for RL training, **keep TTS enabled**.
-3. Audio output fields (`audio_data`, `merged_audio_data`) are always `null`
+1. Audio output fields (`audio_data`, `merged_audio_data`) are always `null`
    in `NO_TTS=1` mode; setting `tts.enabled=true` in the request has no
-   effect.
+   effect — TTS / Token2Wav weights aren't loaded so audio simply can't
+   be synthesized.
 
-Both limitations 1 and 2 are open items; see commit log on `feat/web-server`
-for the latest investigation status.
+> Earlier revisions of this branch listed two other limitations: `/v1/chat`
+> returning empty text under `NO_TTS=1`, and `logits` capture only covering
+> ~5% of expected positions. Both shared the same root cause: the Python
+> chat path was sending the first user message at index=0, which the C++
+> ``stream_prefill`` reserves for system-prompt initialization (see the
+> contract comment in ``tools/omni/omni.cpp`` near ``stream_prefill``);
+> user content at index=0 was silently dropped, so the LLM either decoded
+> nothing (use_tts=false) or hallucinated an unrelated reply forced by
+> ``<|tts_bos|>`` (use_tts=true). The chat path now emits a dedicated
+> index=0 init prefill and starts user content at index=1, which fixes
+> both the empty-text and the partial-logits behavior in NO_TTS mode.
 
 ---
 
