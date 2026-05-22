@@ -741,6 +741,35 @@ class GenerationConfig(BaseModel):
         le=5.0,
         description="长度惩罚系数。>1.0 抑制 EOS token 使输出更长更详细，=1.0 不惩罚，<1.0 鼓励更早结束"
     )
+    # ---- LLM 主 sampler 的 per-request 字段（透传到 C++ ctx_sampler 重建） ----
+    # 见 ``cpp_backend._sampling_from_generation`` + ``server.cpp`` 中
+    # ``handle_stream_update_session_config_impl`` 的 ``llm_sampling`` 块。
+    seed: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=4_294_967_295,  # uint32 max
+        description=(
+            "LLM 主 sampler 随机种子（uint32）。设了之后同一 prompt + 同 sampling "
+            "字段在同一进程内可重放。RL rollout 推荐显式传，可重复。None=保留启动默认。"
+        ),
+    )
+    repetition_penalty: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description=(
+            "重复惩罚（>1.0 抑制重复，1.0=不启用，<1.0 鼓励重复）。映射到 llama.cpp "
+            "common_params_sampling.penalty_repeat。None=保留启动默认。"
+        ),
+    )
+    repetition_penalty_last_n: Optional[int] = Field(
+        default=None,
+        ge=-1,
+        description=(
+            "重复惩罚作用窗口（最近 N token）。-1=context_size，0=禁用。"
+            "映射到 penalty_last_n。None=保留启动默认。"
+        ),
+    )
     max_inp_length: int = Field(
         8192,
         ge=1,

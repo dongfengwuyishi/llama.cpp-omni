@@ -6397,6 +6397,62 @@ int main(int argc, char ** argv) {
                         ctx_server.octx->tts_temperature);
             }
 
+            // [Python 透传 - LLM 主 sampler per-request 配置]
+            //
+            // 嵌套对象 ``llm_sampling`` 接 7 个 LLM 主链路 sampler 字段。任意字段
+            // 改动都会触发主 sampler 重建（free 旧的 ctx_sampler + common_sampler_init
+            // 新的，model 不变）。do_sample=False 在 Python 端转成 ``temp=0`` 透传
+            // 到这里，沿用 llama.cpp ``temp <= 0 = greedy`` 的语义。
+            //
+            // 注意 ``tts_temperature`` 是单独字段（顶层），它影响的是 ctx_tts_sampler
+            // 而不是这里的 ctx_sampler，二者互不干扰。
+            //
+            // 用例：RL rollout 想 per-request 设 seed/temp 让 trajectory 可重放；
+            // chat 路径希望按 GenerationConfig.do_sample=False 走 greedy。修复了
+            // 之前 _sampling_from_generation 把 do_sample/temperature 整个丢掉、
+            // 必须靠 OMNI_LLM_SAMPLE_TEMP 环境变量绕开的问题（commit 9bc3964）。
+            //
+            // 重要：只要请求体里出现 ``llm_sampling`` 这个对象，**总是** rebuild
+            // sampler，即使所有字段值都和当前一致 —— 因为 sampler 的内部状态
+            // （RNG cursor、penalty token ring buffer 等）会随上一次 stream_decode
+            // 推进；新一轮 chat 想要 reproducibility，必须从 seed 重新 seed 状态，
+            // 而不是只看"参数值是否变化"。如果 client 不想动 sampler，就别传
+            // ``llm_sampling`` 字段。
+            if (data.contains("llm_sampling") && data.at("llm_sampling").is_object()) {
+                auto & ls = data.at("llm_sampling");
+                auto & s = ctx_server.octx->params->sampling;
+                if (ls.contains("temp") && ls.at("temp").is_number()) {
+                    s.temp = ls.at("temp").get<float>();
+                }
+                if (ls.contains("top_p") && ls.at("top_p").is_number()) {
+                    s.top_p = ls.at("top_p").get<float>();
+                }
+                if (ls.contains("top_k") && ls.at("top_k").is_number_integer()) {
+                    s.top_k = ls.at("top_k").get<int32_t>();
+                }
+                if (ls.contains("min_p") && ls.at("min_p").is_number()) {
+                    s.min_p = ls.at("min_p").get<float>();
+                }
+                if (ls.contains("seed") && ls.at("seed").is_number_integer()) {
+                    s.seed = ls.at("seed").get<uint32_t>();
+                }
+                if (ls.contains("penalty_repeat") && ls.at("penalty_repeat").is_number()) {
+                    s.penalty_repeat = ls.at("penalty_repeat").get<float>();
+                }
+                if (ls.contains("penalty_last_n") && ls.at("penalty_last_n").is_number_integer()) {
+                    s.penalty_last_n = ls.at("penalty_last_n").get<int32_t>();
+                }
+                if (ctx_server.octx->ctx_sampler != nullptr) {
+                    common_sampler_free(ctx_server.octx->ctx_sampler);
+                }
+                ctx_server.octx->ctx_sampler = common_sampler_init(
+                    ctx_server.octx->model, s);
+                SRV_INF("%s: LLM main sampler rebuilt (temp=%.3f top_p=%.3f top_k=%d "
+                        "min_p=%.3f seed=%u penalty_repeat=%.3f penalty_last_n=%d)\n",
+                        __func__, s.temp, s.top_p, s.top_k, s.min_p,
+                        (unsigned)s.seed, s.penalty_repeat, s.penalty_last_n);
+            }
+
             // 3. 清空 KV cache
             if (ctx_server.octx->ctx_llama) {
                 llama_memory_t mem = llama_get_memory(ctx_server.octx->ctx_llama);

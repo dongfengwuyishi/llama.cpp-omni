@@ -59,13 +59,18 @@ GET   ${base}/health                  # 等价 /v1/health（兼容路径）
   ],
 
   // 生成参数（可选；默认见 GenerationConfig）
+  // 标 † 的字段 per-request 透传到 C++ ctx_sampler 重建（rebuild on every chat / half-duplex
+  // turn）；标 ‡ 的字段是 server 自身处理（不进 sampler）。
   "generation": {
-    "max_new_tokens": 256,
-    "temperature":     0.7,
-    "top_k":           20,
-    "top_p":           0.8,
-    "do_sample":       true,
-    "repetition_penalty": 1.05
+    "max_new_tokens":            256,    // ‡ 单轮硬上限，透传到 ctx_omni->chat_max_new_tokens
+    "do_sample":                 true,   // † do_sample=false ⇒ 透传 temp=0 走 greedy
+    "temperature":               0.7,    // † 仅在 do_sample=true 时生效
+    "top_p":                     0.8,    // † 透传到 sampler.top_p
+    "top_k":                     100,    // † 0 = HF 语义"禁用"，会在 _sampling_from_generation 端被丢弃
+    "seed":                      42,     // † uint32；显式传 = trajectory 可重放（RL rollout 推荐）
+    "repetition_penalty":        1.05,   // † 也接 ``repeat_penalty`` 别名
+    "repetition_penalty_last_n": 64,     // † -1 = context_size，0 = 关闭
+    "length_penalty":            1.1     // ‡ EOS bias，server 端在 stream/decode 处理
   },
 
   // TTS 输出（可选）

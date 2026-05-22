@@ -167,22 +167,86 @@ def _sampling_from_duplex_config(cfg: Any) -> Dict[str, Any]:
 
 
 def _sampling_from_generation(gen: Any) -> Dict[str, Any]:
-    """从 GenerationConfig（chat / half-duplex 用）抽出 C++ session-config 能吃的字段。
+    """从 GenerationConfig（chat / half-duplex 用）映射到 C++
+    ``/v1/stream/update_session_config`` 接受的字段。
 
-    注意 max_new_tokens **不**进 update_session_config 的 sampling，而是在每轮
-    /v1/stream/decode 请求体上单独透传到 ctx_omni->chat_max_new_tokens
-    （见 ``chat()`` 里组装 decode_body 的位置 + omni.h ``chat_max_new_tokens``
-    注释）。原因是单轮上限是"按请求"语义、不是"按 session"语义，且 duplex 路径
-    要走 max_new_speak_tokens_per_chunk，强行映射到 sampling 会污染 session。
+    映射两类字段：
 
-    这里仅承担 session 级 sticky 字段（目前是 tts_temperature）。
+    1. **顶层 session 级 sticky**：``tts_temperature`` → 同名顶层字段，影响
+       ``ctx_tts_sampler``。
+
+    2. **嵌套 ``llm_sampling`` 对象**：do_sample / temperature / top_p / top_k /
+       seed / repetition_penalty 这些 LLM 主链路字段，由 server.cpp 的
+       ``handle_stream_update_session_config_impl`` 解析后**重建**
+       ``ctx_omni->ctx_sampler``（见 server.cpp 的 ``[Python 透传 - LLM 主 sampler
+       per-request 配置]`` 块）。语义对齐 HuggingFace generation：
+
+       - ``do_sample=False`` → 透传 ``temp=0``（llama.cpp ``temp <= 0 = greedy``）
+       - ``do_sample=True``  → 透传请求体上的 ``temperature`` 原值
+       - 其它字段（top_p/top_k/seed）不依赖 do_sample，按字段直传
+
+    历史上这里曾把整段 GenerationConfig 丢掉（见 commit 9bc3964 引入的
+    ``OMNI_LLM_SAMPLE_TEMP`` 环境变量），导致 do_sample / temperature / seed
+    在 chat 路径根本没有效果。本函数现在恢复语义并避免再依赖那个环境变量。
+
+    ``max_new_tokens`` **不**进这里，而是在每轮 ``/v1/stream/decode`` 请求体上
+    单独透传到 ``ctx_omni->chat_max_new_tokens`` —— 单轮上限是"按请求"语义，
+    不是"按 session"语义；duplex 还要走 ``max_new_speak_tokens_per_chunk``。
     """
     if gen is None:
         return {}
     out: Dict[str, Any] = {}
-    tts_t = getattr(gen, "tts_temperature", None) if not isinstance(gen, dict) else gen.get("tts_temperature")
+
+    def _pick(name: str):
+        if isinstance(gen, dict):
+            return gen.get(name)
+        return getattr(gen, name, None)
+
+    # ---- TTS sampler (顶层) ----
+    tts_t = _pick("tts_temperature")
     if tts_t is not None:
         out["tts_temperature"] = tts_t
+
+    # ---- LLM 主 sampler (嵌套 llm_sampling) ----
+    llm: Dict[str, Any] = {}
+    do_sample = _pick("do_sample")
+    temperature = _pick("temperature")
+    if do_sample is False:
+        # HF 语义：do_sample=False ⇒ greedy。映射到 llama.cpp 的 temp<=0=greedy。
+        llm["temp"] = 0.0
+    elif temperature is not None:
+        # do_sample=True 或未指定，且显式给了 temperature → 按字段直传。
+        # 注意 GenerationConfig.temperature 默认 0.7，不会触发 sampler 重建
+        # （server.cpp 端做了"值变化才 rebuild"判断）。
+        llm["temp"] = float(temperature)
+
+    top_p = _pick("top_p")
+    if top_p is not None:
+        llm["top_p"] = float(top_p)
+
+    top_k = _pick("top_k")
+    if top_k is not None and int(top_k) > 0:
+        # GenerationConfig.top_k=0 在 HF 语义里是"禁用"；在 llama.cpp 里
+        # ``top_k <= 0`` 表示"用 vocab size"，行为不同。这里按 HF 语义跳过。
+        llm["top_k"] = int(top_k)
+
+    seed = _pick("seed")
+    if seed is not None:
+        # int -> uint32 转换由 C++ 端做（json::is_number_integer）
+        llm["seed"] = int(seed)
+
+    rep_pen = _pick("repetition_penalty")
+    if rep_pen is None:
+        rep_pen = _pick("repeat_penalty")
+    if rep_pen is not None:
+        llm["penalty_repeat"] = float(rep_pen)
+
+    rep_last_n = _pick("repetition_penalty_last_n")
+    if rep_last_n is not None:
+        llm["penalty_last_n"] = int(rep_last_n)
+
+    if llm:
+        out["llm_sampling"] = llm
     return out
 
 
@@ -1416,6 +1480,9 @@ class CppBackendWorker:
 
         # [Python -> C++ 透传] DuplexConfig / GenerationConfig 中 session-level 的
         # sampling 旋钮。仅在明确给出时才下推，省略沿用 omni_init 默认。
+        # 顶层 4 个旋钮 + 嵌套 ``llm_sampling`` 对象（LLM 主 sampler per-request
+        # 字段，由 server.cpp 收到后重建 ctx_omni->ctx_sampler；见
+        # ``_sampling_from_generation`` 的注释）。
         if sampling:
             for key in (
                 "listen_prob_scale",
@@ -1425,12 +1492,22 @@ class CppBackendWorker:
             ):
                 if key in sampling and sampling[key] is not None:
                     req_body[key] = sampling[key]
+            llm_sampling = sampling.get("llm_sampling")
+            if isinstance(llm_sampling, dict) and llm_sampling:
+                req_body["llm_sampling"] = llm_sampling
 
         # [RL training] Toggle LLM logits capture for the next prefill+decode
         # cycle. C++ side allocates / frees the bf16 buffer.
         if return_logits is not None:
             req_body["return_logits"] = bool(return_logits)
 
+        if "llm_sampling" in req_body:
+            # 调试线索：每轮 chat / half-duplex 透传到 C++ 的 sampler 字段。
+            # rebuild 触发的 SRV_INF "LLM main sampler rebuilt (...)" 在
+            # llama-server 子进程那边输出，组合起来可以重放每轮 sampler 状态。
+            logger.debug(
+                f"[update_session_config] llm_sampling={req_body['llm_sampling']}"
+            )
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/update_session_config",
             json=req_body,
