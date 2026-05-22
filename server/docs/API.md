@@ -547,6 +547,31 @@ The C++ worker is then booted with `use_tts=False`:
 - **`format="file"`**：server 写一个 `.safetensors`，响应里只返回路径
 - **`format="inline"`**：响应 JSON 里直接 base64 嵌入 token_ids + logits 字节
 
+> **落盘路径与保留策略（`format="file"`）**
+>
+> server 把 `output_dir`（或环境变量 `OMNI_LOGITS_OUTPUT_DIR`，默认
+> `/tmp/minicpm_logits`）当**基目录**，自动在它下面追加一层 UTC 日期子目录
+> `YYYY-MM-DD/`，最终落盘路径示例：
+>
+> ```
+> /data/logits/2026-05-21/chat_round0.safetensors
+> /data/logits/2026-05-21/duplex_<request_id>.safetensors
+> /data/logits/2026-05-22/...
+> ```
+>
+> Worker 进程内置一个 daemon janitor，按下面的环境变量做老化清理（默认开启）：
+>
+> | 变量 | 默认 | 含义 |
+> |---|---|---|
+> | `OMNI_LOGITS_OUTPUT_DIR`        | `/tmp/minicpm_logits` | 基目录（请求未指定 `output_dir` 时） |
+> | `OMNI_LOGITS_RETENTION_DAYS`    | `7`   | 严格早于 `(today - N 天)` 的日期目录整体删除；`0` 关闭 |
+> | `OMNI_LOGITS_MAX_TOTAL_BYTES`   | `0`   | 超过则按"最旧日期目录优先"逐日驱逐；`0` 关闭。永不删当天 |
+> | `OMNI_LOGITS_CLEANUP_INTERVAL_S`| `600` | 扫描间隔秒，最小 60 |
+>
+> 多 worker 共享同一个基目录是安全的（`unlink/rmtree` 幂等）。这是 server-side
+> 行为，client 不需要改 schema —— 老的 `output_dir=/data/logits` 调用方拿到的
+> `logits.file` 字段就会变成 `/data/logits/2026-05-21/chat_round0.safetensors`。
+
 ### 8.2 响应字段
 
 `ChatResponse.logits` / `DuplexBatchResponse.logits`

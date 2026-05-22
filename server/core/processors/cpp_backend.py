@@ -965,10 +965,19 @@ class CppBackendWorker:
         if logits_spec.enabled:
             decode_body["logit_format"] = logits_spec.format
             if logits_spec.format == "file":
-                # Use the caller-provided output_dir (worker layer is in charge
-                # of picking one; we never invent paths here).
-                if logits_spec.output_dir:
-                    decode_body["logit_output_dir"] = logits_spec.output_dir
+                # [P3 retention] Route the C++ writer through a date-bucketed
+                # subdirectory: ``<base>/<YYYY-MM-DD>/chat_round<N>.safetensors``.
+                # ``logits_retention.resolve_output_dir`` is idempotent and
+                # honors ``$OMNI_LOGITS_OUTPUT_DIR`` when the request didn't
+                # pin one. The retention daemon (see ``worker.py`` lifespan
+                # → ``start_cleanup_thread``) then reaps stale ``YYYY-MM-DD``
+                # subdirs by ``OMNI_LOGITS_RETENTION_DAYS`` /
+                # ``OMNI_LOGITS_MAX_TOTAL_BYTES``.
+                from .logits_retention import resolve_output_dir
+                bucket_dir = resolve_output_dir(logits_spec.output_dir)
+                decode_body["logit_output_dir"] = (
+                    bucket_dir if bucket_dir.endswith(os.sep) else bucket_dir + os.sep
+                )
                 # Default filename: <round>.safetensors. Worker layer can
                 # override by patching ``logits_spec`` before calling chat().
                 fname = getattr(request, "_logit_filename", None) or f"chat_round{self._round_number}.safetensors"

@@ -716,6 +716,19 @@ async def lifespan(app: FastAPI):
     # 模型加载是同步操作（~15s for pytorch, ~2-3min for cpp），在线程中执行避免阻塞
     await asyncio.to_thread(worker.load_model)
 
+    # [P3 logits retention] 后台 daemon：按 ``$OMNI_LOGITS_RETENTION_DAYS`` /
+    # ``$OMNI_LOGITS_MAX_TOTAL_BYTES`` 老化清理 ``$OMNI_LOGITS_OUTPUT_DIR``
+    # （或 spec.output_dir）下的 ``YYYY-MM-DD/*.safetensors`` 子目录。
+    # 默认 7 天；设 0 关闭。多 worker 共享同一 base dir 是安全的
+    # （unlink/rmtree 幂等）。lifespan shutdown 时显式 join 一次。
+    try:
+        from core.processors.logits_retention import (
+            start_cleanup_thread as _start_logits_retention,
+        )
+        _start_logits_retention()
+    except Exception as e:
+        logger.warning(f"[logits_retention] failed to start: {e}")
+
     # C++ 后端看门狗：定期检测 llama-server 是否存活，崩溃时自动重启
     cpp_watchdog_task = None
     if backend == "cpp" and hasattr(worker, "is_cpp_healthy"):
@@ -770,6 +783,11 @@ async def lifespan(app: FastAPI):
             await cpp_watchdog_task
         except asyncio.CancelledError:
             pass
+    try:
+        from core.processors.logits_retention import stop_cleanup_thread
+        stop_cleanup_thread(timeout=2.0)
+    except Exception:
+        pass
     if backend == "cpp" and hasattr(worker, "shutdown"):
         worker.shutdown()
     logger.info("Worker shutting down")
@@ -2731,8 +2749,12 @@ def _build_consolidated_logits_payload(
         )
 
     if spec.format == "file":
-        out_dir = spec.output_dir or "/tmp/minicpm_logits"
-        os.makedirs(out_dir, exist_ok=True)
+        # [P3 retention] Route through date-bucketed subdir to make the
+        # janitor (``core.processors.logits_retention.start_cleanup_thread``)
+        # able to reap stale days cheaply. Honors ``OMNI_LOGITS_OUTPUT_DIR``
+        # env when ``spec.output_dir`` is empty. Idempotent on re-runs.
+        from core.processors.logits_retention import resolve_output_dir
+        out_dir = resolve_output_dir(spec.output_dir)
         fname = f"duplex_{request_id or uuid.uuid4().hex[:12]}.safetensors"
         path = os.path.join(out_dir, fname)
         extra = {
