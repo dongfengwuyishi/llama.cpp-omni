@@ -115,6 +115,14 @@ def step_chat_inline(client: httpx.Client) -> bool:
     p = r.json()
     info("client elapsed s", round(dt, 2))
     info("text", repr((p.get("text") or "")[:120]))
+    # Regression guard: with --no-tts the chat path historically returned an
+    # empty string because cnt=0 prefill triggered system-prompt-only init in
+    # C++ stream_prefill and silently dropped the user message. The fix
+    # routes a dedicated index=0 init through cpp_backend, then user content
+    # from index>=1, so we MUST see non-empty decode output here.
+    if not (p.get("text") or "").strip():
+        fail("chat returned empty text — likely the no-tts cnt=0 dropped-content bug regressed")
+        return False
     lp = p.get("logits")
     if not lp:
         fail("no logits in response")
@@ -131,22 +139,39 @@ def step_chat_inline(client: httpx.Client) -> bool:
     if len(raw) != expected:
         fail("logits byte count mismatch")
         return False
-    u16 = np.frombuffer(raw, dtype=np.uint16).reshape(lp["n_tokens"], lp["vocab_size"])
+    # Hard P/D split assertions: both phases MUST contribute tokens. Before
+    # the chat-cnt=0 fix this script only printed WARNs while the decode
+    # half silently captured ~0 tokens (= the "logits ~5%" symptom).
+    n_pref   = int(lp["n_prefill_tokens"])
+    n_total  = int(lp["n_tokens"])
+    n_decode = n_total - n_pref
+    info("P / D token counts", f"prefill={n_pref}, decode={n_decode}, total={n_total}")
+    if n_pref <= 0:
+        fail("prefill phase captured no tokens (n_prefill_tokens == 0)")
+        return False
+    if n_decode <= 0:
+        fail("decode phase captured no tokens (n_tokens == n_prefill_tokens)")
+        return False
+    # Greedy decode (do_sample=False) drives ~max_new_tokens unless EOS hits
+    # very early; demand at least a couple of decode steps to ensure the
+    # sampling loop actually ran.
+    if n_decode < 2:
+        fail(f"decode phase captured only {n_decode} token(s); sampling loop barely ran")
+        return False
+    u16 = np.frombuffer(raw, dtype=np.uint16).reshape(n_total, lp["vocab_size"])
     fp = bf16_uint16_to_fp32(u16)
-    n_pref = lp["n_prefill_tokens"]
-    if n_pref < lp["n_tokens"]:
-        row = fp[n_pref]
-        sampled_tok = int(tok[n_pref])
-        if sampled_tok >= 0:
-            rank = int(np.sum(row > row[sampled_tok]))
-            top5 = np.argsort(row)[-5:][::-1]
-            info("first decode step", f"sampled={sampled_tok}, rank={rank}, top5={top5.tolist()}")
-            # do_sample=False so the sampled token should be argmax
-            if rank != 0:
-                warn(f"sampled token rank={rank} (expected 0 for greedy decode)")
-        else:
-            info("first decode step", f"modality placeholder sampled={sampled_tok}")
-    ok("inline logits round-trip ok")
+    row = fp[n_pref]
+    sampled_tok = int(tok[n_pref])
+    if sampled_tok >= 0:
+        rank = int(np.sum(row > row[sampled_tok]))
+        top5 = np.argsort(row)[-5:][::-1]
+        info("first decode step", f"sampled={sampled_tok}, rank={rank}, top5={top5.tolist()}")
+        # do_sample=False so the sampled token should be argmax
+        if rank != 0:
+            warn(f"sampled token rank={rank} (expected 0 for greedy decode)")
+    else:
+        info("first decode step", f"modality placeholder sampled={sampled_tok}")
+    ok("inline logits round-trip ok (P+D both captured)")
     return True
 
 
@@ -187,7 +212,19 @@ def step_chat_file(client: httpx.Client, out_dir: Path) -> bool:
     if tensors["token_ids"].shape != (lp["n_tokens"],):
         fail(f"token_ids shape mismatch: {tensors['token_ids'].shape}")
         return False
-    ok("safetensors content matches header")
+    # Same regression guard as the inline step: chat under --no-tts must
+    # actually decode something or the safetensors degenerates to "system /
+    # assistant prompt prefill only" (~5% of expected tokens).
+    n_pref   = int(lp.get("n_tokens", 0)) - 0  # placeholder, override below
+    n_pref   = int(md.get("n_prefill_tokens") or lp.get("n_prefill_tokens") or 0)
+    n_total  = int(md.get("n_tokens")          or lp.get("n_tokens")          or 0)
+    n_decode = n_total - n_pref
+    info("P / D token counts", f"prefill={n_pref}, decode={n_decode}, total={n_total}")
+    if n_decode < 2:
+        fail(f"decode phase captured only {n_decode} token(s); chat appears to "
+             "have degenerated to prefill-only output (no-tts cnt=0 bug?)")
+        return False
+    ok("safetensors content matches header (P+D both captured)")
     return True
 
 
@@ -237,6 +274,20 @@ def step_duplex_file(client: httpx.Client, out_dir: Path, audio_path: str) -> bo
             ok(f"chunk_boundaries close consistent ({len(cb_list)-1} chunks)")
     except Exception as e:
         warn(f"chunk_boundaries parse: {e}")
+    # P/D split sanity for duplex_offline. The duplex path streams chunk by
+    # chunk, so n_decode being 0 here means every chunk decided to LISTEN
+    # (rare for a real-world prompt) or that decode-side capture is broken.
+    n_pref   = int(md.get("n_prefill_tokens") or lp.get("n_prefill_tokens") or 0)
+    n_total  = int(md.get("n_tokens")          or lp.get("n_tokens")          or 0)
+    n_decode = n_total - n_pref
+    info("P / D token counts", f"prefill={n_pref}, decode={n_decode}, total={n_total}")
+    if n_pref <= 0:
+        fail("duplex prefill phase captured no tokens")
+        return False
+    if n_decode <= 0:
+        warn("duplex decode phase captured no tokens — model may have stayed "
+             "in LISTEN for every chunk; not necessarily a regression but "
+             "worth eyeballing the audio")
     ok("duplex safetensors content matches header")
     return True
 
