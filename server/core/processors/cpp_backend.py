@@ -1170,6 +1170,27 @@ class CppBackendWorker:
                 f"{env['CUDA_VISIBLE_DEVICES']!r}; inheriting (not overriding)"
             )
 
+        # [LLM 主 sampler 默认 + override]
+        # 默认：--temp 0.7 / --repeat-penalty 1.05，无固定 --seed（每次启动随机）。
+        # 这与 Python MiniCPM-o-4_5 推理脚本 default 对齐，保留 duplex/chat 在
+        # default sampling 下的多样性。
+        #
+        # Override（环境变量）：
+        #   OMNI_LLM_SAMPLE_TEMP    = "0.0"   → 强制 greedy（适合 RL rollout / token
+        #                                       一致性回归 / use_tts=true vs false 比对）
+        #   OMNI_LLM_SAMPLE_SEED    = "42"    → 固定 seed，让随机采样轨迹可复现
+        #   OMNI_LLM_REPEAT_PENALTY = "1.0"   → 关闭 repetition penalty
+        #
+        # 这条口子是为 P2 验证（"use_tts=true / false 必须给 LLM 看到完全相同的
+        # token+logits 序列"）开的：通过两 worker 设相同 OMNI_LLM_SAMPLE_TEMP=0
+        # 即可绕开当前 update_session_config 不接 LLM 主 sampler 字段的限制
+        # （server.cpp ~6377-6398 只透传 listen_prob_scale / force_listen_count /
+        # max_new_speak_tokens_per_chunk / tts_temperature 这四项 session-level 字段）。
+        # 等到 LLM 主 sampler 被纳入 update_session_config / per-request 透传后，
+        # 这些 env 仍可作为"启动期默认值"保留，不冲突。
+        sample_temp = os.environ.get("OMNI_LLM_SAMPLE_TEMP", "0.7")
+        repeat_penalty = os.environ.get("OMNI_LLM_REPEAT_PENALTY", "1.05")
+        sample_seed = os.environ.get("OMNI_LLM_SAMPLE_SEED")
         cmd = [
             server_bin,
             "--host", "0.0.0.0",
@@ -1177,9 +1198,17 @@ class CppBackendWorker:
             "--model", model_path,
             "--ctx-size", str(self.ctx_size),
             "--n-gpu-layers", str(self.n_gpu_layers),
-            "--repeat-penalty", "1.05",
-            "--temp", "0.7",
+            "--repeat-penalty", repeat_penalty,
+            "--temp", sample_temp,
         ]
+        if sample_seed is not None:
+            cmd.extend(["--seed", sample_seed])
+        if sample_temp != "0.7" or repeat_penalty != "1.05" or sample_seed is not None:
+            logger.info(
+                f"[LLM sampler override] temp={sample_temp} repeat-penalty={repeat_penalty} "
+                f"seed={sample_seed!r} (env: OMNI_LLM_SAMPLE_TEMP / OMNI_LLM_REPEAT_PENALTY / "
+                f"OMNI_LLM_SAMPLE_SEED)"
+            )
 
         logger.info(f"Starting C++ server: {' '.join(cmd)}")
 

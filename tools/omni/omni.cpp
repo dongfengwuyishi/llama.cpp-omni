@@ -10546,24 +10546,36 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             }
             return true;
         }
-    } else if (ctx_omni->use_tts) {
-        // 🔧 [非双工 TTS 模式] 需要包含 <|tts_bos|>，告诉模型开始生成 TTS 文本
-        // stream_prefill 已添加 <|audio_start|>[audio]<|audio_end|>，这里关闭用户消息并添加 assistant prompt
-        // 格式: <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|tts_bos|>
-        std::string prompt = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|tts_bos|>";
-        print_with_timestamp("📍 [单工TTS] 添加 assistant prompt: \"%s\", n_past=%d\n", 
-                            prompt.c_str(), ctx_omni->n_past);
-        {
-            eval_string(ctx_omni, ctx_omni->params, prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-        }
-        print_with_timestamp("📍 [单工TTS] assistant prompt 完成, n_past=%d\n", ctx_omni->n_past);
     } else {
-        // 🔧 [非双工纯 LLM 模式] 只使用标准的 assistant prompt（无 TTS 标记，无 think 标记）
-        // 格式: <|im_end|>\n<|im_start|>assistant\n
-        std::string prompt = "<|im_end|>\n<|im_start|>assistant\n";
+        // 🔧 [非双工 - 训练分布对齐] 单工 chat / half-duplex 一律使用与 Python
+        // ``default_tts_chat_template`` 一致的 assistant generation prompt：
+        //
+        //     <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|tts_bos|>
+        //
+        // [设计契约 - RL 友好] use_tts 只影响"是否真的去合成语音"
+        // （即是否启动 tts_thread / t2w_thread、是否落 wav 文件），**完全不影响**
+        // LLM 看到的 prompt 和它生成的 token / logits。换句话说，给定同一段
+        // 用户输入，use_tts=true / use_tts=false 必须输出**完全一致**的
+        // token_ids 和 logits 序列；否则 RL rollout 拿到的 (token,logit) 分布
+        // 就会与真实部署 (use_tts=true) 不可比，gradient 会跑偏。
+        //
+        // 历史遗留问题：之前这里有一条 ``else (use_tts=false)`` 分支会把
+        // assistant prompt 简化为 ``<|im_end|>\n<|im_start|>assistant\n``
+        // （去掉 think 段和 <|tts_bos|>），那个 prompt 是 out-of-distribution
+        // 的——MiniCPM-o-4.5 训练时一直见的是带 <|tts_bos|> 的版本，
+        // 简化后 LLM 看到的就不是训练分布的 prompt 了。已删除。
+        //
+        // 注意：use_tts=false 时 LLM 在 <|tts_bos|> 之后采样出来的 token
+        // 在语义上是 audio embedding 编号，detokenize 成字符是 garbage——
+        // 这是预期行为。下游 RL pipeline 应消费 ``token_ids`` + ``logits``，
+        // 不应当把 detokenized ``text`` 字段当人类可读文本使用。
+        std::string prompt = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|tts_bos|>";
+        print_with_timestamp("📍 [单工] 添加 assistant prompt (use_tts=%d): \"%s\", n_past=%d\n",
+                            (int)ctx_omni->use_tts, prompt.c_str(), ctx_omni->n_past);
         {
             eval_string(ctx_omni, ctx_omni->params, prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
         }
+        print_with_timestamp("📍 [单工] assistant prompt 完成, n_past=%d\n", ctx_omni->n_past);
     }
     LOG_INF("<user>%s\n", ctx_omni->params->prompt.c_str());
     LOG_INF("<assistant>");
