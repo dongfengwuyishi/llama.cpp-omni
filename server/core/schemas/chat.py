@@ -217,7 +217,7 @@ class ChatRequest(BaseModel):
     #
     # Optional client-side identifier echoed back in logs and used as a
     # **debug-only** suffix on the ``logits.format='file'`` output filename
-    # (e.g. ``chat_w0_p1f4a_00000123_<request_id>.safetensors``). Never used
+    # (e.g. ``chat_w0_p0001f4a_00000123_<request_id>.safetensors``). Never used
     # for routing or correctness — uniqueness of the output filename is
     # guaranteed by ``(worker_idx, pid, atomic_seq)`` in
     # ``logits_retention.make_logits_filename``, so even if two clients send

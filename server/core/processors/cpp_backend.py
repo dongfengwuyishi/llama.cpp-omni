@@ -1061,7 +1061,7 @@ class CppBackendWorker:
                 #
                 # 现在统一走 ``make_logits_filename(kind, worker_idx, request_id)``：
                 #   1. ``worker_idx`` 跨 worker 进程唯一（worker.py 的 args.worker_index）
-                #   2. ``pid_hex5`` 防 worker 重启 + 同日复用 seq 撞名
+                #   2. ``pid_hex7`` 防 worker 重启 + 同日复用 seq 撞名
                 #   3. ``seq:08d`` 进程内 atomic counter 串行不撞
                 #   4. ``request_id`` 作为可选 debug 后缀，方便 grep
                 # 唯一性由 (worker_idx, pid, seq) 三元组保证，request_id 不参

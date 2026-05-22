@@ -559,7 +559,7 @@ The C++ worker is then booted with `use_tts=False`:
 > `YYYY-MM-DD/`，叶子文件名走如下统一模板（chat / duplex 共用）：
 >
 > ```
-> {kind}_w{worker_idx}_p{pid_hex5}_{seq:08d}[_{client_request_id}].safetensors
+> {kind}_w{worker_idx}_p{pid_hex7}_{seq:08d}[_{client_request_id}].safetensors
 > ```
 >
 > 字段语义：
@@ -567,8 +567,10 @@ The C++ worker is then booted with `use_tts=False`:
 > - `kind` ∈ `{chat, duplex}` —— 请求类型，事后批量 `grep` 友好
 > - `w{worker_idx}` —— worker 进程在 batch_server pool 里的 0-based 索引
 >   （由 `worker.py --worker-index` 注入），跨 worker 进程必然唯一
-> - `p{pid_hex5}` —— worker 进程 PID 的低 20 bits（5 位 hex）。仅用于防
->   "同一 worker_idx + 同一日期 bucket + worker 重启 + seq 复用" 的极端撞名
+> - `p{pid_hex7}` —— worker 进程 PID 的低 28 bits（7 位 hex）。28 bits 覆盖
+>   Linux `/proc/sys/kernel/pid_max` 的常见生产上限 4194304=2^22，**无截断**。
+>   仅用于防"同一 worker_idx + 同一日期 bucket + worker 重启 + seq 复用"的
+>   极端撞名（撞名概率约 1/2^28 ≈ 4e-9）
 > - `seq:08d` —— 进程内 atomic 单调计数器，从 0 开始
 > - `_{client_request_id}` —— 可选 debug 后缀。client 给的 `request_id` 经
 >   `[A-Za-z0-9_]+` sanitize、截断到 32 字符。**不参与唯一性**，client 给重了
@@ -577,9 +579,9 @@ The C++ worker is then booted with `use_tts=False`:
 > 最终落盘路径示例：
 >
 > ```
-> /data/logits/2026-05-21/chat_w0_p1f4a_00000123.safetensors
-> /data/logits/2026-05-21/chat_w0_p1f4a_00000124_e2e_001.safetensors
-> /data/logits/2026-05-21/duplex_w2_p3b81_00000456_dup_42.safetensors
+> /data/logits/2026-05-21/chat_w0_p0001f4a_00000123.safetensors
+> /data/logits/2026-05-21/chat_w0_p0001f4a_00000124_e2e_001.safetensors
+> /data/logits/2026-05-21/duplex_w2_p0003b81_00000456_dup_42.safetensors
 > /data/logits/2026-05-22/...
 > ```
 >
@@ -615,7 +617,7 @@ The C++ worker is then booted with `use_tts=False`:
   "n_prefill_tokens":  217,
   "vocab_size":        151748,
   "dtype":             "bf16",
-  "file":              "/data/logits/2026-05-21/chat_w0_p1f4a_00000123.safetensors",  // file 模式
+  "file":              "/data/logits/2026-05-21/chat_w0_p0001f4a_00000123.safetensors",  // file 模式
   // inline 模式：
   "token_ids_b64":     "<base64 int32 bytes>",
   "logits_b64":        "<base64 bf16 bytes>",
@@ -661,7 +663,7 @@ The C++ worker is then booted with `use_tts=False`:
 import struct, json
 import numpy as np
 
-with open("chat_w0_p1f4a_00000123.safetensors", "rb") as f:
+with open("chat_w0_p0001f4a_00000123.safetensors", "rb") as f:
     header_size = struct.unpack("<Q", f.read(8))[0]
     header = json.loads(f.read(header_size))
     body_off = 8 + header_size

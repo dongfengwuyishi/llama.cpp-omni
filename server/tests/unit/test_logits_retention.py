@@ -175,7 +175,7 @@ import threading
 
 
 _FILENAME_RE = re.compile(
-    r"^(chat|duplex)_w(\d+)_p([0-9a-f]{5})_(\d{8})(?:_([A-Za-z0-9_]+))?\.safetensors$"
+    r"^(chat|duplex)_w(\d+)_p([0-9a-f]{7})_(\d{8})(?:_([A-Za-z0-9_]+))?\.safetensors$"
 )
 
 
@@ -188,10 +188,10 @@ def test_make_logits_filename_basic_format():
     assert m, f"format mismatch: {fn!r}"
     assert m.group(1) == "chat"
     assert m.group(2) == "0"
-    assert m.group(3) == "01f4a"
+    assert m.group(3) == "0001f4a"
     assert m.group(4) == "00000123"
     assert m.group(5) is None
-    assert fn == "chat_w0_p01f4a_00000123.safetensors"
+    assert fn == "chat_w0_p0001f4a_00000123.safetensors"
 
 
 def test_make_logits_filename_with_request_id_appended():
@@ -199,7 +199,20 @@ def test_make_logits_filename_with_request_id_appended():
 
     fn = make_logits_filename("duplex", 2, "user_abc",
                               _pid_override=0x3B81, _seq_override=456)
-    assert fn == "duplex_w2_p03b81_00000456_user_abc.safetensors"
+    assert fn == "duplex_w2_p0003b81_00000456_user_abc.safetensors"
+
+
+def test_make_logits_filename_pid_no_truncation_for_typical_linux_pid_max():
+    """生产常见 ``pid_max=4194304=2^22`` 落在 28 bits 内，**不**应被截断。"""
+    from core.processors.logits_retention import make_logits_filename
+
+    # 临界 PID（pid_max - 1）
+    fn = make_logits_filename("chat", 0, None,
+                              _pid_override=4_194_303, _seq_override=0)
+    m = _FILENAME_RE.match(fn)
+    assert m, fn
+    assert m.group(3) == f"{4_194_303:07x}", \
+        f"expected full 7-hex representation of {4_194_303}, got {m.group(3)!r}"
 
 
 def test_make_logits_filename_kind_validation():

@@ -117,18 +117,19 @@ def base_dir_from_spec(spec_output_dir: Optional[str]) -> str:
 #
 # 1. 跨 worker 进程并发不撞 → ``w{worker_idx}`` 段
 # 2. 同 worker 进程内串行不撞 → 进程内 atomic 单调计数器 ``seq``
-# 3. worker 重启 + 同日复用 seq 不撞 → ``p{pid_hex5}`` 段（PID 末 5 位 hex；
-#    同日内同 worker 进程**重启后** PID 复用且 seq 撞概率 ~1/2^20）
+# 3. worker 重启 + 同日复用 seq 不撞 → ``p{pid_hex7}`` 段（PID 末 28 bits 的
+#    7 位 hex；Linux ``/proc/sys/kernel/pid_max`` 默认 32768=2^15、生产常见
+#    4194304=2^22，28 bits 完全无截断，重启后撞 PID 概率约 1/2^28 ≈ 4e-9）
 # 4. 调试可读 → 留可选 ``client_request_id`` 后缀（sanitize 后）
 #
 # 命名格式（chat / duplex 共用）：
 #
-#     {kind}_w{worker_idx}_p{pid_hex5}_{seq:08d}[_{sanitized_rid}].safetensors
+#     {kind}_w{worker_idx}_p{pid_hex7}_{seq:08d}[_{sanitized_rid}].safetensors
 #
 # 例：
-#     chat_w0_p1f4a_00000123.safetensors                # 无 client rid
-#     chat_w0_p1f4a_00000124_e2e_001.safetensors        # 有 client rid
-#     duplex_w2_p3b81_00000456_dup_42.safetensors
+#     chat_w0_p0001f4a_00000123.safetensors              # 无 client rid
+#     chat_w0_p0001f4a_00000124_e2e_001.safetensors      # 有 client rid
+#     duplex_w2_p0003b81_00000456_dup_42.safetensors
 #
 # 历史问题（修复前）：chat 路径硬编码 ``chat_round{N}.safetensors``，且 ``chat()``
 # 入口处 ``self._round_number = 0``，所有 chat 请求都写到 ``chat_round0`` →
@@ -186,7 +187,7 @@ def make_logits_filename(
                            ``None`` / 空 / 全是非法字符时省略此后缀。
 
     Returns:
-        ``{kind}_w{worker_idx}_p{pid_hex5}_{seq:08d}[_{rid}].safetensors``。
+        ``{kind}_w{worker_idx}_p{pid_hex7}_{seq:08d}[_{rid}].safetensors``。
         **不**包含目录路径（调用方自己拼 ``resolve_output_dir`` 输出的 bucket
         dir）。
     """
@@ -194,8 +195,9 @@ def make_logits_filename(
         raise ValueError(f"kind must be 'chat' or 'duplex', got {kind!r}")
     pid = _pid_override if _pid_override is not None else os.getpid()
     seq = _seq_override if _seq_override is not None else next(_filename_seq)
-    pid_hex5 = f"{pid & 0xFFFFF:05x}"
-    base = f"{kind}_w{int(worker_idx)}_p{pid_hex5}_{seq:08d}"
+    # 28 bits 覆盖 Linux pid_max 的常见生产上限 4194304=2^22，再无截断损失。
+    pid_hex7 = f"{pid & 0xFFFFFFF:07x}"
+    base = f"{kind}_w{int(worker_idx)}_p{pid_hex7}_{seq:08d}"
     rid = _sanitize_request_id(client_request_id)
     if rid:
         return f"{base}_{rid}.safetensors"
