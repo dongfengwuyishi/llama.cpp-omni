@@ -286,6 +286,15 @@ struct omni_context {
     // 每个 chunk 最大生成 token 数（用于限制单次 speak 长度，便于及时响应打断）
     // 设置为 0 表示无限制
     int max_new_speak_tokens_per_chunk = 26;
+
+    // 单工 chat / half-duplex 模式下，单轮 stream_decode 的硬上限。
+    // -1（默认）= 透明无效，沿用 params->n_predict / n_ctx 兜底。
+    // > 0       = stream_decode 把它映射成 max_tgt_len，循环到该值时强制结束，
+    //             与 Python ``GenerationConfig.max_new_tokens`` 对齐。
+    // 通过 /v1/stream/decode 请求体 ``max_new_tokens`` 字段每轮动态注入；
+    // 离开 chat / half-duplex 路径时由调用方负责重置为 -1。
+    // 不影响 duplex 路径（duplex 用 max_new_speak_tokens_per_chunk 控 chunk 大小）。
+    int chat_max_new_tokens = -1;
     
     // listen_prob_scale: 调整 <|listen|> token 的采样概率
     // 1.0: Python 默认

@@ -167,13 +167,15 @@ def _sampling_from_duplex_config(cfg: Any) -> Dict[str, Any]:
 
 
 def _sampling_from_generation(gen: Any) -> Dict[str, Any]:
-    """从 GenerationConfig（chat / half-duplex 用）抽出 C++ 能用的字段。
+    """从 GenerationConfig（chat / half-duplex 用）抽出 C++ session-config 能吃的字段。
 
-    GenerationConfig 当前没有 listen_*/force_listen 等双工字段，所以这里只能
-    透传 max_new_tokens（映射到 max_new_speak_tokens_per_chunk）和 tts_temperature
-    （如果上层加了的话）。chat / half-duplex 的 max_new_tokens 语义是"单轮上限"，
-    与 max_new_speak_tokens_per_chunk 在非双工模式下的"无限制"不同——故暂不映射，
-    避免改变现有行为。等 C++ 加 chat_max_new_tokens 后再启用。
+    注意 max_new_tokens **不**进 update_session_config 的 sampling，而是在每轮
+    /v1/stream/decode 请求体上单独透传到 ctx_omni->chat_max_new_tokens
+    （见 ``chat()`` 里组装 decode_body 的位置 + omni.h ``chat_max_new_tokens``
+    注释）。原因是单轮上限是"按请求"语义、不是"按 session"语义，且 duplex 路径
+    要走 max_new_speak_tokens_per_chunk，强行映射到 sampling 会污染 session。
+
+    这里仅承担 session 级 sticky 字段（目前是 tts_temperature）。
     """
     if gen is None:
         return {}
@@ -944,6 +946,22 @@ class CppBackendWorker:
             "round_idx": self._round_number,
             "length_penalty": length_penalty,
         }
+        # [chat budget] 单工 chat 路径把 GenerationConfig.max_new_tokens 透传到
+        # C++ 端 ``ctx_omni->chat_max_new_tokens``，由 stream_decode 内部当硬
+        # 上限（见 omni.cpp ~10570 / omni.h 注释）。修复了 chat 路径下
+        # max_new_tokens 被 _sampling_from_generation 注释忽略、模型靠自己 EOS
+        # 容易在 use_tts=true attractor 里跑成百秒的问题（见 commit message）。
+        max_new = None
+        if generation is not None:
+            max_new = getattr(generation, "max_new_tokens", None)
+            if max_new is None and isinstance(generation, dict):
+                max_new = generation.get("max_new_tokens")
+        try:
+            max_new_int = int(max_new) if max_new is not None else 0
+        except (TypeError, ValueError):
+            max_new_int = 0
+        if max_new_int > 0:
+            decode_body["max_new_tokens"] = max_new_int
         if logits_spec.enabled:
             decode_body["logit_format"] = logits_spec.format
             if logits_spec.format == "file":
@@ -1077,13 +1095,21 @@ class CppBackendWorker:
         """Chat 非流式生成"""
         cur_round = self._round_number
         length_penalty = float(kwargs.get("length_penalty", 1.1) or 1.1)
+        # [chat budget] half-duplex / chat_prefill 复用此入口，把 max_new_tokens 透传到 C++。
+        decode_body: Dict[str, Any] = {
+            "stream": True,
+            "round_idx": cur_round,
+            "length_penalty": length_penalty,
+        }
+        try:
+            max_new_int = int(kwargs.get("max_new_tokens") or 0)
+        except (TypeError, ValueError):
+            max_new_int = 0
+        if max_new_int > 0:
+            decode_body["max_new_tokens"] = max_new_int
         resp = self._http_client.post(
             f"{self._cpp_server_url}/v1/stream/decode",
-            json={
-                "stream": True,
-                "round_idx": cur_round,
-                "length_penalty": length_penalty,
-            },
+            json=decode_body,
             timeout=600.0,
         )
         self._round_number += 1

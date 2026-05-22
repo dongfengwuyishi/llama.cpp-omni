@@ -10567,9 +10567,20 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     }
     LOG_INF("<user>%s\n", ctx_omni->params->prompt.c_str());
     LOG_INF("<assistant>");
-    const int max_tgt_len = ctx_omni->params->n_predict < 0 ? ctx_omni->params->n_ctx : ctx_omni->params->n_predict;
-    print_with_timestamp("LLM decode: max_tgt_len = %d, n_predict = %d, n_ctx = %d\n", 
-                         max_tgt_len, ctx_omni->params->n_predict, ctx_omni->params->n_ctx);
+    int max_tgt_len = ctx_omni->params->n_predict < 0 ? ctx_omni->params->n_ctx : ctx_omni->params->n_predict;
+    // [chat budget] 单工 chat / half-duplex：当 /v1/stream/decode 带了
+    // max_new_tokens（写入 ctx_omni->chat_max_new_tokens）时优先用它当硬
+    // 上限；duplex_mode 下这条不生效，因为 duplex 走 chunk-level
+    // max_new_speak_tokens_per_chunk 控制大小，每次 stream_decode 只产
+    // 一个 chunk，不需要再叠一层 budget。修复了 chat 路径下 max_new_tokens
+    // 被 _sampling_from_generation 注释掉、模型靠自己 EOS 容易在
+    // use_tts=true attractor 里跑成百秒的问题。
+    if (!ctx_omni->duplex_mode && ctx_omni->chat_max_new_tokens > 0) {
+        max_tgt_len = ctx_omni->chat_max_new_tokens;
+    }
+    print_with_timestamp("LLM decode: max_tgt_len = %d, n_predict = %d, n_ctx = %d, chat_max_new_tokens = %d\n",
+                         max_tgt_len, ctx_omni->params->n_predict, ctx_omni->params->n_ctx,
+                         ctx_omni->chat_max_new_tokens);
     // LLM chunk size: 每chunk推送给TTS的LLM tokens数量
     // 原始Python: generate_chunk_size=10
     // 注意：step_size影响TTS条件长度，可能影响音质

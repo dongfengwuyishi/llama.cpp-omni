@@ -5712,6 +5712,26 @@ int main(int argc, char ** argv) {
             SRV_INF("%s: length_penalty set to %.3f\n", __func__, lp);
         }
 
+        // [chat budget] 单工 chat / half-duplex：把请求体里的
+        // max_new_tokens 透传到 ctx_omni->chat_max_new_tokens。
+        // - 缺省或 <= 0：写 -1，stream_decode 走 n_predict / n_ctx 兜底（即旧行为）
+        // - > 0          ：stream_decode 把它当硬上限，循环到值时强制结束
+        // duplex_mode 下 stream_decode 内部会忽略此字段（duplex 用 chunk-level 限制）。
+        {
+            int chat_budget = -1;
+            if (data.contains("max_new_tokens") && data.at("max_new_tokens").is_number_integer()) {
+                int v = data.at("max_new_tokens").get<int>();
+                if (v > 0) chat_budget = v;
+            }
+            std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
+            if (ctx_server.octx != nullptr) {
+                ctx_server.octx->chat_max_new_tokens = chat_budget;
+            }
+            if (chat_budget > 0) {
+                SRV_INF("%s: chat_max_new_tokens set to %d\n", __func__, chat_budget);
+            }
+        }
+
         // 🔧 [Logit Capture] 从请求体读取本次 decode 输出 logit 的方式：
         //   - "inline" (default): SSE event 携带 base64 token_ids + bf16 logits
         //   - "file":              落盘 safetensors，event 仅返回路径 + sha256
