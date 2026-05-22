@@ -700,6 +700,7 @@ async def lifespan(app: FastAPI):
             ctx_size=config.get("ctx_size", 32768),
             n_gpu_layers=config.get("n_gpu_layers", 99),
             use_tts=config.get("use_tts", True),
+            worker_idx=config.get("worker_idx", 0),
         )
     else:
         worker = MiniCPMOWorker(
@@ -2731,8 +2732,16 @@ def _build_consolidated_logits_payload(
     vocab_size: int,
     spec: Any,
     request_id: Optional[str],
+    worker_idx: int = 0,
 ):
-    """Stitch per-chunk inline logits into a single LogitsPayload."""
+    """Stitch per-chunk inline logits into a single LogitsPayload.
+
+    ``worker_idx`` is the 0-based pool index of this worker process; it goes
+    into the ``.safetensors`` filename via
+    ``logits_retention.make_logits_filename`` to guarantee no two workers
+    sharing one date-bucket dir clobber each other's outputs. Default 0 keeps
+    single-worker dev / unit tests working.
+    """
     from core.schemas.logits import LogitsPayload
 
     n_tokens = len(token_ids)
@@ -2753,9 +2762,18 @@ def _build_consolidated_logits_payload(
         # janitor (``core.processors.logits_retention.start_cleanup_thread``)
         # able to reap stale days cheaply. Honors ``OMNI_LOGITS_OUTPUT_DIR``
         # env when ``spec.output_dir`` is empty. Idempotent on re-runs.
-        from core.processors.logits_retention import resolve_output_dir
+        #
+        # [duplex 命名 - 多 worker 防撞] 统一走
+        # ``make_logits_filename("duplex", worker_idx, request_id)``：和 chat
+        # 路径用同一套 ``{kind}_w{idx}_p{pid}_{seq}[_{rid}]`` 模板，确保多
+        # worker 共享日期 bucket dir 时不会互相覆盖。``request_id`` 仍然写进
+        # ``__metadata__`` 作为权威标识，文件名里的副本只是 debug 友好。
+        from core.processors.logits_retention import (
+            make_logits_filename,
+            resolve_output_dir,
+        )
         out_dir = resolve_output_dir(spec.output_dir)
-        fname = f"duplex_{request_id or uuid.uuid4().hex[:12]}.safetensors"
+        fname = make_logits_filename("duplex", worker_idx, request_id)
         path = os.path.join(out_dir, fname)
         extra = {
             "n_prefill_tokens": str(n_prefill),
@@ -3177,6 +3195,7 @@ async def duplex_offline(request_body: Dict[str, Any]):
                     vocab_size=logits_vocab_size,
                     spec=req.logits,
                     request_id=req.request_id,
+                    worker_idx=int(WORKER_CONFIG.get("worker_idx", 0)),
                 )
             except Exception as e:
                 logger.error(f"[duplex_offline] logits consolidation failed: {e}", exc_info=True)
@@ -3288,6 +3307,10 @@ def main():
             "ctx_size": cpp_cfg.ctx_size,
             "n_gpu_layers": cpp_cfg.n_gpu_layers,
             "use_tts": effective_use_tts,
+            # 0-based pool index — 透传给 CppBackendWorker，用作 logits .safetensors
+            # 文件名里的 ``w{idx}`` 段防多 worker 写盘撞名（见
+            # ``logits_retention.make_logits_filename``）。
+            "worker_idx": int(args.worker_index),
         })
         logger.info(
             f"Starting Worker (C++ backend) on port {port}, GPU {gpu_id}, "

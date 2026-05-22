@@ -556,13 +556,38 @@ The C++ worker is then booted with `use_tts=False`:
 >
 > server 把 `output_dir`（或环境变量 `OMNI_LOGITS_OUTPUT_DIR`，默认
 > `/tmp/minicpm_logits`）当**基目录**，自动在它下面追加一层 UTC 日期子目录
-> `YYYY-MM-DD/`，最终落盘路径示例：
+> `YYYY-MM-DD/`，叶子文件名走如下统一模板（chat / duplex 共用）：
 >
 > ```
-> /data/logits/2026-05-21/chat_round0.safetensors
-> /data/logits/2026-05-21/duplex_<request_id>.safetensors
+> {kind}_w{worker_idx}_p{pid_hex5}_{seq:08d}[_{client_request_id}].safetensors
+> ```
+>
+> 字段语义：
+>
+> - `kind` ∈ `{chat, duplex}` —— 请求类型，事后批量 `grep` 友好
+> - `w{worker_idx}` —— worker 进程在 batch_server pool 里的 0-based 索引
+>   （由 `worker.py --worker-index` 注入），跨 worker 进程必然唯一
+> - `p{pid_hex5}` —— worker 进程 PID 的低 20 bits（5 位 hex）。仅用于防
+>   "同一 worker_idx + 同一日期 bucket + worker 重启 + seq 复用" 的极端撞名
+> - `seq:08d` —— 进程内 atomic 单调计数器，从 0 开始
+> - `_{client_request_id}` —— 可选 debug 后缀。client 给的 `request_id` 经
+>   `[A-Za-z0-9_]+` sanitize、截断到 32 字符。**不参与唯一性**，client 给重了
+>   也不会撞文件（前面的 `(worker_idx, pid, seq)` 三元组已经唯一）
+>
+> 最终落盘路径示例：
+>
+> ```
+> /data/logits/2026-05-21/chat_w0_p1f4a_00000123.safetensors
+> /data/logits/2026-05-21/chat_w0_p1f4a_00000124_e2e_001.safetensors
+> /data/logits/2026-05-21/duplex_w2_p3b81_00000456_dup_42.safetensors
 > /data/logits/2026-05-22/...
 > ```
+>
+> 为什么这样命名 —— 修复一个并发缺陷：早期版本 chat 路径硬编码
+> `chat_round{N}.safetensors`，且 `chat()` 入口处把内部 round 计数重置为 0，
+> 导致**所有** chat 请求都写到同一个 `chat_round0.safetensors`，单 worker
+> 内自相覆盖、跨 worker 共享日期 bucket 又互相覆盖。在 4 worker × 30 并发的
+> 压测里 100+ 个 logits_file 调用全部 success，盘上只剩 1 个文件。
 >
 > Worker 进程内置一个 daemon janitor，按下面的环境变量做老化清理（默认开启）：
 >
@@ -573,9 +598,10 @@ The C++ worker is then booted with `use_tts=False`:
 > | `OMNI_LOGITS_MAX_TOTAL_BYTES`   | `0`   | 超过则按"最旧日期目录优先"逐日驱逐；`0` 关闭。永不删当天 |
 > | `OMNI_LOGITS_CLEANUP_INTERVAL_S`| `600` | 扫描间隔秒，最小 60 |
 >
-> 多 worker 共享同一个基目录是安全的（`unlink/rmtree` 幂等）。这是 server-side
-> 行为，client 不需要改 schema —— 老的 `output_dir=/data/logits` 调用方拿到的
-> `logits.file` 字段就会变成 `/data/logits/2026-05-21/chat_round0.safetensors`。
+> 多 worker 共享同一个基目录是安全的（`unlink/rmtree` 幂等，且文件名按上面
+> 模板互斥）。这是 server-side 行为，client 不需要改 schema —— 老的
+> `output_dir=/data/logits` 调用方拿到的 `logits.file` 字段就会变成
+> `/data/logits/2026-05-21/chat_w<idx>_p<pid>_<seq>.safetensors`。
 
 ### 8.2 响应字段
 
@@ -589,7 +615,7 @@ The C++ worker is then booted with `use_tts=False`:
   "n_prefill_tokens":  217,
   "vocab_size":        151748,
   "dtype":             "bf16",
-  "file":              "/data/logits/chat_round0.safetensors",  // file 模式
+  "file":              "/data/logits/2026-05-21/chat_w0_p1f4a_00000123.safetensors",  // file 模式
   // inline 模式：
   "token_ids_b64":     "<base64 int32 bytes>",
   "logits_b64":        "<base64 bf16 bytes>",
@@ -635,7 +661,7 @@ The C++ worker is then booted with `use_tts=False`:
 import struct, json
 import numpy as np
 
-with open("chat_round0.safetensors", "rb") as f:
+with open("chat_w0_p1f4a_00000123.safetensors", "rb") as f:
     header_size = struct.unpack("<Q", f.read(8))[0]
     header = json.loads(f.read(header_size))
     body_off = 8 + header_size

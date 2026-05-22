@@ -48,6 +48,7 @@ helper :func:`resolve_output_dir` so chat (cpp_backend) and duplex
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import re
@@ -106,6 +107,99 @@ def base_dir_from_spec(spec_output_dir: Optional[str]) -> str:
     if env_dir:
         return env_dir
     return _DEFAULT_BASE_DIR
+
+
+# ---------------------------------------------------------------------------
+# Filename builder
+# ---------------------------------------------------------------------------
+#
+# 多 worker 部署下 ``.safetensors`` 落盘文件名必须满足：
+#
+# 1. 跨 worker 进程并发不撞 → ``w{worker_idx}`` 段
+# 2. 同 worker 进程内串行不撞 → 进程内 atomic 单调计数器 ``seq``
+# 3. worker 重启 + 同日复用 seq 不撞 → ``p{pid_hex5}`` 段（PID 末 5 位 hex；
+#    同日内同 worker 进程**重启后** PID 复用且 seq 撞概率 ~1/2^20）
+# 4. 调试可读 → 留可选 ``client_request_id`` 后缀（sanitize 后）
+#
+# 命名格式（chat / duplex 共用）：
+#
+#     {kind}_w{worker_idx}_p{pid_hex5}_{seq:08d}[_{sanitized_rid}].safetensors
+#
+# 例：
+#     chat_w0_p1f4a_00000123.safetensors                # 无 client rid
+#     chat_w0_p1f4a_00000124_e2e_001.safetensors        # 有 client rid
+#     duplex_w2_p3b81_00000456_dup_42.safetensors
+#
+# 历史问题（修复前）：chat 路径硬编码 ``chat_round{N}.safetensors``，且 ``chat()``
+# 入口处 ``self._round_number = 0``，所有 chat 请求都写到 ``chat_round0`` →
+# 单 worker 自相覆盖 + 跨 worker 跨日期 bucket 共享更是互相覆盖。压测里 103 个
+# logits_file 调用全部 success，但盘上只剩 1 个文件。
+
+# Atomic 进程内自增计数器 —— ``itertools.count`` 的 ``__next__`` 在 CPython
+# 上是 GIL-protected atomic（C 实现），多线程并发 ``next()`` 不会撞值。
+# 起点 0 是有意的，方便和 hex/八进制等其他 fmt 看起来的"第几个" 1:1 对齐。
+_filename_seq = itertools.count(0)
+
+
+# 允许进文件名的 client request_id 字符（unicode 全部剔除，避免文件系统/工具
+# 链的 NFD/NFC 差异、re-encoding 引起的 mismatch）。``-`` 和 ``.`` 故意排除：
+# 前者会和我们自己的分隔符 ``_`` 混淆，后者会让某些工具误判扩展名。
+_RID_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_]+")
+_RID_MAX_LEN = 32
+
+
+def _sanitize_request_id(rid: Optional[str]) -> str:
+    """Best-effort 把 client 给的 request_id 清成文件系统友好的 ASCII 串。
+
+    返回空串表示"原 rid 全是非法字符 / None / 空"，调用方按"省略后缀"处理。
+    截断到 32 字符避免 ext4 的 255-byte 路径段上限被撑爆（前缀本身已经
+    占了 ``chat_w999_p12345_00000000_`` ~ 28 字符，留余量给客户。）
+    """
+    if not rid:
+        return ""
+    cleaned = _RID_SANITIZE_RE.sub("_", str(rid)).strip("_")
+    if not cleaned:
+        return ""
+    if len(cleaned) > _RID_MAX_LEN:
+        cleaned = cleaned[:_RID_MAX_LEN]
+    return cleaned
+
+
+def make_logits_filename(
+    kind: str,
+    worker_idx: int,
+    client_request_id: Optional[str] = None,
+    *,
+    _pid_override: Optional[int] = None,    # 仅供测试 inject
+    _seq_override: Optional[int] = None,    # 仅供测试 inject
+) -> str:
+    """构造一个**进程内 + 多 worker 全局**唯一的 ``.safetensors`` 文件名。
+
+    Args:
+        kind: ``"chat"`` 或 ``"duplex"``。事后用 ``ls *.safetensors | grep`` 也能
+              一眼分出请求类型。
+        worker_idx: worker 在 batch_server pool 里的 0-based 索引（worker.py
+                    的 ``args.worker_index``）。多 worker 进程**必传**，否则唯一性
+                    保障会缩水成"靠 PID 防撞"。
+        client_request_id: 可选；client 给的 request_id（debug 友好）。会被
+                           sanitize 成 ``[A-Za-z0-9_]+`` 并截断到 32 字符。
+                           ``None`` / 空 / 全是非法字符时省略此后缀。
+
+    Returns:
+        ``{kind}_w{worker_idx}_p{pid_hex5}_{seq:08d}[_{rid}].safetensors``。
+        **不**包含目录路径（调用方自己拼 ``resolve_output_dir`` 输出的 bucket
+        dir）。
+    """
+    if kind not in ("chat", "duplex"):
+        raise ValueError(f"kind must be 'chat' or 'duplex', got {kind!r}")
+    pid = _pid_override if _pid_override is not None else os.getpid()
+    seq = _seq_override if _seq_override is not None else next(_filename_seq)
+    pid_hex5 = f"{pid & 0xFFFFF:05x}"
+    base = f"{kind}_w{int(worker_idx)}_p{pid_hex5}_{seq:08d}"
+    rid = _sanitize_request_id(client_request_id)
+    if rid:
+        return f"{base}_{rid}.safetensors"
+    return f"{base}.safetensors"
 
 
 def resolve_output_dir(spec_output_dir: Optional[str]) -> str:

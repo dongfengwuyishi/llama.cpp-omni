@@ -213,6 +213,27 @@ class ChatRequest(BaseModel):
         ),
     )
 
+    # ---- Tracing / RL rollout per-trajectory id ----
+    #
+    # Optional client-side identifier echoed back in logs and used as a
+    # **debug-only** suffix on the ``logits.format='file'`` output filename
+    # (e.g. ``chat_w0_p1f4a_00000123_<request_id>.safetensors``). Never used
+    # for routing or correctness — uniqueness of the output filename is
+    # guaranteed by ``(worker_idx, pid, atomic_seq)`` in
+    # ``logits_retention.make_logits_filename``, so even if two clients send
+    # the same ``request_id`` concurrently their logits files won't collide.
+    #
+    # Aligned with ``DuplexBatchRequest.request_id`` so RL rollout pipelines
+    # can correlate chat and duplex trajectories by a single id field.
+    request_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional client trajectory id, echoed in logs and used as a "
+            "debug suffix on logits .safetensors filenames. Not used for "
+            "routing; unique-naming is enforced by the server."
+        ),
+    )
+
 
 # =============================================================================
 # Chat 响应
@@ -331,4 +352,11 @@ class ChatResponse(BaseModel):
             "Captured logits payload. None if not requested or capture failed. "
             "See core/schemas/logits.py:LogitsPayload."
         ),
+    )
+
+    # Echo client trajectory id back so async RL pipelines can match
+    # ``ChatResponse`` ↔ ``ChatRequest`` without keeping a side table.
+    request_id: Optional[str] = Field(
+        default=None,
+        description="echo 自请求的 request_id（client 未传则为 null）",
     )

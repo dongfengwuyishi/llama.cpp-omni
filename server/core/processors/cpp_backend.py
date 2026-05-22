@@ -268,6 +268,7 @@ class CppBackendWorker:
         ctx_size: int = 32768,
         n_gpu_layers: int = 99,
         use_tts: bool = True,
+        worker_idx: int = 0,
         **kwargs,
     ):
         self.llamacpp_root = llamacpp_root
@@ -283,6 +284,15 @@ class CppBackendWorker:
         # threads. Used for RL-training rollouts that only care about the
         # LLM token stream + logits (no audio synthesis).
         self.use_tts = bool(use_tts)
+        # 0-based index of this worker in the batch_server pool, injected by
+        # ``worker.py``'s ``args.worker_index``. **Only** used to mint
+        # collision-free logits filenames in ``make_logits_filename`` —
+        # multiple workers under the same gateway share one date-bucket dir,
+        # so without an idx in the filename two workers would race on the
+        # same name and overwrite each other's ``.safetensors``. Kept as a
+        # plain int (not parsed from gpu_id) because ``CUDA_VISIBLE_DEVICES``
+        # remaps gpu_id to local 0 on every worker.
+        self.worker_idx = int(worker_idx)
 
         from worker import WorkerState, WorkerStatus
         self.state = WorkerState()
@@ -1030,21 +1040,41 @@ class CppBackendWorker:
             decode_body["logit_format"] = logits_spec.format
             if logits_spec.format == "file":
                 # [P3 retention] Route the C++ writer through a date-bucketed
-                # subdirectory: ``<base>/<YYYY-MM-DD>/chat_round<N>.safetensors``.
+                # subdirectory: ``<base>/<YYYY-MM-DD>/<filename>``.
                 # ``logits_retention.resolve_output_dir`` is idempotent and
                 # honors ``$OMNI_LOGITS_OUTPUT_DIR`` when the request didn't
                 # pin one. The retention daemon (see ``worker.py`` lifespan
                 # → ``start_cleanup_thread``) then reaps stale ``YYYY-MM-DD``
                 # subdirs by ``OMNI_LOGITS_RETENTION_DAYS`` /
                 # ``OMNI_LOGITS_MAX_TOTAL_BYTES``.
-                from .logits_retention import resolve_output_dir
+                from .logits_retention import resolve_output_dir, make_logits_filename
                 bucket_dir = resolve_output_dir(logits_spec.output_dir)
                 decode_body["logit_output_dir"] = (
                     bucket_dir if bucket_dir.endswith(os.sep) else bucket_dir + os.sep
                 )
-                # Default filename: <round>.safetensors. Worker layer can
-                # override by patching ``logits_spec`` before calling chat().
-                fname = getattr(request, "_logit_filename", None) or f"chat_round{self._round_number}.safetensors"
+                # [chat 命名 - 多 worker 防撞] 历史上这里硬编码
+                # ``chat_round{self._round_number}.safetensors``，且 chat() 入口
+                # 处把 ``self._round_number = 0``，导致**所有** chat 请求都写
+                # 到 ``chat_round0.safetensors``：单 worker 自相覆盖、跨 worker
+                # 共享日期 bucket 又互相覆盖（压测里 103 个 logits_file 调用
+                # 全部 success，盘上只剩 1 个文件）。
+                #
+                # 现在统一走 ``make_logits_filename(kind, worker_idx, request_id)``：
+                #   1. ``worker_idx`` 跨 worker 进程唯一（worker.py 的 args.worker_index）
+                #   2. ``pid_hex5`` 防 worker 重启 + 同日复用 seq 撞名
+                #   3. ``seq:08d`` 进程内 atomic counter 串行不撞
+                #   4. ``request_id`` 作为可选 debug 后缀，方便 grep
+                # 唯一性由 (worker_idx, pid, seq) 三元组保证，request_id 不参
+                # 与唯一性，client 给重了也无所谓。
+                #
+                # 测试 hook：``request._logit_filename`` 仍然支持手工 override
+                # （e2e 用例固定文件名好做断言用）。
+                from .logits_retention import make_logits_filename as _mklog_fn
+                override = getattr(request, "_logit_filename", None)
+                fname = override or _mklog_fn(
+                    "chat", self.worker_idx,
+                    getattr(request, "request_id", None),
+                )
                 decode_body["logit_filename"] = fname
                 extra = getattr(request, "_logit_extra_metadata", None)
                 if extra:
@@ -1080,6 +1110,7 @@ class CppBackendWorker:
             audio_sample_rate=_AUDIO_OUTPUT_SR if wav_b64 else None,
             success=True,
             logits=logits_payload,
+            request_id=getattr(request, "request_id", None),
         )
 
     def chat_prefill(self, session_id, msgs, omni_mode=False, max_slice_nums=None,
