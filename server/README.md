@@ -1,8 +1,7 @@
 # MiniCPM-o Batch Inference Server
 
 非流式批量推理服务，专为离线评测、刷数据等场景设计。
-基于 `llama.cpp-omni` C++ 引擎（默认）或 PyTorch（可选），
-对外提供 OpenAI 风格的 HTTP 接口：
+基于 `llama.cpp-omni` C++ 引擎（GGUF），对外提供 OpenAI 风格的 HTTP 接口：
 
 | 接口 | 类型 | 输入 | 输出 |
 |---|---|---|---|
@@ -142,7 +141,7 @@ python scripts/eval_runner.py \
 
 ## 配置要点
 
-- **后端选择**：`backend = "cpp"`（默认，吃 GGUF）或 `"pytorch"`（吃 HF 目录）
+- **后端**：固定 `backend = "cpp"`（吃 GGUF，通过 HTTP 调用 `llama-server`）
 - **多 GPU**：`CUDA_VISIBLE_DEVICES` 决定起几个 worker，每个 worker 占一张卡
 - **队列**：`service.max_queue_size` 默认 1000，按 FIFO 调度
 - **超时**：单条 `duplex_offline` 默认 600s（视频/音频可能很长），可在 config 里改
