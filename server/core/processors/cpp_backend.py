@@ -1147,7 +1147,28 @@ class CppBackendWorker:
             raise RuntimeError(f"LLM model not found: {model_path}")
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        # [GPU pinning] Only set CUDA_VISIBLE_DEVICES on the child if the parent
+        # process didn't already restrict device visibility. ``self.gpu_id`` has
+        # ambiguous semantics (start_all.sh passes the physical card id, while
+        # worker.py defaults it to ``args.worker_index``), so blindly writing
+        # ``CUDA_VISIBLE_DEVICES = str(self.gpu_id)`` over a parent that already
+        # set ``CUDA_VISIBLE_DEVICES=1`` would re-pin the child to physical
+        # GPU 0 (the index "1" doesn't exist inside the parent's narrowed
+        # window) and silently OOM-stall during model load. This bug bit the
+        # e2e fixture before commit 98bfb29; here we make cpp_backend itself
+        # immune to the trap so any caller (fixture, custom launcher, etc.)
+        # that already set CUDA_VISIBLE_DEVICES gets honored.
+        if not env.get("CUDA_VISIBLE_DEVICES"):
+            env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+            logger.info(
+                f"[GPU {self.gpu_id}] parent CUDA_VISIBLE_DEVICES unset; "
+                f"pinning C++ child to physical GPU {self.gpu_id}"
+            )
+        else:
+            logger.info(
+                f"[GPU {self.gpu_id}] parent CUDA_VISIBLE_DEVICES="
+                f"{env['CUDA_VISIBLE_DEVICES']!r}; inheriting (not overriding)"
+            )
 
         cmd = [
             server_bin,

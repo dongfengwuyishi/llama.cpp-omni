@@ -70,12 +70,11 @@ def real_stack(tmp_path_factory):
     """
     env = _require_env("LLAMA_CPP_OMNI_ROOT", "MODEL_DIR")
     cuda = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-    # cpp_backend re-exports CUDA_VISIBLE_DEVICES to ``str(self.gpu_id)`` when
-    # spawning ``llama-server``. If we leave ``--gpu-id 0`` while the parent
-    # has e.g. CUDA_VISIBLE_DEVICES=1, llama-server gets pinned to physical
-    # GPU 0 (often the busy one) and silently OOM-stalls during model load.
-    # Mirror ``start_all.sh``: pass the *physical* device id to ``--gpu-id``
-    # so the override is a no-op.
+    # Belt-and-suspenders: pass the physical device id (first element of
+    # CUDA_VISIBLE_DEVICES) to ``--gpu-id`` so it matches the parent's
+    # narrowed window. cpp_backend now also refuses to overwrite a
+    # parent-set CUDA_VISIBLE_DEVICES (see ``_start_cpp_server``), so this
+    # mostly serves to keep the WorkerHealthResponse.gpu_id label readable.
     primary_gpu = cuda.split(",")[0].strip() or "0"
 
     worker_port = _pick_free_port()
