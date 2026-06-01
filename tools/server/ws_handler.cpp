@@ -229,6 +229,26 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     LOG_INF("WS /backend: session %s activated, mode=%s\n", session_id.c_str(), parsed_init.mode.c_str());
 
     // ================================================================
+    // Setup audio output callback — sends audio_delta events via WS
+    // ================================================================
+    struct AudioCbState {
+        std::string session_id;
+        std::string response_id; // updated per-turn
+        httplib::ws::WebSocket * ws = nullptr;
+    };
+    auto audio_state = std::make_shared<AudioCbState>();
+    audio_state->session_id = session_id;
+    audio_state->ws = &ws;
+
+    octx->audio_output_cb = [audio_state](const float * samples, int n_samples, int /*sample_rate*/, bool /*is_final*/) {
+        if (audio_state->ws && audio_state->ws->is_open()) {
+            std::string b64 = float32_pcm_to_b64(samples, n_samples);
+            json ev = make_audio_delta(audio_state->session_id, audio_state->response_id, b64);
+            audio_state->ws->send(ev.dump());
+        }
+    };
+
+    // ================================================================
     // Step 3: Read loop — process input.append messages
     // ================================================================
     std::string raw;
@@ -269,43 +289,161 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             return;
         }
 
-        // ================================================================
-        // Full-duplex input processing
-        // ================================================================
-        TempMediaFiles tmp_files;
-
-        // Write audio to temp WAV
-        if (!parsed_input.audio_b64.empty()) {
-            tmp_files.audio_path = TempMediaFiles::write_audio_wav(
-                parsed_input.audio_b64, temp_dir, msg_counter++);
-        }
-
-        // Write first video frame to temp image
-        if (!parsed_input.video_frames_b64.empty()) {
-            tmp_files.image_path = TempMediaFiles::write_image_jpeg(
-                parsed_input.video_frames_b64[0], temp_dir, msg_counter++);
-        }
-
-        // Prefill
-        {
-            std::lock_guard<std::mutex> lock(octx_mutex);
-            if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
-                                msg_counter, parsed_input.max_slice_nums)) {
-                tmp_files.cleanup();
-                fail_fast(session_id, "prefill_failed");
-                return;
-            }
-        }
-
-        tmp_files.cleanup();
-
-        // Generate response_id
         response_seq++;
         std::string response_id = session_id + "_resp_" + std::to_string(response_seq);
+        audio_state->response_id = response_id; // update for audio callback
 
-        // Decode: start background thread, poll text_queue on this thread
-        std::string debug_dir = session_output_dir;
-        {
+        // Branch: full_duplex vs turn_based
+        if (parsed_init.mode == "turn_based" && !parsed_input.messages.is_null()) {
+            // ================================================================
+            // Turn-based input processing
+            // ================================================================
+            auto parsed_msgs = parse_messages_array(parsed_input.messages);
+            if (parsed_msgs.empty()) {
+                fail_fast(session_id, "empty_messages");
+                return;
+            }
+
+            TempMediaFiles tmp_files;
+
+            // Images: take all images from the last user message
+            const ParsedMessage * last_user_msg = nullptr;
+            for (auto it = parsed_msgs.rbegin(); it != parsed_msgs.rend(); ++it) {
+                if (it->role == "user") {
+                    last_user_msg = &(*it);
+                    break;
+                }
+            }
+
+            if (last_user_msg) {
+                for (const auto & img_b64 : last_user_msg->image_b64s) {
+                    std::string ipath = TempMediaFiles::write_image_jpeg(img_b64, temp_dir, msg_counter++);
+                    if (!ipath.empty()) {
+                        tmp_files.image_path = ipath; // last image wins
+                    }
+                }
+                // Audio: use the first audio from the last user message
+                if (!last_user_msg->audio_b64s.empty()) {
+                    tmp_files.audio_path = TempMediaFiles::write_audio_wav(
+                        last_user_msg->audio_b64s[0], temp_dir, msg_counter++);
+                }
+            }
+
+            // Build prompt
+            std::string prompt = build_prompt_from_messages(parsed_msgs);
+
+            // Prefill with text + audio + image
+            {
+                std::lock_guard<std::mutex> lock(octx_mutex);
+                if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
+                                    msg_counter, parsed_input.max_slice_nums, prompt)) {
+                    tmp_files.cleanup();
+                    fail_fast(session_id, "prefill_failed");
+                    return;
+                }
+            }
+
+            tmp_files.cleanup();
+            msg_counter++;
+
+            // Decode
+            bool streaming = parsed_input.streaming;
+            std::string full_text;
+            std::string full_audio_b64;
+            bool had_listen = false;
+
+            {
+                std::lock_guard<std::mutex> lk(octx->text_mtx);
+                octx->text_queue.clear();
+                octx->text_done_flag = false;
+                octx->text_streaming = true;
+            }
+
+            std::thread decode_thread([octx, debug_dir = session_output_dir]() {
+                stream_decode(octx, debug_dir, -1);
+            });
+
+            while (true) {
+                std::string frag;
+                {
+                    std::unique_lock<std::mutex> lk(octx->text_mtx);
+                    octx->text_cv.wait_for(lk, std::chrono::milliseconds(200), [&]{
+                        return !octx->text_queue.empty() || octx->text_done_flag;
+                    });
+
+                    if (!octx->text_queue.empty()) {
+                        frag = std::move(octx->text_queue.front());
+                        octx->text_queue.pop_front();
+                    }
+
+                    if (octx->text_done_flag && octx->text_queue.empty()) {
+                        break;
+                    }
+                }
+
+                if (!frag.empty()) {
+                    if (frag == "__IS_LISTEN__") {
+                        if (streaming) {
+                            send_event(make_listen_delta(session_id, response_id));
+                        }
+                        had_listen = true;
+                        break;
+                    } else if (frag == "__END_OF_TURN__") {
+                        // handled by response.done
+                    } else {
+                        full_text += frag;
+                        if (streaming) {
+                            send_event(make_text_delta(session_id, response_id, frag));
+                        }
+                    }
+                }
+
+                if (session_mgr.get(session_id) == nullptr) {
+                    if (decode_thread.joinable()) decode_thread.join();
+                    goto cleanup;
+                }
+            }
+
+            if (decode_thread.joinable()) decode_thread.join();
+
+            // Send response.done (streaming may have sent deltas already, but done is always sent)
+            send_event(make_response_done(session_id, response_id, full_text,
+                                          full_audio_b64, had_listen ? "listen" : "turn_end"));
+
+        } else {
+            // ================================================================
+            // Full-duplex input processing
+            // ================================================================
+            TempMediaFiles tmp_files;
+
+            // Write audio to temp WAV
+            if (!parsed_input.audio_b64.empty()) {
+                tmp_files.audio_path = TempMediaFiles::write_audio_wav(
+                    parsed_input.audio_b64, temp_dir, msg_counter++);
+            }
+
+            // Write first video frame to temp image
+            if (!parsed_input.video_frames_b64.empty()) {
+                tmp_files.image_path = TempMediaFiles::write_image_jpeg(
+                    parsed_input.video_frames_b64[0], temp_dir, msg_counter++);
+            }
+
+            // Prefill
+            {
+                std::lock_guard<std::mutex> lock(octx_mutex);
+                if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
+                                    msg_counter, parsed_input.max_slice_nums)) {
+                    tmp_files.cleanup();
+                    fail_fast(session_id, "prefill_failed");
+                    return;
+                }
+            }
+
+            tmp_files.cleanup();
+
+            // Decode: start background thread, poll text_queue on this thread
+            std::string debug_dir = session_output_dir;
+
             // Reset text streaming state
             {
                 std::lock_guard<std::mutex> lk(octx->text_mtx);
