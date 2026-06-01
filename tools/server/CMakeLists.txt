@@ -14,6 +14,8 @@ set(TARGET_SRCS
     session.cpp
     protocol.h
     protocol.cpp
+    ws_handler.h
+    ws_handler.cpp
 )
 set(PUBLIC_ASSETS
     index.html.gz

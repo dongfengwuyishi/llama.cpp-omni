@@ -10,6 +10,8 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "omni.h"
+#include "session.h"
+#include "ws_handler.h"
 
 // mime type for sending response
 #define MIMETYPE_JSON "application/json; charset=utf-8"
@@ -2337,6 +2339,8 @@ struct server_context {
     mtmd_context * mctx = nullptr;
     omni_context * octx = nullptr;
     std::mutex octx_mutex;
+
+    SessionManager session_mgr;
 
     const llama_vocab * vocab = nullptr;
     bool vocab_dft_compatible = true;
@@ -6357,6 +6361,44 @@ int main(int argc, char ** argv) {
     // Save & load slots
     svr->Get (params.api_prefix + "/slots",               handle_slots);
     svr->Post(params.api_prefix + "/slots/:id_slot",      handle_slots_action);
+
+    //
+    // Backend Protocol (WebSocket + HTTP unary)
+    //
+    svr->WebSocket(params.api_prefix + "/backend", [&](const httplib::Request &, httplib::ws::WebSocket & ws) {
+        handle_ws_backend(ws, ctx_server.session_mgr, params, ctx_server.model, ctx_server.ctx, ctx_server.octx_mutex);
+    });
+
+    svr->Post(params.api_prefix + "/sessions/:session_id/close", [&](const httplib::Request & req, httplib::Response & res) {
+        std::string session_id = req.path_params.at("session_id");
+        SRV_INF("Close session requested: %s\n", session_id.c_str());
+
+        auto * session = ctx_server.session_mgr.get(session_id);
+        if (!session || session->state != SessionState::ACTIVE) {
+            res_error(res, format_error_response("session not found", ERROR_TYPE_NOT_FOUND));
+            res.status = 404;
+            return;
+        }
+
+        // Signal break to stop any ongoing inference
+        if (session->octx) {
+            session->octx->break_event = true;
+            {
+                std::lock_guard<std::mutex> lk(session->octx->text_mtx);
+                session->octx->text_queue.clear();
+                session->octx->text_done_flag = true;
+            }
+            session->octx->text_cv.notify_all();
+        }
+
+        ctx_server.session_mgr.close(session_id);
+
+        json resp;
+        resp["ok"] = true;
+        resp["session_id"] = session_id;
+        resp["closed"] = true;
+        res_ok(res, resp);
+    });
 
     //
     // Start the server
