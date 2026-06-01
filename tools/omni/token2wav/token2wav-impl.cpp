@@ -995,8 +995,6 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
     }
     return x;
 }
-}  // namespace flow_matching
-}  // namespace omni
 fmCausalConv1d::fmCausalConv1d(int in_channels, int out_channels, int kernel_size) :
     in_channels_(in_channels),
     out_channels_(out_channels),
@@ -1088,10 +1086,6 @@ ggml_tensor * fmCausalConv1d::build_forward_chunk_graph(ggml_context * ctx,
     }
     return y;
 }
-}  // namespace flow_matching
-}  // namespace omni
-namespace omni {
-namespace flow_matching {
 fmCausalConvBlock::fmCausalConvBlock(int in_channels, int out_channels, int kernel_size) :
     in_channels_(in_channels),
     out_channels_(out_channels),

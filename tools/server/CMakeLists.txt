@@ -10,6 +10,10 @@ endif()
 set(TARGET_SRCS
     server.cpp
     utils.hpp
+    session.h
+    session.cpp
+    protocol.h
+    protocol.cpp
 )
 set(PUBLIC_ASSETS
     index.html.gz
