@@ -8687,6 +8687,29 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             double audio_duration = 0;
             
             if (process_python_t2w_tokens(ctx_omni, window, is_last_window, wav_path, inference_time_ms, audio_duration)) {
+                // Audio output callback (for WS protocol) — read the WAV and pass float32 samples
+                if (ctx_omni->audio_output_cb && audio_duration > 0) {
+                    // Read the WAV file back to get float32 samples
+                    FILE * fw = fopen(wav_path.c_str(), "rb");
+                    if (fw) {
+                        // Skip WAV header (44 bytes for standard PCM WAV)
+                        fseek(fw, 44, SEEK_SET);
+                        // Read int16 PCM data
+                        int n_samples = static_cast<int>(audio_duration * 24000); // Python T2W uses 24kHz
+                        std::vector<int16_t> pcm(n_samples);
+                        size_t n_read = fread(pcm.data(), sizeof(int16_t), n_samples, fw);
+                        fclose(fw);
+                        if (n_read > 0) {
+                            // Convert int16 → float32
+                            std::vector<float> float_samples(n_read);
+                            for (size_t i = 0; i < n_read; ++i) {
+                                float_samples[i] = static_cast<float>(pcm[i]) / 32768.0f;
+                            }
+                            ctx_omni->audio_output_cb(float_samples.data(), static_cast<int>(n_read), 24000, is_last_window);
+                        }
+                    }
+                }
+
                 if (audio_duration > 0) {
                     auto wav_complete_time = std::chrono::high_resolution_clock::now();
                     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -9008,6 +9031,12 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                 double t2w_ms = std::chrono::duration<double, std::milli>(t2w_end - t2w_start).count();
                 
                 if (!chunk_wav.empty()) {
+                    // Audio output callback (for WS protocol)
+                    if (ctx_omni->audio_output_cb) {
+                        ctx_omni->audio_output_cb(chunk_wav.data(), static_cast<int>(chunk_wav.size()),
+                                                  sample_rate, is_last_window);
+                    }
+
                     // Write WAV file
                     std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(ctx_omni->wav_turn_base + wav_idx) + ".wav";
                     

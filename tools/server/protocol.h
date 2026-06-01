@@ -103,6 +103,33 @@ struct ParsedInput {
     bool tts_enabled = false;
 };
 
+// ============================================================================
+// Structured message parsing (turn_based mode)
+// ============================================================================
+
+struct ParsedContentPart {
+    std::string type;       // "text", "image_url", "audio"
+    std::string text;       // for type=text
+    std::string b64;        // for type=image_url or audio (decoded bytes ready to use)
+    std::string mime;       // "image/jpeg", "audio/wav", etc.
+};
+
+struct ParsedMessage {
+    std::string role;                       // "user", "assistant", "system"
+    std::string text;                       // concatenated text content (for easy prompt building)
+    std::vector<std::string> image_b64s;    // all images in this message (already decoded)
+    std::vector<std::string> audio_b64s;    // all audio in this message (base64 float32 PCM)
+};
+
+// Parse a single message from json
+ParsedMessage parse_one_message(const json & msg);
+
+// Parse full messages array → vector of ParsedMessage
+std::vector<ParsedMessage> parse_messages_array(const json & messages);
+
+// Build conversation prompt from messages (omni-style: <user>...<AI>...<user>)
+std::string build_prompt_from_messages(const std::vector<ParsedMessage> & msgs);
+
 ParsedSessionInit parse_session_init(const json & msg);
 ParsedInput parse_input_append(const json & msg);
 

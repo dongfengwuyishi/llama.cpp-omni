@@ -285,6 +285,87 @@ ParsedInput parse_input_append(const json & msg) {
 }
 
 // ============================================================================
+// Structured message parsing (turn_based mode)
+// ============================================================================
+
+ParsedMessage parse_one_message(const json & msg) {
+    ParsedMessage out;
+
+    out.role = json_str(msg, "role", "user");
+
+    if (msg.contains("content")) {
+        const json & content = msg.at("content");
+
+        if (content.is_string()) {
+            out.text = content.get<std::string>();
+        } else if (content.is_array()) {
+            std::string text_buf;
+            for (const auto & part : content) {
+                if (!part.is_object()) continue;
+
+                std::string ptype = json_str(part, "type");
+
+                if (ptype == "text") {
+                    std::string t = json_str(part, "text");
+                    if (!t.empty()) {
+                        if (!text_buf.empty()) text_buf += "\n";
+                        text_buf += t;
+                    }
+                } else if (ptype == "image_url") {
+                    if (part.contains("image_url") && part.at("image_url").is_object()) {
+                        const json & iu = part.at("image_url");
+                        std::string url = json_str(iu, "url");
+                        if (!url.empty()) {
+                            auto comma = url.find(',');
+                            if (comma != std::string::npos) {
+                                std::string payload = url.substr(comma + 1);
+                                auto raw = b64_decode(payload);
+                                if (!raw.empty()) {
+                                    out.image_b64s.push_back(base64::encode(
+                                        reinterpret_cast<const char*>(raw.data()), raw.size()));
+                                }
+                            }
+                        }
+                    }
+                } else if (ptype == "audio") {
+                    std::string audio = json_str(part, "audio");
+                    if (!audio.empty()) {
+                        out.audio_b64s.push_back(audio);
+                    }
+                }
+            }
+            out.text = text_buf;
+        }
+    }
+
+    return out;
+}
+
+std::vector<ParsedMessage> parse_messages_array(const json & messages) {
+    std::vector<ParsedMessage> out;
+    if (!messages.is_array()) return out;
+    for (const auto & m : messages) {
+        out.push_back(parse_one_message(m));
+    }
+    return out;
+}
+
+std::string build_prompt_from_messages(const std::vector<ParsedMessage> & msgs) {
+    std::string prompt;
+    for (const auto & m : msgs) {
+        if (m.role == "system") {
+            prompt += m.text + "\n\n";
+        } else if (m.role == "user") {
+            prompt += "<|user|>\n" + m.text + "\n";
+        } else if (m.role == "assistant") {
+            prompt += "<|assistant|>\n" + m.text + "\n";
+        }
+    }
+    prompt += "<|assistant|>\n";
+    return prompt;
+}
+
+// ============================================================================
 // Helpers: base64 ↔ raw bytes
 // ============================================================================
 
