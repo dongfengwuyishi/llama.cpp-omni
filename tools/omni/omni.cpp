@@ -4407,6 +4407,68 @@ void omni_stop_threads(struct omni_context * ctx_omni) {
     print_with_timestamp("omni_stop_threads: stop signals sent\n");
 }
 
+// Reset a context between backend-protocol sessions: end any duplex session,
+// stop+join the LLM/TTS/token2wav worker threads and drain their queues, while
+// keeping the loaded model alive so the next session can reuse this context.
+void omni_prepare_for_reuse(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr) {
+        return;
+    }
+
+    if (ctx_omni->duplex_session) {
+        omni_duplex_session_end(ctx_omni);
+    }
+    duplex_stop_threads(ctx_omni);
+
+    llm_thread_running = false;
+    if (ctx_omni->llm_thread_info) {
+        ctx_omni->llm_thread_info->cv.notify_all();
+    }
+    if (ctx_omni->llm_thread.joinable()) {
+        ctx_omni->llm_thread.join();
+    }
+
+    tts_thread_running = false;
+    if (ctx_omni->tts_thread_info) {
+        ctx_omni->tts_thread_info->cv.notify_all();
+    }
+    if (ctx_omni->tts_thread.joinable()) {
+        ctx_omni->tts_thread.join();
+    }
+
+    t2w_thread_running = false;
+    if (ctx_omni->t2w_thread_info) {
+        ctx_omni->t2w_thread_info->cv.notify_all();
+    }
+    if (ctx_omni->t2w_thread.joinable()) {
+        ctx_omni->t2w_thread.join();
+    }
+
+    if (ctx_omni->llm_thread_info) {
+        std::lock_guard<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+        while (!ctx_omni->llm_thread_info->queue.empty()) {
+            delete ctx_omni->llm_thread_info->queue.front();
+            ctx_omni->llm_thread_info->queue.pop();
+        }
+    }
+    if (ctx_omni->tts_thread_info) {
+        std::lock_guard<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
+        while (!ctx_omni->tts_thread_info->queue.empty()) {
+            delete ctx_omni->tts_thread_info->queue.front();
+            ctx_omni->tts_thread_info->queue.pop();
+        }
+    }
+    if (ctx_omni->t2w_thread_info) {
+        std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+        while (!ctx_omni->t2w_thread_info->queue.empty()) {
+            delete ctx_omni->t2w_thread_info->queue.front();
+            ctx_omni->t2w_thread_info->queue.pop();
+        }
+    }
+
+    print_with_timestamp("omni_prepare_for_reuse: inference threads stopped and queues cleared\n");
+}
+
 void omni_free(struct omni_context * ctx_omni) {
 
     // 高层 duplex session 必须在底层 duplex pipeline 之前结束：
@@ -4527,8 +4589,8 @@ void omni_free(struct omni_context * ctx_omni) {
         }
     }
 
-    llama_backend_free();
-
+    // NOTE: do NOT call llama_backend_free() here — the backend/model is shared
+    // and owned by the server; freeing it would break the still-running process.
     delete ctx_omni;
 }
 
@@ -10083,34 +10145,44 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             // Step 3: 评估 suffix (assistant_prompt，包含 <|audio_end|><|im_end|>)
             eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
         } else {
-            // 🔧 [与 Python 对齐] 非双工模式也需要在 system prompt 中插入 ref_audio embedding
-            // Python: sys_msgs = {"role": "system", "content": [vc_prompt_prefix, ref_audio, vc_prompt_suffix]}
-            // 格式: <|im_start|>system\n{vc_prompt_prefix}\n<|audio_start|>[ref_audio_embed]<|audio_end|>{vc_prompt_suffix}<|im_end|>\n
-            
-            // 确定 ref_audio 路径：优先使用调用方传入的 aud_fname，其次配置路径，最后默认路径
-            std::string system_ref_audio = !aud_fname.empty()
-                ? aud_fname
-                : (!ctx_omni->ref_audio_path.empty()
-                    ? ctx_omni->ref_audio_path
-                    : "tools/omni/assets/default_ref_audio/default_ref_audio.wav");
-            print_with_timestamp("system prompt ref_audio: %s\n", system_ref_audio.c_str());
-            
-            // Step 1: 评估 prefix (voice_clone_prompt，包含 <|audio_start|>)
-            eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-            
-            // Step 2: 获取并 prefill 参考音频的 APM embedding
-            auto * ref_audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, system_ref_audio);
-            if (ref_audio_embeds != nullptr && ref_audio_embeds->n_pos > 0) {
-                print_with_timestamp("system prompt ref_audio embedding: n_pos=%d\n", ref_audio_embeds->n_pos);
-                prefill_with_emb(ctx_omni, ctx_omni->params, ref_audio_embeds->embed, ref_audio_embeds->n_pos, 
-                                ctx_omni->params->n_batch, &ctx_omni->n_past);
-                omni_embed_free(ref_audio_embeds);
+            const bool has_ref_audio_slot =
+                voice_clone_prompt.find("<|audio_start|>") != std::string::npos &&
+                assistant_prompt.find("<|audio_end|>") != std::string::npos;
+
+            if (!has_ref_audio_slot) {
+                // Python no-TTS chat template has a plain system message, with
+                // no ref-audio embedding in the prompt.
+                eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(),
+                            ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+                eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(),
+                            ctx_omni->params->n_batch, &ctx_omni->n_past, false);
             } else {
-                print_with_timestamp("WARNING: failed to load system prompt ref_audio: %s\n", system_ref_audio.c_str());
+                // 🔧 [与 Python 对齐] 非双工 TTS/voice-clone system prompt:
+                // <|im_start|>system\nprefix\n<|audio_start|>[ref_audio]<|audio_end|>suffix<|im_end|>\n
+                std::string system_ref_audio = !aud_fname.empty()
+                    ? aud_fname
+                    : (!ctx_omni->ref_audio_path.empty()
+                        ? ctx_omni->ref_audio_path
+                        : "tools/omni/assets/default_ref_audio/default_ref_audio.wav");
+                print_with_timestamp("system prompt ref_audio: %s\n", system_ref_audio.c_str());
+
+                eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(),
+                            ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+
+                auto * ref_audio_embeds = omni_audio_embed_make_with_filename(
+                    ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, system_ref_audio);
+                if (ref_audio_embeds != nullptr && ref_audio_embeds->n_pos > 0) {
+                    print_with_timestamp("system prompt ref_audio embedding: n_pos=%d\n", ref_audio_embeds->n_pos);
+                    prefill_with_emb(ctx_omni, ctx_omni->params, ref_audio_embeds->embed, ref_audio_embeds->n_pos,
+                                    ctx_omni->params->n_batch, &ctx_omni->n_past);
+                    omni_embed_free(ref_audio_embeds);
+                } else {
+                    print_with_timestamp("WARNING: failed to load system prompt ref_audio: %s\n", system_ref_audio.c_str());
+                }
+
+                eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(),
+                            ctx_omni->params->n_batch, &ctx_omni->n_past, false);
             }
-            
-            // Step 3: 评估 suffix (assistant_prompt，包含 <|audio_end|><|im_end|>)
-            eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
         }
         
         // 标记系统 prompt 已初始化
@@ -10489,9 +10561,10 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         }
         print_with_timestamp("📍 [单工TTS] assistant prompt 完成, n_past=%d\n", ctx_omni->n_past);
     } else {
-        // 🔧 [非双工纯 LLM 模式] 只使用标准的 assistant prompt（无 TTS 标记，无 think 标记）
-        // 格式: <|im_end|>\n<|im_start|>assistant\n
-        std::string prompt = "<|im_end|>\n<|im_start|>assistant\n";
+        // 🔧 [非双工纯 LLM 模式] 使用空 thinking block，避免 Qwen3/MiniCPM-o
+        // 在面向用户的回答里直接生成 <think>...</think>。
+        // 格式: <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+        std::string prompt = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
         {
             eval_string(ctx_omni, ctx_omni->params, prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
         }
@@ -10779,11 +10852,18 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 }
             }
             
-            // 🔧 [特殊处理] <|speak|> 是开始标记，直接移除它（不截断后面内容）
-            size_t speak_pos = response.find("<|speak|>");
-            while (speak_pos != std::string::npos) {
-                response.erase(speak_pos, std::string("<|speak|>").length());
-                speak_pos = response.find("<|speak|>");
+            // 🔧 [特殊处理] 开始/控制标记直接移除（不截断后面内容）
+            static const std::vector<std::string> inline_token_strings = {
+                "<|speak|>",
+                "<think>",
+                "</think>",
+            };
+            for (const auto & token : inline_token_strings) {
+                size_t pos = response.find(token);
+                while (pos != std::string::npos) {
+                    response.erase(pos, token.length());
+                    pos = response.find(token);
+                }
             }
         }
         fflush(stdout);

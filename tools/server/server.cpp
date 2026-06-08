@@ -2375,6 +2375,13 @@ struct server_context {
     oaicompat_parser_options  oai_parser_opt;
 
     ~server_context() {
+        // Backend-protocol sessions reuse a single server-owned omni_context;
+        // free it here on shutdown instead of per-session.
+        if (octx) {
+            omni_free(octx);
+            octx = nullptr;
+        }
+
         mtmd_free(mctx);
 
         // Clear any sampling context
@@ -6366,7 +6373,8 @@ int main(int argc, char ** argv) {
     // Backend Protocol (WebSocket + HTTP unary)
     //
     svr->WebSocket(params.api_prefix + "/backend", [&](const httplib::Request &, httplib::ws::WebSocket & ws) {
-        handle_ws_backend(ws, ctx_server.session_mgr, params, ctx_server.model, ctx_server.ctx, ctx_server.octx_mutex);
+        handle_ws_backend(ws, ctx_server.session_mgr, params, ctx_server.model, ctx_server.ctx,
+                          ctx_server.octx, ctx_server.octx_mutex);
     });
 
     svr->Post(params.api_prefix + "/sessions/:session_id/close", [&](const httplib::Request & req, httplib::Response & res) {
@@ -6380,18 +6388,24 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // Signal break to stop any ongoing inference
-        if (session->octx) {
-            session->octx->break_event = true;
-            {
-                std::lock_guard<std::mutex> lk(session->octx->text_mtx);
-                session->octx->text_queue.clear();
-                session->octx->text_done_flag = true;
+        // close is a completion primitive: do not return until inference
+        // threads are stopped and the shared omni_context is safe to reuse.
+        {
+            std::lock_guard<std::mutex> octx_lock(ctx_server.octx_mutex);
+            auto * closing = ctx_server.session_mgr.get(session_id);
+            if (closing && closing->octx) {
+                closing->octx->break_event = true;
+                {
+                    std::lock_guard<std::mutex> lk(closing->octx->text_mtx);
+                    closing->octx->text_queue.clear();
+                    closing->octx->text_done_flag = true;
+                }
+                closing->octx->text_cv.notify_all();
+                omni_prepare_for_reuse(closing->octx);
             }
-            session->octx->text_cv.notify_all();
-        }
 
-        ctx_server.session_mgr.close(session_id);
+            ctx_server.session_mgr.close(session_id);
+        }
 
         json resp;
         resp["ok"] = true;

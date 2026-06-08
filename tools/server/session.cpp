@@ -86,29 +86,34 @@ void SessionManager::close(const std::string & session_id) {
             active_->state = SessionState::CLOSED;
         }
 
-        // Release omni_context if owned (model stays alive)
-        if (active_->owns_octx && active_->octx) {
-            omni_free(active_->octx);
-            active_->octx = nullptr;
-        }
-
         to_free = std::move(active_);
     }
-    // to_free destructor runs outside lock
+
+    // Release omni_context outside the manager lock. omni_free stops and joins
+    // inference threads and can touch shared backend state, so holding mtx_ here
+    // can race with WS cleanup or block unrelated lifecycle checks.
+    if (to_free && to_free->owns_octx && to_free->octx) {
+        omni_free(to_free->octx);
+        to_free->octx = nullptr;
+    }
 }
 
 void SessionManager::on_disconnect() {
-    std::lock_guard<std::mutex> lock(mtx_);
+    std::unique_ptr<OmniSession> to_free;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
 
-    if (!active_ || active_->state == SessionState::CLOSED) {
-        return;
+        if (!active_ || active_->state == SessionState::CLOSED) {
+            return;
+        }
+
+        active_->state = SessionState::CLOSED;
+        to_free = std::move(active_);
     }
 
-    active_->state = SessionState::CLOSED;
-
-    if (active_->owns_octx && active_->octx) {
-        omni_free(active_->octx);
-        active_->octx = nullptr;
+    if (to_free && to_free->owns_octx && to_free->octx) {
+        omni_free(to_free->octx);
+        to_free->octx = nullptr;
     }
 }
 

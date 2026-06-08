@@ -490,6 +490,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 const std::string & base_output_dir = "./tools/omni/output");
 
 void omni_free(struct omni_context * ctx_omni);
+// Stop/join inference threads and clear queues so the same context can serve a
+// new session, without tearing down the loaded model (unlike omni_free).
+void omni_prepare_for_reuse(struct omni_context * ctx_omni);
 
 // ANE/CoreML warmup — call once after omni_init to pre-load models into NPU
 void omni_warmup_ane(struct omni_context * ctx_omni);

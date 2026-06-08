@@ -3281,6 +3281,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.port = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PORT"));
+    // One flag to point at the MiniCPM-o GGUF root; derives the vision/audio/TTS
+    // sub-model paths so the backend-protocol server can be launched with just -m + this.
+    add_opt(common_arg(
+        {"--omni-model-dir"}, "DIR",
+        "MiniCPM-o GGUF root directory; fills vision/audio/TTS model paths for the backend protocol server",
+        [](common_params & params, const std::string & value) {
+            params.omni_model_dir = value;
+            params.vpm_model = value + "/vision/MiniCPM-o-4_5-vision-F16.gguf";
+            params.apm_model = value + "/audio/MiniCPM-o-4_5-audio-F16.gguf";
+            params.tts_model = value + "/tts/MiniCPM-o-4_5-tts-F16.gguf";
+            params.tts_bin_dir = value + "/tts";
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--path"}, "PATH",
         string_format("path to serve static files from (default: %s)", params.public_path.c_str()),

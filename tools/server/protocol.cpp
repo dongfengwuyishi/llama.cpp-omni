@@ -1,6 +1,7 @@
 #include "protocol.h"
 #include "common/base64.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 // ============================================================================
@@ -22,8 +23,29 @@ json ProtocolMetrics::to_json() const {
     if (wall_clock_ms > 0.0) {
         m["wall_clock_ms"] = wall_clock_ms;
     }
+    if (cost_llm_ms > 0.0) {
+        m["cost_llm_ms"] = cost_llm_ms;
+    }
+    if (cost_tts_prep_ms > 0.0) {
+        m["cost_tts_prep_ms"] = cost_tts_prep_ms;
+    }
+    if (cost_tts_ms > 0.0) {
+        m["cost_tts_ms"] = cost_tts_ms;
+    }
+    if (cost_token2wav_ms > 0.0) {
+        m["cost_token2wav_ms"] = cost_token2wav_ms;
+    }
     if (n_tokens > 0) {
         m["n_tokens"] = n_tokens;
+    }
+    if (n_tts_tokens > 0) {
+        m["n_tts_tokens"] = n_tts_tokens;
+    }
+    if (vision_slices > 0) {
+        m["vision_slices"] = vision_slices;
+    }
+    if (vision_tokens > 0) {
+        m["vision_tokens"] = vision_tokens;
     }
     return m;
 }
@@ -188,6 +210,50 @@ static float json_float(const json & j, const std::string & key, float default_v
     return default_val;
 }
 
+// Return the first non-empty string among several accepted key aliases.
+static std::string json_str_any(const json & j, std::initializer_list<const char *> keys) {
+    for (const char * key : keys) {
+        if (j.contains(key) && j.at(key).is_string()) {
+            std::string value = j.at(key).get<std::string>();
+            if (!value.empty()) {
+                return value;
+            }
+        }
+    }
+    return "";
+}
+
+// Drop a leading "data:...;base64," prefix if present, returning raw base64.
+static std::string strip_data_url_prefix(const std::string & value) {
+    auto comma = value.find(',');
+    if (comma != std::string::npos && value.substr(0, comma).find("base64") != std::string::npos) {
+        return value.substr(comma + 1);
+    }
+    return value;
+}
+
+// Accept audio/image as either a bare base64 string or an object carrying it
+// under one of several common key names; always return clean base64.
+static std::string extract_audio_b64(const json & value) {
+    if (value.is_string()) {
+        return strip_data_url_prefix(value.get<std::string>());
+    }
+    if (value.is_object()) {
+        return strip_data_url_prefix(json_str_any(value, {"data", "base64", "audio_base64", "audio_data"}));
+    }
+    return "";
+}
+
+static std::string extract_image_b64(const json & value) {
+    if (value.is_string()) {
+        return strip_data_url_prefix(value.get<std::string>());
+    }
+    if (value.is_object()) {
+        return strip_data_url_prefix(json_str_any(value, {"data", "base64", "image_base64"}));
+    }
+    return "";
+}
+
 ParsedSessionInit parse_session_init(const json & msg) {
     ParsedSessionInit out;
 
@@ -215,8 +281,11 @@ ParsedSessionInit parse_session_init(const json & msg) {
     // voice (reference audio)
     if (p.contains("voice") && p.at("voice").is_object()) {
         const json & v = p.at("voice");
-        out.ref_audio_b64 = json_str(v, "ref_audio");
-        out.tts_ref_audio_b64 = json_str(v, "tts_ref_audio");
+        out.ref_audio_b64 = json_str_any(v, {"ref_audio", "ref_audio_base64"});
+        out.tts_ref_audio_b64 = json_str_any(v, {"tts_ref_audio", "tts_ref_audio_base64"});
+        if (out.tts_ref_audio_b64.empty() && !out.ref_audio_b64.empty()) {
+            out.tts_ref_audio_b64 = out.ref_audio_b64;
+        }
     }
 
     // system_prompt
@@ -246,20 +315,61 @@ ParsedInput parse_input_append(const json & msg) {
 
     const json & in = msg.at("input");
 
-    // Full-duplex fields: audio (required), video_frames (optional)
-    if (in.contains("audio") && in.at("audio").is_string()) {
-        out.audio_b64 = in.at("audio").get<std::string>();
+    // Full-duplex audio aliases: audio, audio.data/base64, audio_base64, audio_data.
+    out.audio_b64 = json_str_any(in, {"audio_base64", "audio_data"});
+    if (out.audio_b64.empty() && in.contains("audio")) {
+        out.audio_b64 = extract_audio_b64(in.at("audio"));
     }
+    out.audio_b64 = strip_data_url_prefix(out.audio_b64);
 
-    if (in.contains("video_frames") && in.at("video_frames").is_array()) {
-        for (const auto & f : in.at("video_frames")) {
-            if (f.is_string()) {
-                out.video_frames_b64.push_back(f.get<std::string>());
+    auto append_frames = [&](const json & frames) {
+        if (!frames.is_array()) {
+            return;
+        }
+        for (const auto & f : frames) {
+            std::string frame = extract_image_b64(f);
+            if (!frame.empty()) {
+                out.video_frames_b64.push_back(frame);
             }
         }
+    };
+
+    if (in.contains("video_frames")) {
+        append_frames(in.at("video_frames"));
+    }
+    if (in.contains("frame_base64_list")) {
+        append_frames(in.at("frame_base64_list"));
+    }
+    if (in.contains("frames")) {
+        append_frames(in.at("frames"));
     }
 
-    out.max_slice_nums = json_int(in, "max_slice_nums", -1);
+    // max_slice_nums: int applies to every frame; int[] must match frame count
+    // (schema §4.3). Falls back to hints.max_slice_nums when absent.
+    if (in.contains("max_slice_nums")) {
+        const json & msn = in.at("max_slice_nums");
+        if (msn.is_number_integer()) {
+            out.max_slice_nums = msn.get<int>();
+        } else if (msn.is_array()) {
+            if (!out.video_frames_b64.empty() && msn.size() != out.video_frames_b64.size()) {
+                out.error = "max_slice_nums array length must match video frame count";
+                return out;
+            }
+            if (!msn.empty() && msn.at(0).is_number_integer()) {
+                out.max_slice_nums = msn.at(0).get<int>();
+            }
+        } else if (!msn.is_null()) {
+            out.error = "max_slice_nums must be int or int[]";
+            return out;
+        }
+    } else if (in.contains("hints") && in.at("hints").is_object()) {
+        out.max_slice_nums = json_int(in.at("hints"), "max_slice_nums", -1);
+    }
+
+    out.force_listen = json_bool(in, "force_listen", false);
+    if (in.contains("hints") && in.at("hints").is_object()) {
+        out.force_listen = json_bool(in.at("hints"), "force_listen", out.force_listen);
+    }
 
     // Turn-based fields: messages (required), streaming (required), generation
     if (in.contains("messages") && in.at("messages").is_array()) {
@@ -274,11 +384,21 @@ ParsedInput parse_input_append(const json & msg) {
         out.length_penalty = json_float(gen, "length_penalty", 1.1f);
     }
 
+    if (in.contains("image") && in.at("image").is_object()) {
+        const json & img = in.at("image");
+        out.max_slice_nums = json_int(img, "max_slice_nums", out.max_slice_nums);
+    }
+
     if (in.contains("tts") && in.at("tts").is_object()) {
         const json & tts = in.at("tts");
         out.tts_enabled = json_bool(tts, "enabled", false);
         out.tts_ref_audio_b64 = json_str(tts, "ref_audio_data");
     }
+
+    out.omni_mode = json_bool(in, "omni_mode", false);
+    // TTS is on if either use_tts_template or tts.enabled is set (schema §4.2).
+    out.use_tts_template = json_bool(in, "use_tts_template", false) || out.tts_enabled;
+    out.enable_thinking = json_bool(in, "enable_thinking", false);
 
     out.ok = true;
     return out;
@@ -311,26 +431,37 @@ ParsedMessage parse_one_message(const json & msg) {
                         if (!text_buf.empty()) text_buf += "\n";
                         text_buf += t;
                     }
+                } else if (ptype == "image") {
+                    std::string data = extract_image_b64(part);
+                    if (!data.empty()) {
+                        out.image_b64s.push_back(data);
+                    }
                 } else if (ptype == "image_url") {
                     if (part.contains("image_url") && part.at("image_url").is_object()) {
                         const json & iu = part.at("image_url");
                         std::string url = json_str(iu, "url");
                         if (!url.empty()) {
-                            auto comma = url.find(',');
-                            if (comma != std::string::npos) {
-                                std::string payload = url.substr(comma + 1);
-                                auto raw = b64_decode(payload);
-                                if (!raw.empty()) {
-                                    out.image_b64s.push_back(base64::encode(
-                                        reinterpret_cast<const char*>(raw.data()), raw.size()));
-                                }
+                            std::string payload = strip_data_url_prefix(url);
+                            auto raw = b64_decode(payload);
+                            if (!raw.empty()) {
+                                out.image_b64s.push_back(base64::encode(
+                                    reinterpret_cast<const char*>(raw.data()), raw.size()));
                             }
                         }
                     }
                 } else if (ptype == "audio") {
-                    std::string audio = json_str(part, "audio");
+                    std::string audio = extract_audio_b64(part);
                     if (!audio.empty()) {
                         out.audio_b64s.push_back(audio);
+                    }
+                } else if (ptype == "video") {
+                    // base64 MP4 container (schema §4.4); decoded into frames +
+                    // audio later. stack_frames = frames stacked per sample point.
+                    std::string video = json_str_any(part, {"data", "base64"});
+                    if (!video.empty()) {
+                        out.video_b64s.push_back(strip_data_url_prefix(video));
+                        int stack_frames = json_int(part, "stack_frames", 1);
+                        out.video_stack_frames.push_back(std::max(1, stack_frames));
                     }
                 }
             }
@@ -352,16 +483,26 @@ std::vector<ParsedMessage> parse_messages_array(const json & messages) {
 
 std::string build_prompt_from_messages(const std::vector<ParsedMessage> & msgs) {
     std::string prompt;
+    bool wrote_any = false;
     for (const auto & m : msgs) {
         if (m.role == "system") {
-            prompt += m.text + "\n\n";
+            if (!m.text.empty()) {
+                if (wrote_any) prompt += "\n";
+                prompt += m.text;
+                wrote_any = true;
+            }
         } else if (m.role == "user") {
-            prompt += "<|user|>\n" + m.text + "\n";
+            if (wrote_any) prompt += "<|im_end|>\n";
+            prompt += "<|im_start|>user\n" + m.text;
+            wrote_any = true;
         } else if (m.role == "assistant") {
-            prompt += "<|assistant|>\n" + m.text + "\n";
+            if (wrote_any) prompt += "<|im_end|>\n";
+            prompt += "<|im_start|>assistant\n" + m.text;
+            wrote_any = true;
         }
     }
-    prompt += "<|assistant|>\n";
+    if (wrote_any) prompt += "<|im_end|>\n";
+    prompt += "<|im_start|>assistant\n<think>\n\n</think>\n\n";
     return prompt;
 }
 
