@@ -411,7 +411,6 @@ struct common_params {
     std::string tts_model            = ""; // model path
     std::string apm_model            = ""; // model path
     std::string vpm_model            = ""; // model path
-    std::string omni_model_dir       = ""; // MiniCPM-o GGUF root directory
     std::string tts_bin_dir          = ""; // directory containing TTS projector/token2wav assets
 
     // Apple Neural Engine (CoreML) support

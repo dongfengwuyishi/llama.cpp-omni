@@ -131,14 +131,15 @@ static std::string parent_dir(const std::string & path) {
     return pos == std::string::npos ? "." : path.substr(0, pos);
 }
 
-// Fill vision/audio/TTS sub-model paths from --omni-model-dir (or, as a
-// fallback, the directory of the main -m model) when they weren't set explicitly.
+// Derive vision/audio/TTS sub-model paths from the directory of the main -m
+// model (same convention as omni-cli's resolve_model_paths): the llm is the
+// only quantized file, the F16 sub-models live in fixed sub-dirs next to it,
+// so the -m path is enough to locate them all. Only fills paths left unset.
 static void ensure_omni_model_paths(common_params & params) {
-    std::string root = params.omni_model_dir;
-    if (root.empty() && !params.model.path.empty()) {
-        root = parent_dir(params.model.path);
-        params.omni_model_dir = root;
+    if (params.model.path.empty()) {
+        return;
     }
+    const std::string root = parent_dir(params.model.path);
     if (root.empty()) {
         return;
     }
