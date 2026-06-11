@@ -352,7 +352,8 @@ struct omni_context {
     // 语言设置 (用于 prompt 生成)
     std::string language = "zh";
 
-    // text streaming queue for server
+    // text_mtx protects only the text streaming state consumed by HTTP/WS
+    // readers; broader omni_context lifecycle/prefill changes use server octx_mutex.
     std::mutex text_mtx;
     std::condition_variable text_cv;
     std::deque<std::string> text_queue;

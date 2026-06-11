@@ -1,3 +1,15 @@
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <thread>
+#include <vector>
+
+#include <cpp-httplib/httplib.h>
+
 #include "ws_handler.h"
 #include "session.h"
 #include "protocol.h"
@@ -7,18 +19,6 @@
 #include "log.h"
 #include "audition.h"
 #include "vision.h"
-
-#include <cpp-httplib/httplib.h>
-
-#include <thread>
-#include <filesystem>
-#include <fstream>
-#include <chrono>
-#include <deque>
-#include <vector>
-#include <algorithm>
-#include <cstdlib>
-#include <cstdio>
 
 namespace fs = std::filesystem;
 
@@ -285,6 +285,7 @@ std::string TempMediaFiles::write_audio_wav(const std::string & b64, const std::
     auto pcm = b64_to_float32_pcm(b64);
     if (pcm.empty()) return "";
 
+    // Backend protocol audio payloads are mono float32 PCM in this path.
     int n_samples = static_cast<int>(pcm.size());
     int sample_rate = 16000;
     int n_channels = 1;
@@ -686,6 +687,12 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             fail_fast(session_id, "activate_failed");
             return;
         }
+        session_mgr.set_close_callback(session_id, [&ws, session_id]() {
+            // Preserve protocol ordering for older runtimes: emit session.closed
+            // before the transport close wakes a blocked ws.read().
+            ws.send(make_session_closed(session_id, "client_closed").dump());
+            ws.close(httplib::ws::CloseStatus::Normal, "client_closed");
+        });
     }
 
     // Send session.created

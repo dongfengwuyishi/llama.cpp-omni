@@ -197,7 +197,7 @@ static bool json_bool(const json & j, const std::string & key, bool default_val 
 }
 
 static int json_int(const json & j, const std::string & key, int default_val = 0) {
-    if (j.contains(key) && j.at(key).is_number_integer()) {
+    if (j.contains(key) && j.at(key).is_number()) {
         return j.at(key).get<int>();
     }
     return default_val;
@@ -348,14 +348,14 @@ ParsedInput parse_input_append(const json & msg) {
     // (schema §4.3). Falls back to hints.max_slice_nums when absent.
     if (in.contains("max_slice_nums")) {
         const json & msn = in.at("max_slice_nums");
-        if (msn.is_number_integer()) {
+        if (msn.is_number()) {
             out.max_slice_nums = msn.get<int>();
         } else if (msn.is_array()) {
             if (!out.video_frames_b64.empty() && msn.size() != out.video_frames_b64.size()) {
                 out.error = "max_slice_nums array length must match video frame count";
                 return out;
             }
-            if (!msn.empty() && msn.at(0).is_number_integer()) {
+            if (!msn.empty() && msn.at(0).is_number()) {
                 out.max_slice_nums = msn.at(0).get<int>();
             }
         } else if (!msn.is_null()) {
@@ -442,10 +442,8 @@ ParsedMessage parse_one_message(const json & msg) {
                         std::string url = json_str(iu, "url");
                         if (!url.empty()) {
                             std::string payload = strip_data_url_prefix(url);
-                            auto raw = b64_decode(payload);
-                            if (!raw.empty()) {
-                                out.image_b64s.push_back(base64::encode(
-                                    reinterpret_cast<const char*>(raw.data()), raw.size()));
+                            if (!payload.empty()) {
+                                out.image_b64s.push_back(payload);
                             }
                         }
                     }

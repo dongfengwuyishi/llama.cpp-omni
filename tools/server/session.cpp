@@ -73,6 +73,30 @@ OmniSession * SessionManager::get(const std::string & session_id) {
     return active_.get();
 }
 
+void SessionManager::set_close_callback(const std::string & session_id, std::function<void()> cb) {
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    if (!active_ || active_->session_id != session_id) {
+        return;
+    }
+    active_->close_ws = std::move(cb);
+}
+
+void SessionManager::request_transport_close(const std::string & session_id) {
+    std::function<void()> close_ws;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!active_ || active_->session_id != session_id) {
+            return;
+        }
+        close_ws = active_->close_ws;
+    }
+
+    if (close_ws) {
+        close_ws();
+    }
+}
+
 void SessionManager::close(const std::string & session_id) {
     std::unique_ptr<OmniSession> to_free;
     {

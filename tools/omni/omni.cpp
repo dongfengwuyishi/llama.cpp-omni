@@ -134,6 +134,57 @@ static bool set_python_t2w_ref_audio(struct omni_context * ctx_omni, const std::
 static bool process_python_t2w_tokens(struct omni_context * ctx_omni, const std::vector<int32_t>& tokens, bool last_chunk, const std::string& output_path, double& inference_time_ms, double& audio_duration);
 static bool reset_python_t2w_cache(struct omni_context * ctx_omni);
 
+static bool read_wav_pcm16_data(const std::string & wav_path, std::vector<int16_t> & pcm) {
+    FILE * f = fopen(wav_path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+
+    auto read_u32_le = [](FILE * fp, uint32_t & out) {
+        unsigned char b[4];
+        if (fread(b, 1, 4, fp) != 4) {
+            return false;
+        }
+        out = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+              ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+        return true;
+    };
+
+    char riff[4];
+    char wave[4];
+    uint32_t riff_size = 0;
+    if (fread(riff, 1, 4, f) != 4 || !read_u32_le(f, riff_size) ||
+        fread(wave, 1, 4, f) != 4 || memcmp(riff, "RIFF", 4) != 0 ||
+        memcmp(wave, "WAVE", 4) != 0) {
+        fclose(f);
+        return false;
+    }
+    (void) riff_size;
+
+    while (true) {
+        char chunk_id[4];
+        uint32_t chunk_size = 0;
+        if (fread(chunk_id, 1, 4, f) != 4 || !read_u32_le(f, chunk_size)) {
+            break;
+        }
+        if (memcmp(chunk_id, "data", 4) == 0) {
+            const size_t n_samples = chunk_size / sizeof(int16_t);
+            pcm.assign(n_samples, 0);
+            size_t n_read = fread(pcm.data(), sizeof(int16_t), n_samples, f);
+            pcm.resize(n_read);
+            fclose(f);
+            return !pcm.empty();
+        }
+        long skip = (long)chunk_size + (chunk_size & 1u);
+        if (fseek(f, skip, SEEK_CUR) != 0) {
+            break;
+        }
+    }
+
+    fclose(f);
+    return false;
+}
+
 
 //
 // Forward declarations
@@ -8484,24 +8535,15 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             if (process_python_t2w_tokens(ctx_omni, window, is_last_window, wav_path, inference_time_ms, audio_duration)) {
                 // Audio output callback (for WS protocol) — read the WAV and pass float32 samples
                 if (ctx_omni->audio_output_cb && audio_duration > 0) {
-                    // Read the WAV file back to get float32 samples
-                    FILE * fw = fopen(wav_path.c_str(), "rb");
-                    if (fw) {
-                        // Skip WAV header (44 bytes for standard PCM WAV)
-                        fseek(fw, 44, SEEK_SET);
-                        // Read int16 PCM data
-                        int n_samples = static_cast<int>(audio_duration * 24000); // Python T2W uses 24kHz
-                        std::vector<int16_t> pcm(n_samples);
-                        size_t n_read = fread(pcm.data(), sizeof(int16_t), n_samples, fw);
-                        fclose(fw);
-                        if (n_read > 0) {
-                            // Convert int16 → float32
-                            std::vector<float> float_samples(n_read);
-                            for (size_t i = 0; i < n_read; ++i) {
-                                float_samples[i] = static_cast<float>(pcm[i]) / 32768.0f;
-                            }
-                            ctx_omni->audio_output_cb(float_samples.data(), static_cast<int>(n_read), 24000, is_last_window);
+                    std::vector<int16_t> pcm;
+                    if (read_wav_pcm16_data(wav_path, pcm)) {
+                        std::vector<float> float_samples(pcm.size());
+                        for (size_t i = 0; i < pcm.size(); ++i) {
+                            float_samples[i] = static_cast<float>(pcm[i]) / 32768.0f;
                         }
+                        ctx_omni->audio_output_cb(float_samples.data(), static_cast<int>(float_samples.size()), 24000, is_last_window);
+                    } else {
+                        LOG_ERR("Python T2W: failed to read WAV data chunk from %s\n", wav_path.c_str());
                     }
                 }
 

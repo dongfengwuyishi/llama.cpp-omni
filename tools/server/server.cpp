@@ -2338,6 +2338,8 @@ struct server_context {
     // multimodal
     mtmd_context * mctx = nullptr;
     omni_context * octx = nullptr;
+    // Protects shared omni_context lifecycle and prefill/decode entry points.
+    // Per-fragment text queues are protected by omni_context::text_mtx.
     std::mutex octx_mutex;
 
     SessionManager session_mgr;
@@ -6387,6 +6389,8 @@ int main(int argc, char ** argv) {
             res.status = 404;
             return;
         }
+
+        ctx_server.session_mgr.request_transport_close(session_id);
 
         // close is a completion primitive: do not return until inference
         // threads are stopped and the shared omni_context is safe to reuse.
