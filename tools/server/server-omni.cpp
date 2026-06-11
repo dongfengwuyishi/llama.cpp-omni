@@ -7,6 +7,8 @@
 #include "log.h"
 #include "arg.h"
 #include "sampling.h"
+#include "session.h"
+#include "ws_handler.h"
 
 #include <mutex>
 #include <thread>
@@ -51,8 +53,9 @@ static bool server_sent_event(httplib::DataSink & sink, const json & ev) {
 }
 
 struct omni_server_state {
-    omni_context * octx = nullptr;
-    std::mutex octx_mutex;
+    omni_context * octx = nullptr;    // WS backend uses this as shared_octx
+    std::mutex octx_mutex;            // protects omni_context lifecycle + prefill/decode entry
+    SessionManager session_mgr;       // WS backend session management
 };
 
 int main(int argc, char ** argv) {
@@ -337,6 +340,54 @@ int main(int argc, char ** argv) {
         }
 
         res_ok(res, {{"success", true}});
+    });
+
+    //
+    // Backend Protocol (WebSocket + HTTP unary)
+    //
+    svr.WebSocket("/backend", [&](const httplib::Request &, httplib::ws::WebSocket & ws) {
+        handle_ws_backend(ws, state.session_mgr, params,
+                          /*model*/nullptr, /*ctx*/nullptr,
+                          state.octx, state.octx_mutex);
+    });
+
+    svr.Post("/sessions/:session_id/close", [&](const httplib::Request & req, httplib::Response & res) {
+        std::string session_id = req.path_params.at("session_id");
+        LOG_INF("Close session requested: %s\n", session_id.c_str());
+
+        auto * session = state.session_mgr.get(session_id);
+        if (!session || session->state != SessionState::ACTIVE) {
+            res_error(res, format_error_response("session not found", "not_found"));
+            res.status = 404;
+            return;
+        }
+
+        state.session_mgr.request_transport_close(session_id);
+
+        // close is a completion primitive: do not return until inference
+        // threads are stopped and the shared omni_context is safe to reuse.
+        {
+            std::lock_guard<std::mutex> octx_lock(state.octx_mutex);
+            auto * closing = state.session_mgr.get(session_id);
+            if (closing && closing->octx) {
+                closing->octx->break_event = true;
+                {
+                    std::lock_guard<std::mutex> lk(closing->octx->text_mtx);
+                    closing->octx->text_queue.clear();
+                    closing->octx->text_done_flag = true;
+                }
+                closing->octx->text_cv.notify_all();
+                omni_prepare_for_reuse(closing->octx);
+            }
+
+            state.session_mgr.close(session_id);
+        }
+
+        json resp;
+        resp["ok"] = true;
+        resp["session_id"] = session_id;
+        resp["closed"] = true;
+        res_ok(res, resp);
     });
 
     // start server
