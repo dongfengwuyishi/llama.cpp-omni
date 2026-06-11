@@ -26,6 +26,7 @@ struct OmniSession {
     omni_context * octx = nullptr;
     bool owns_octx = false;
     double created_at = 0.0;
+    std::function<void()> close_ws;
 };
 
 // SessionManager — manages the single active backend session.
@@ -43,6 +44,11 @@ public:
 
     // Get a session by id. Returns nullptr if not found.
     OmniSession * get(const std::string & session_id);
+
+    // Register/trigger transport close without holding the manager lock while
+    // invoking the callback.
+    void set_close_callback(const std::string & session_id, std::function<void()> cb);
+    void request_transport_close(const std::string & session_id);
 
     // Close and forget a session. Releases omni_context if owned.
     void close(const std::string & session_id);

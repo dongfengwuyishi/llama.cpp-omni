@@ -18,7 +18,16 @@ struct ProtocolMetrics {
     double prefill_ms = 0.0;
     double generate_ms = 0.0;
     double wall_clock_ms = 0.0;
+    // Detailed stage timings + token/vision counts (schema §5.4). Only emitted
+    // to JSON when > 0, so leaving any unset simply omits that field.
+    double cost_llm_ms = 0.0;
+    double cost_tts_prep_ms = 0.0;
+    double cost_tts_ms = 0.0;
+    double cost_token2wav_ms = 0.0;
     int n_tokens = 0;
+    int n_tts_tokens = 0;
+    int vision_slices = 0;
+    int vision_tokens = 0;
 
     json to_json() const;
 };
@@ -92,11 +101,15 @@ struct ParsedInput {
     std::string audio_b64;                         // base64 float32 PCM
     std::vector<std::string> video_frames_b64;     // base64 JPEG frames
     int max_slice_nums = -1;
+    bool force_listen = false;            // full_duplex: force this step to LISTEN
 
     // Turn-based fields
     bool streaming = true;
     int max_new_tokens = 512;
     float length_penalty = 1.1f;
+    bool omni_mode = false;               // pass-through hints (§4.2)
+    bool use_tts_template = false;        // emit speech for this turn (use_tts_template OR tts.enabled)
+    bool enable_thinking = false;
     // messages[] — currently passed as raw json for backend to interpret
     json messages;
     std::string tts_ref_audio_b64;
@@ -119,6 +132,8 @@ struct ParsedMessage {
     std::string text;                       // concatenated text content (for easy prompt building)
     std::vector<std::string> image_b64s;    // all images in this message (already decoded)
     std::vector<std::string> audio_b64s;    // all audio in this message (base64 float32 PCM)
+    std::vector<std::string> video_b64s;    // all video containers in this message (base64 MP4)
+    std::vector<int> video_stack_frames;     // stack_frames for each video_b64s entry
 };
 
 // Parse a single message from json

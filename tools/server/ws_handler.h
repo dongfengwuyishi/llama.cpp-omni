@@ -25,6 +25,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                        common_params & params_base,
                        llama_model * model,
                        llama_context * ctx,
+                       omni_context *& shared_octx,  // server-owned, reused across sessions
                        std::mutex & octx_mutex);
 
 // ============================================================================
