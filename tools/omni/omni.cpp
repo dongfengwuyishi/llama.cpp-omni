@@ -1020,14 +1020,10 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
                 ctx_omni->n_past -= n_discard;
                 // 没有可信的 round boundary 了，清空以避免后续按错位的 boundary 切割
                 ctx_omni->round_start_positions.clear();
-                if (ctx_omni->ctx_tts_llama) {
-                    llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-                    if (tts_mem) llama_memory_seq_rm(tts_mem, 0, 0, -1);
-                    ctx_omni->tts_n_past_accumulated = 0;
-                    ctx_omni->tts_all_generated_tokens.clear();
-                    ctx_omni->tts_condition_saved = false;
-                }
-                print_with_timestamp("⚠️ slide DONE: rounds<2 tail-keep: n_past %d→%d, freed %d (kept last %d), TTS KV cleared\n",
+                // 主 LLM 滑窗不触碰 TTS 状态：TTS 是独立小模型，其 KV 占用可忽略，清它对缓解主
+                // 上下文压力无益；而 force_slide 可能在说话中途触发，清空会抹掉正在进行的 TTS
+                // 连贯状态导致后半句乱码。TTS 由 tts_thread_func_duplex 在真正轮末自行重置。
+                print_with_timestamp("⚠️ slide DONE: rounds<2 tail-keep: n_past %d→%d, freed %d (kept last %d), TTS KV kept\n",
                                      old_n_past, ctx_omni->n_past, n_discard, target_keep_tokens);
             }
         } else {
@@ -1065,15 +1061,8 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
                 }
                 ctx_omni->round_start_positions = new_rounds;
 
-                if (ctx_omni->ctx_tts_llama) {
-                    llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
-                    if (tts_mem) llama_memory_seq_rm(tts_mem, 0, 0, -1);
-                    ctx_omni->tts_n_past_accumulated = 0;
-                    ctx_omni->tts_all_generated_tokens.clear();
-                    ctx_omni->tts_condition_saved = false;
-                }
-
-                print_with_timestamp("⚠️ slide DONE: n_past %d→%d, freed %d, boundaries_kept=%d, TTS KV cleared\n",
+                // 主 LLM 滑窗不触碰 TTS 状态（理由同上：保住正在进行的 TTS 连贯性，避免乱码）。
+                print_with_timestamp("⚠️ slide DONE: n_past %d→%d, freed %d, boundaries_kept=%d, TTS KV kept\n",
                                      old_n_past, ctx_omni->n_past, n_discard, (int)new_rounds.size());
             }
         }
@@ -6673,7 +6662,51 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                     }
                 }
             }
-            
+
+            // 句末标点边界复位 TTS：滑窗不再清 TTS 后，长独白里 TTS KV 会持续增长，
+            // 逼近 TTS 上下文上限会导致结尾音频与文字不符。这里仅在 TTS KV 超过软上限、
+            // 且当前 chunk 文本以句末标点收尾（不在音节中途）的安全点复位，既不破句又能封顶。
+            if (ctx_omni->duplex_mode && !accumulated_is_end_of_turn &&
+                ctx_omni->ctx_tts_llama && ctx_omni->tts_n_past_accumulated >= 1024) {
+                const std::string& tail = llm_text;
+                size_t e = tail.size();
+                while (e > 0 && (tail[e-1] == ' ' || tail[e-1] == '\n' ||
+                                 tail[e-1] == '\r' || tail[e-1] == '\t')) {
+                    --e;
+                }
+                static const std::string enders[] = {"。", "！", "？", "…", ".", "!", "?"};
+                bool sentence_end = false;
+                for (const std::string& p : enders) {
+                    if (e >= p.size() && tail.compare(e - p.size(), p.size(), p) == 0) {
+                        sentence_end = true;
+                        break;
+                    }
+                }
+                if (sentence_end) {
+                    // TTS 滑动窗口：不整段清空（整段清空会让下一句冷启动、句首冒杂音，
+                    // 等现象），而是只丢弃最老的一段、保留最近 tts_keep 个 token，
+                    // 并把保留段位置前移以保持 KV position 连续。关键：不清 tts_all_generated_tokens、
+                    // 不置 condition_saved=false，避免下一句被当成"首 token"重铺条件而冷启动。
+                    const int tts_keep = 512;
+                    int n_discard = ctx_omni->tts_n_past_accumulated - tts_keep;
+                    if (n_discard > 0) {
+                        llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+                        if (tts_mem) {
+                            llama_memory_seq_rm(tts_mem, 0, 0, n_discard);
+                            llama_memory_seq_add(tts_mem, 0, n_discard,
+                                                 ctx_omni->tts_n_past_accumulated, -n_discard);
+                        }
+                        ctx_omni->tts_n_past_accumulated -= n_discard;
+                        auto & gen = ctx_omni->tts_all_generated_tokens;
+                        if ((int)gen.size() > tts_keep) {
+                            gen.erase(gen.begin(), gen.end() - tts_keep);
+                        }
+                        print_with_timestamp("TTS: sentence-boundary sliding window, kept last %d (n_past_tts→%d)\n",
+                                             tts_keep, ctx_omni->tts_n_past_accumulated);
+                    }
+                }
+            }
+
             ++chunk_idx;
             llm_text.clear();
             response.clear();
